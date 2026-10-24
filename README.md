@@ -163,3 +163,7 @@ Verified by sampling the window ~75 times a second for 8 s per page: the visible
 - Dark theme (or the system's high-contrast colours). Context menus and table headers are dark (via the same uxtheme dark-mode switches Explorer uses, looked up defensively); native dialogs such as file pickers and message boxes stay light.
 - The executable is unsigned; SmartScreen and some AV products may warn.
 - UI models and keyboard logic are unit-tested without creating windows. Actual window rendering and native dialogs require the embedded Windows manifest and live inspection.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The third-party components linked into the binaries and their licences are listed in THIRD-PARTY-NOTICES.txt, generated at build time.
