@@ -3,3 +3,4 @@
 - [tailscale/walk](https://github.com/tailscale/walk) — native Win32 GUI toolkit used for the UI
 - [Azure Trusted Signing](https://azure.microsoft.com/products/trusted-signing) — the code-signing service build.ps1 -TrustedSigning uses; setup in docs/SIGNING.md
 - [Trusted Signing quickstart](https://learn.microsoft.com/en-us/azure/trusted-signing/quickstart) — Microsoft's portal steps (account, identity validation, certificate profile, roles)
+- [gotm on GitHub](https://github.com/davidwilliams-crypto/gotm) — public source repository (main branch); dist/, third_party/ and the signing client stay local
