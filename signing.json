@@ -1,0 +1,6 @@
+{
+  "_comment": "Azure Trusted Signing settings for build.ps1 -TrustedSigning. Fill in the three values from the Azure portal (Trusted Signing account > Overview for the endpoint and account name; Certificate profiles for the profile name). Nothing here is secret.",
+  "endpoint": "https://eus.codesigning.azure.net",
+  "account": "FILL-IN-account-name",
+  "profile": "FILL-IN-certificate-profile-name"
+}

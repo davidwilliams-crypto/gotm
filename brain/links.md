@@ -1,0 +1,5 @@
+- [README](../README.md) — pages, data sources, flicker approach, customizing
+- [Feature spec](../docs/FEATURES.md) — what is built and what is open
+- [tailscale/walk](https://github.com/tailscale/walk) — native Win32 GUI toolkit used for the UI
+- [Azure Trusted Signing](https://azure.microsoft.com/products/trusted-signing) — the code-signing service build.ps1 -TrustedSigning uses; setup in docs/SIGNING.md
+- [Trusted Signing quickstart](https://learn.microsoft.com/en-us/azure/trusted-signing/quickstart) — Microsoft's portal steps (account, identity validation, certificate profile, roles)

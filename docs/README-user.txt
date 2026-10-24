@@ -1,0 +1,61 @@
+gotm — a native task manager for Windows
+=======================================
+
+Requirements
+------------
+Windows 10 or Windows 11, 64-bit (x64). Nothing else to install.
+
+Installing
+----------
+Installer:  run gotm-<version>-setup.exe and approve the Windows prompt. gotm is
+            installed for all users in "C:\Program Files\gotm", with a Start menu
+            shortcut. Run it again later to upgrade in place.
+            Silent install for IT deployment:   gotm-<version>-setup.exe /S
+            Also add a desktop shortcut:        gotm-<version>-setup.exe /desktop
+
+Portable:   unzip gotm-<version>-portable.zip anywhere and run gotm.exe.
+            Settings are stored per user in %APPDATA%\gotm either way.
+
+"Windows protected your PC"
+---------------------------
+gotm is not code-signed, so Microsoft Defender SmartScreen may warn the first
+time it runs on a computer. Check that the file's SHA-256 matches the
+SHA256SUMS.txt you were given, then choose "More info" > "Run anyway".
+(For a downloaded zip you can also right-click it > Properties > Unblock
+before extracting.)
+
+Using it
+--------
+- The sidebar lists the pages. Ctrl+1 … Ctrl+0 jump between them, Ctrl+F
+  searches the current page, F5 reloads it. Settings lists every shortcut.
+- Ending tasks, controlling services and changing startup entries for other
+  users needs administrator rights: click "Run as administrator" in the
+  bottom-right corner and gotm restarts elevated.
+- Power & Freq shows clocks, drive health, GPU temperatures/clocks/power
+  (NVIDIA and AMD, read from the graphics driver you already have) and, where
+  Windows exposes it, CPU package power.
+  CPU die temperature needs a vendor sensor driver; gotm never installs one.
+  Optional sources: AMD Ryzen Master Monitoring SDK (Settings > AMD Ryzen
+  sensors, Ryzen CPUs only, run as administrator) or LibreHardwareMonitor with
+  its web server on 127.0.0.1:8085.
+- Accessibility: every page works with the keyboard alone (Tab, arrows,
+  Enter), screen readers such as Narrator read the cards, charts captions and
+  settings, and a Windows high-contrast theme is used as soon as it is on.
+
+Privacy
+-------
+gotm makes no internet connections and collects nothing. The only network
+access is optional and local: reading LibreHardwareMonitor on 127.0.0.1.
+The Flight Recorder keeps its history in memory unless you turn on
+"Keep recording on disk" (stored in %APPDATA%\gotm).
+
+Removing
+--------
+Settings > Apps > gotm > Uninstall (or run "C:\Program Files\gotm\uninstall.exe").
+Uninstall asks whether to delete your settings too; it never deletes files
+it did not install. Portable copy: just delete the folder.
+
+Third-party software
+--------------------
+THIRD-PARTY-NOTICES.txt lists the open-source components gotm is built from and
+their licenses.

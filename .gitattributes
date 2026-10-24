@@ -1,0 +1,6 @@
+# Store text as LF; each checkout uses its platform's line endings.
+* text=auto
+*.go text eol=lf
+*.ps1 text
+*.json text
+*.md text

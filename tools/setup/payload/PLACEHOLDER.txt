@@ -1,0 +1,1 @@
+Placeholder. build.ps1 copies gotm.exe, README.txt and THIRD-PARTY-NOTICES.txt here before building the installer, and removes them afterwards.
