@@ -5,7 +5,7 @@ system directly (no cgo, no third-party runtime) behind a dark, owner-drawn
 Win32 interface. No browser, no local web server.
 
 ```
-.\build.ps1 -Version 0.9.2   # resources, vet, tests, gotm.exe, installer and portable zip in dist\release\gotm-0.9.2
+.\build.ps1 -Version 0.9.3   # resources, vet, tests, gotm.exe, installer and portable zip in dist\release\gotm-0.9.3
 .\dist\gotm.exe        # run; reopens the page you last used (or --tab performance|processes|startup|services|power|recorder|connections|apps|drivers|disk|settings)
 .\tools\elevated-check.ps1   # one UAC prompt: runs the administrator-only self-tests and captures the elevated app
 ```
@@ -28,7 +28,10 @@ services, and read some drive details).
 gotm installs for all users on purpose: it can relaunch itself elevated, and an
 elevated program should only ever run from a folder that standard users cannot
 modify. Uninstall removes only the files it installed and asks before deleting
-the user's settings.
+the user's settings. Custom `/D=` destinations must be local folders protected
+from standard-user changes, with trusted ownership throughout their parent
+chain. Setup rejects user-owned or writable paths, reparse points and ambiguous
+path names before installing or upgrading.
 
 Unsigned executables make SmartScreen warn on first run on other PCs. Two ways
 to sign both executables (each build also verifies its signatures):

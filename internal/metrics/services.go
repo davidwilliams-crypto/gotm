@@ -67,42 +67,24 @@ func ListServices() ([]Service, error) {
 	}
 	defer windows.CloseServiceHandle(scm)
 
-	var needed, returned, resume uint32
-	var buf []byte
-	for {
-		var p *byte
-		if len(buf) > 0 {
-			p = &buf[0]
+	out := make([]Service, 0)
+	err = enumerateServiceStatus(scm, serviceWin32, func(entries []windows.ENUM_SERVICE_STATUS_PROCESS) {
+		for _, e := range entries {
+			name := windows.UTF16PtrToString(e.ServiceName)
+			st := e.ServiceStatusProcess
+			s := Service{
+				Name:    name,
+				Display: windows.UTF16PtrToString(e.DisplayName),
+				State:   svcStateNames[st.CurrentState],
+				PID:     st.ProcessId,
+				CanStop: st.ControlsAccepted&acceptStop != 0 && st.CurrentState == 4,
+			}
+			s.StartType, s.Path = serviceConfig(scm, name)
+			out = append(out, s)
 		}
-		err = windows.EnumServicesStatusEx(scm, scEnumProcessInfo, serviceWin32, serviceStateAll,
-			p, uint32(len(buf)), &needed, &returned, &resume, nil)
-		if err == nil {
-			break
-		}
-		if err != windows.ERROR_MORE_DATA {
-			return nil, fmt.Errorf("enumerate services: %w", err)
-		}
-		if needed == 0 {
-			needed = 64 * 1024
-		}
-		buf = make([]byte, needed)
-		resume = 0
-	}
-
-	entries := unsafe.Slice((*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buf[0])), returned)
-	out := make([]Service, 0, returned)
-	for _, e := range entries {
-		name := windows.UTF16PtrToString(e.ServiceName)
-		st := e.ServiceStatusProcess
-		s := Service{
-			Name:    name,
-			Display: windows.UTF16PtrToString(e.DisplayName),
-			State:   svcStateNames[st.CurrentState],
-			PID:     st.ProcessId,
-			CanStop: st.ControlsAccepted&acceptStop != 0 && st.CurrentState == 4,
-		}
-		s.StartType, s.Path = serviceConfig(scm, name)
-		out = append(out, s)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate services: %w", err)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Display < out[j].Display })
 	return out, nil

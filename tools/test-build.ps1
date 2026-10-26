@@ -37,6 +37,20 @@ try {
         throw "An unfilled signing.json did not stop the build first (error: '$signFailed', $($calls.Count) Go commands ran)."
     }
     Write-Host 'PASS: -TrustedSigning refuses an unfilled signing.json before building.'
+
+    # A successful PowerShell helper leaves a preceding native exit code alone.
+    # Reach the first Go command to prove the returned client was accepted.
+    New-Item -ItemType Directory -Path (Join-Path $scratch 'tools') | Out-Null
+    Set-Content -LiteralPath (Join-Path $scratch 'tools/get-signing-client.ps1') -Value "'C:\fake\Azure.CodeSigning.Dlib.dll'" -Encoding ascii
+    @{endpoint='https://eus.codesigning.azure.net'; account='test'; profile='test'} | ConvertTo-Json | Set-Content -LiteralPath $cfg
+    & $env:ComSpec /d /c 'exit 7'
+    $signFailed = $null
+    try { & (Join-Path $scratch 'build.ps1') -Version '0.0.0' -TrustedSigning -SigningConfig $cfg } catch { $signFailed = $_.Exception.Message }
+    $calls = @(Get-Content -LiteralPath $env:GOTM_TEST_GO_LOG | Where-Object { $_ -ne '' })
+    if ($calls.Count -ne 1 -or $signFailed -notmatch 'go failed with exit code 7') {
+        throw "A successful signing helper was rejected due to stale LASTEXITCODE (error: '$signFailed', $($calls.Count) Go commands ran)."
+    }
+    Write-Host 'PASS: successful signing helper ignores stale native exit code.'
 } finally {
 	Set-Location -LiteralPath $savedLocation.Path
     foreach ($name in $savedBuildEnv.Keys) {

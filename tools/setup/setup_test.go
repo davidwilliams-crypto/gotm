@@ -5,6 +5,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"golang.org/x/sys/windows"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,11 +22,12 @@ func testLayout(t *testing.T) layout {
 	t.Helper()
 	root := t.TempDir()
 	l := layout{
-		dir:       filepath.Join(root, "Program Files", "gotm"),
-		startMenu: filepath.Join(root, "Start Menu"),
-		desktop:   filepath.Join(root, "Desktop"),
-		regRoot:   registry.CURRENT_USER,
-		regPath:   `Software\gotm-setup-test\` + strings.ReplaceAll(t.Name(), "/", "_"),
+		inspectSecurity: func(windows.Handle, bool) error { return nil },
+		dir:             filepath.Join(root, "Program Files", "gotm"),
+		startMenu:       filepath.Join(root, "Start Menu"),
+		desktop:         filepath.Join(root, "Desktop"),
+		regRoot:         registry.CURRENT_USER,
+		regPath:         `Software\gotm-setup-test\` + strings.ReplaceAll(t.Name(), "/", "_"),
 	}
 	for _, d := range []string{l.startMenu, l.desktop} {
 		if err := os.MkdirAll(d, 0o755); err != nil {

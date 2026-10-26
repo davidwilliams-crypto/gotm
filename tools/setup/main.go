@@ -55,8 +55,9 @@ func parseArgs(args []string) (options, error) {
 		case l == "/desktop":
 			o.desktop = true
 		case strings.HasPrefix(l, "/d="):
-			o.dir = filepath.Clean(strings.Trim(a[3:], `"`))
-			if !filepath.IsAbs(o.dir) {
+			var err error
+			o.dir, err = normalizeDestinationPath(strings.Trim(a[3:], `"`))
+			if err != nil {
 				return o, fmt.Errorf("/D= needs an absolute folder, got %q", a[3:])
 			}
 		case l == "/?" || l == "/h" || l == "/help":

@@ -12,6 +12,10 @@ Installer:  run gotm-<version>-setup.exe and approve the Windows prompt. gotm is
             shortcut. Run it again later to upgrade in place.
             Silent install for IT deployment:   gotm-<version>-setup.exe /S
             Also add a desktop shortcut:        gotm-<version>-setup.exe /desktop
+            Custom folder:                      gotm-<version>-setup.exe /D=C:\Protected\gotm
+            Custom folders and their parents must have trusted ownership and
+            protection against standard-user changes. Setup rejects unsafe or
+            redirected paths, including during upgrades.
 
 Portable:   unzip gotm-<version>-portable.zip anywhere and run gotm.exe.
             Settings are stored per user in %APPDATA%\gotm either way.

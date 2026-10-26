@@ -95,10 +95,18 @@ func (r *Recorder) Add(s *Snapshot) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if s.T < r.last {
-		r.last = 0 // the clock stepped backwards: keep recording rather than pause until it catches up
+	if !r.enabled {
+		return
 	}
-	if !r.enabled || s.T-r.last < r.every.Milliseconds() {
+	if s.T < r.last {
+		// Range and nearest-sample searches require chronological, unique times.
+		// Supersede the old future tail (including any sample at this time),
+		// just as the sampler does for its graph history after a clock change.
+		i := sort.Search(len(r.ring), func(i int) bool { return r.ring[i].T >= s.T })
+		r.ring = r.ring[:i]
+		r.last = 0
+	}
+	if s.T-r.last < r.every.Milliseconds() {
 		return
 	}
 	r.last = s.T

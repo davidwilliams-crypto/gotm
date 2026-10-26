@@ -38,42 +38,24 @@ func ReadDrivers() ([]DriverInfo, error) {
 	}
 	defer windows.CloseServiceHandle(scm)
 
-	var needed, returned, resume uint32
-	var buf []byte
-	for {
-		var p *byte
-		if len(buf) > 0 {
-			p = &buf[0]
+	out := make([]DriverInfo, 0)
+	err = enumerateServiceStatus(scm, windows.SERVICE_DRIVER, func(entries []windows.ENUM_SERVICE_STATUS_PROCESS) {
+		for _, e := range entries {
+			name := windows.UTF16PtrToString(e.ServiceName)
+			st := e.ServiceStatusProcess
+			d := DriverInfo{
+				Name:    name,
+				Display: windows.UTF16PtrToString(e.DisplayName),
+				State:   svcStateNames[st.CurrentState],
+				Kind:    driverKinds[st.ServiceType&0xB],
+			}
+			d.StartType, d.Path = serviceConfig(scm, name)
+			d.Path = normalizeDriverPath(d.Path, name)
+			out = append(out, d)
 		}
-		err = windows.EnumServicesStatusEx(scm, scEnumProcessInfo, windows.SERVICE_DRIVER, serviceStateAll,
-			p, uint32(len(buf)), &needed, &returned, &resume, nil)
-		if err == nil {
-			break
-		}
-		if err != windows.ERROR_MORE_DATA {
-			return nil, fmt.Errorf("enumerate drivers: %w", err)
-		}
-		if needed == 0 {
-			needed = 128 * 1024
-		}
-		buf = make([]byte, needed)
-		resume = 0
-	}
-
-	entries := unsafe.Slice((*windows.ENUM_SERVICE_STATUS_PROCESS)(unsafe.Pointer(&buf[0])), returned)
-	out := make([]DriverInfo, 0, returned)
-	for _, e := range entries {
-		name := windows.UTF16PtrToString(e.ServiceName)
-		st := e.ServiceStatusProcess
-		d := DriverInfo{
-			Name:    name,
-			Display: windows.UTF16PtrToString(e.DisplayName),
-			State:   svcStateNames[st.CurrentState],
-			Kind:    driverKinds[st.ServiceType&0xB],
-		}
-		d.StartType, d.Path = serviceConfig(scm, name)
-		d.Path = normalizeDriverPath(d.Path, name)
-		out = append(out, d)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enumerate drivers: %w", err)
 	}
 	fillVersionInfo(out)
 	sort.Slice(out, func(i, j int) bool {

@@ -40,6 +40,8 @@ type SensorHub struct {
 	maxMHz       []uint32
 	slowAt       time.Time
 	slowing      bool
+	powerAt      time.Time
+	powering     bool
 	ext          *ExternalSource
 	ryzen        *RyzenSDK
 	detailWanted atomic.Bool
@@ -122,24 +124,43 @@ func (h *SensorHub) Drives() []DriveHealth {
 // polling every drive every 15 s keeps disks and NVMe out of low-power states.
 func (h *SensorHub) SetDetailWanted(on bool) { h.detailWanted.Store(on) }
 
-// refreshSlow reads the sensors that are slow or rarely change, off-thread.
+// refreshSlow reads rarely changing sensors off-thread. Power state must stay
+// fresh on every page, independently of the drive-health polling gate.
 func (h *SensorHub) refreshSlow() {
+	h.refreshSlowWith(ReadDriveHealth, ReadPowerStatic, ReadCPUClocks)
+}
+
+func (h *SensorHub) refreshSlowWith(readDrives func() []DriveHealth, readPower func() PowerStatic, readClocks func() ([]uint32, []uint32)) {
 	h.mu.Lock()
-	if h.slowing || time.Since(h.slowAt) < 15*time.Second || (!h.slowAt.IsZero() && !h.detailWanted.Load()) {
-		h.mu.Unlock()
-		return
+	now := time.Now()
+	powerDue := !h.powering && now.Sub(h.powerAt) >= 15*time.Second
+	drivesDue := !h.slowing && now.Sub(h.slowAt) >= 15*time.Second && (h.slowAt.IsZero() || h.detailWanted.Load())
+	if powerDue {
+		h.powering = true
 	}
-	h.slowing = true
+	if drivesDue {
+		h.slowing = true
+	}
 	h.mu.Unlock()
-	go func() {
-		d := ReadDriveHealth()
-		p := ReadPowerStatic()
-		_, mx := ReadCPUClocks()
-		h.mu.Lock()
-		h.drives, h.power, h.maxMHz = d, p, mx
-		h.slowAt, h.slowing = time.Now(), false
-		h.mu.Unlock()
-	}()
+	if powerDue {
+		go func() {
+			p := readPower()
+			_, mx := readClocks()
+			h.mu.Lock()
+			h.power, h.maxMHz = p, mx
+			h.powerAt, h.powering = time.Now(), false
+			h.mu.Unlock()
+		}()
+	}
+	if drivesDue {
+		go func() {
+			d := readDrives()
+			h.mu.Lock()
+			h.drives = d
+			h.slowAt, h.slowing = time.Now(), false
+			h.mu.Unlock()
+		}()
+	}
 }
 
 func (h *SensorHub) track(id string, v float64) *minMax {

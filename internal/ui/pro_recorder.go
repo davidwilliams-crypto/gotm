@@ -330,9 +330,9 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	fillRound(cv, rect{pr.X - 12, pr.Y - 12, pr.W + 24, pr.H + 52}, 10, T.Card)
 	strokeRound(cv, rect{pr.X - 12, pr.Y - 12, pr.W + 24, pr.H + 52}, 10, T.Stroke)
 
-	capN := int((to - from) / 2000)
-	if capN < 2 {
-		capN = 2
+	times := make([]int64, len(samples))
+	for i, s := range samples {
+		times[i] = s.T
 	}
 	mk := func(get func(s metrics.RecSample) float64) []float64 {
 		out := make([]float64, len(samples))
@@ -341,13 +341,12 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		}
 		return out
 	}
-	// right-align by sampling position within the window
 	ser := []series{
-		{vals: mk(func(s metrics.RecSample) float64 { return s.Mem }), color: T.Mem},
-		{vals: mk(func(s metrics.RecSample) float64 { return s.GPU }), color: T.GPU},
-		{vals: mk(func(s metrics.RecSample) float64 { return s.CPU }), color: T.CPU, fill: true},
+		{vals: mk(func(s metrics.RecSample) float64 { return s.Mem }), times: times, color: T.Mem},
+		{vals: mk(func(s metrics.RecSample) float64 { return s.GPU }), times: times, color: T.GPU},
+		{vals: mk(func(s metrics.RecSample) float64 { return s.CPU }), times: times, color: T.CPU, fill: true},
 	}
-	plotSeries(cv, pr, ser, graphStyle{bg: T.Card, max: 100, capacity: capN, grid: true, lineW: 2})
+	plotSeries(cv, pr, ser, graphStyle{bg: T.Card, max: 100, timeFrom: from, timeTo: to, grid: true, lineW: 2})
 	drawText(cv, "100%", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + 2, 50, 14}, taLeft)
 	drawText(cv, "0", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + pr.H - 16, 30, 14}, taLeft)
 
@@ -377,7 +376,7 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		if m.T < from || m.T > to {
 			continue
 		}
-		x := pr.X + int(float64(m.T-from)/float64(to-from)*float64(pr.W))
+		x := pr.X + int(timePosition(m.T, from, to)*float64(pr.W))
 		fillRect(cv, rect{x, pr.Y, 1, pr.H}, T.Warn)
 		drawText(cv, m.Label, uiFont(8), T.Warn, rect{x + 4, pr.Y + 2, 70, 14}, taLeft)
 	}
@@ -388,7 +387,7 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		selT = to
 	}
 	if selT >= from && selT <= to {
-		x := pr.X + int(float64(selT-from)/float64(to-from)*float64(pr.W))
+		x := pr.X + int(timePosition(selT, from, to)*float64(pr.W))
 		fillRect(cv, rect{x - 1, pr.Y, 2, pr.H}, T.Text)
 		fillRound(cv, rect{x - 5, pr.Y - 8, 10, 10}, 5, T.Text)
 	}

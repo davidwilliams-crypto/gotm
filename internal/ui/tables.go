@@ -259,24 +259,43 @@ func rowStyle(row, selected int) (bg, fg walk.Color) {
 	return T.TableBG, T.Text
 }
 
-// selectQuietly selects row i in the native list without scrolling to it,
-// then tells Walk, keeping its idea of the current row in step.
+// Walk's SetCurrentIndex synchronizes its current row, native selection and
+// notifications, but unconditionally ensures the row is visible. Suppress
+// only that message while restoring selection, including notifications that
+// synchronize the frozen and normal halves. All calls run on the UI thread.
+var (
+	quietSelectOnce sync.Once
+	quietSelectCB   uintptr
+	quietSelectPrev = map[win.HWND]uintptr{}
+)
+
+func quietSelectProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
+	defer uiaGuard(&ret, 0)
+	if msg == win.LVM_ENSUREVISIBLE {
+		return win.TRUE
+	}
+	return win.CallWindowProc(quietSelectPrev[win.HWND(hwnd)], win.HWND(hwnd), uint32(msg), wp, lp)
+}
+
+// selectQuietly uses the toolkit API so both Walk and the native controls
+// agree on selection, without moving the reader's viewport.
 func selectQuietly(tv *walk.TableView, i int) {
-	top := -1
+	quietSelectOnce.Do(func() { quietSelectCB = syscall.NewCallback(quietSelectProc) })
+	var hooked []win.HWND
 	for _, lv := range listViews(tv) {
-		top = int(win.SendMessage(lv, win.LVM_GETTOPINDEX, 0, 0))
-		per := int(win.SendMessage(lv, win.LVM_GETCOUNTPERPAGE, 0, 0))
-		if i >= top && i <= top+per {
-			_ = tv.SetCurrentIndex(i) // visible anyway: nothing will move
-			return
+		if _, alreadyHooked := quietSelectPrev[lv]; alreadyHooked {
+			continue
+		}
+		if prev := win.SetWindowLongPtr(lv, win.GWLP_WNDPROC, quietSelectCB); prev != 0 {
+			quietSelectPrev[lv] = prev
+			hooked = append(hooked, lv)
 		}
 	}
-	// off screen: select via the list view without LVM_ENSUREVISIBLE
-	for _, lv := range listViews(tv) {
-		var item win.LVITEM
-		item.StateMask = win.LVIS_SELECTED | win.LVIS_FOCUSED
-		item.State = win.LVIS_SELECTED | win.LVIS_FOCUSED
-		win.SendMessage(lv, win.LVM_SETITEMSTATE, uintptr(i), uintptr(unsafe.Pointer(&item)))
-	}
-	_ = top
+	defer func() {
+		for _, lv := range hooked {
+			win.SetWindowLongPtr(lv, win.GWLP_WNDPROC, quietSelectPrev[lv])
+			delete(quietSelectPrev, lv)
+		}
+	}()
+	_ = tv.SetCurrentIndex(i)
 }

@@ -20,7 +20,7 @@
 #>
 param(
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string]$Version = "0.9.2",
+  [string]$Version = "0.9.3",
   [switch]$SkipTests,
   [string]$SignThumbprint = "",
   [switch]$TrustedSigning,
@@ -70,7 +70,6 @@ $trustedDlib = $null
 $trustedMetadata = $null
 if ($TrustedSigning) {
     $trustedDlib = & (Join-Path $PSScriptRoot 'tools\get-signing-client.ps1')
-    if ($LASTEXITCODE) { throw 'fetching the Trusted Signing client failed' }
     # What the plug-in needs to know: where the account lives and which profile
     # signs. Credentials are never in here; the plug-in takes them from the
     # signed-in Azure session (or AZURE_* variables). Cloud-only credential

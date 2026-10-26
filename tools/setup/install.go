@@ -21,11 +21,13 @@ import (
 // layout says where everything goes; tests point it at temporary folders and
 // a throw-away registry key.
 type layout struct {
-	dir       string // install folder
-	startMenu string // folder that receives the Start menu shortcut
-	desktop   string // folder that receives the optional desktop shortcut
-	regRoot   registry.Key
-	regPath   string // the Apps & features (Uninstall) entry
+	dir             string // install folder
+	startMenu       string // folder that receives the Start menu shortcut
+	desktop         string // folder that receives the optional desktop shortcut
+	regRoot         registry.Key
+	regPath         string                                                  // the Apps & features (Uninstall) entry
+	inspectSecurity func(windows.Handle, bool) error                        // nil uses production ACL policy
+	queryVolume     func(string, windows.Handle) (destinationVolume, error) // nil uses native volume APIs
 }
 
 const uninstallKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\gotm`
@@ -58,8 +60,8 @@ func (l layout) installed() (ver, dir string) {
 	defer k.Close()
 	ver, _, _ = k.GetStringValue("DisplayVersion")
 	dir, _, _ = k.GetStringValue("InstallLocation")
-	if dir != "" && !filepath.IsAbs(dir) {
-		dir = ""
+	if dir != "" {
+		dir, _ = normalizeDestinationPath(dir)
 	}
 	return ver, dir
 }
@@ -72,15 +74,22 @@ func errRunning(err error) bool { return errors.Is(err, errGotmRunning) }
 // install copies the payload, the uninstaller, shortcuts and the Apps &
 // features entry. Re-running it over an existing install upgrades in place.
 func (l layout) install(payload fs.FS, self, ver string, desktop bool) error {
+	var err error
+	l.dir, err = normalizeDestinationPath(l.dir)
+	if err != nil {
+		return err
+	}
+	guard, err := l.protectDestination()
+	if err != nil {
+		return err
+	}
+	defer guard.close()
 	exe := filepath.Join(l.dir, "gotm.exe")
 	if runningFrom(exe) {
 		return errGotmRunning
 	}
-	if err := os.MkdirAll(l.dir, 0o755); err != nil {
-		return err
-	}
 	var size int64
-	err := fs.WalkDir(payload, ".", func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(payload, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !owned(d.Name()) {
 			return err
 		}
@@ -89,7 +98,7 @@ func (l layout) install(payload fs.FS, self, ver string, desktop bool) error {
 			return err
 		}
 		size += int64(len(data))
-		return writeAtomic(filepath.Join(l.dir, d.Name()), data)
+		return l.writePayload(filepath.Join(l.dir, d.Name()), data)
 	})
 	if err != nil {
 		return err
@@ -103,7 +112,7 @@ func (l layout) install(payload fs.FS, self, ver string, desktop bool) error {
 			return fmt.Errorf("copy uninstaller: %w", err)
 		}
 		size += int64(len(data))
-		if err := writeAtomic(unin, data); err != nil {
+		if err := l.writePayload(unin, data); err != nil {
 			return err
 		}
 	}
@@ -193,10 +202,31 @@ func (l layout) uninstall() error {
 
 // writeAtomic writes data beside the target and renames it into place, so a
 // failed copy never leaves a truncated gotm.exe behind.
-func writeAtomic(path string, data []byte) error {
-	tmp := path + ".new"
-	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+func (l layout) writePayload(path string, data []byte) error {
+	return writeAtomic(path, data, l.inspectSecurity)
+}
+
+func writeAtomic(path string, data []byte, inspect func(windows.Handle, bool) error) error {
+	if inspect == nil {
+		inspect = inspectDestinationSecurity
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".gotm-*")
+	if err != nil {
 		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := inspect(windows.Handle(f.Fd()), true); err != nil {
+		f.Close()
+		return fmt.Errorf("unsafe payload file: %w", err)
+	}
+	_, err = f.Write(data)
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

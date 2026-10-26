@@ -128,6 +128,7 @@ const supersample = 3 // GDI has no anti-aliasing, so graphs are drawn at 3x and
 // series is one plotted curve.
 type series struct {
 	vals  []float64
+	times []int64 // optional timestamps; otherwise use the graph's sample capacity
 	color walk.Color
 	fill  bool
 }
@@ -139,6 +140,8 @@ type graphStyle struct {
 	grid     bool
 	lineW    int // line width in output pixels
 	smooth   bool
+	timeFrom int64 // timestamp domain, used with series.times
+	timeTo   int64
 }
 
 // niceCeil rounds m up to a "round" axis maximum.
@@ -226,7 +229,11 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 		x0 := float64(W) - float64(n-1)*step
 		for i, v := range s.vals {
 			y := float64(H) - math.Min(1, math.Max(0, v/maxV))*float64(H-ss)
-			pts[i] = walk.Point{X: int(x0 + float64(i)*step), Y: int(y)}
+			x := x0 + float64(i)*step
+			if len(s.times) == n && st.timeTo > st.timeFrom {
+				x = timePosition(s.times[i], st.timeFrom, st.timeTo) * float64(W)
+			}
+			pts[i] = walk.Point{X: int(x), Y: int(y)}
 		}
 		if s.fill {
 			// area under the curve, as 1px (supersampled) vertical strokes
@@ -259,4 +266,13 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 	win.StretchBlt(dst.HDC(), int32(r.X), int32(r.Y), int32(r.W), int32(r.H),
 		cv.HDC(), 0, 0, int32(W), int32(H), win.SRCCOPY)
 	return maxV
+}
+
+// timePosition gives samples, markers and the selection cursor the same
+// normalized position, including the exact start and end of the chart.
+func timePosition(t, from, to int64) float64 {
+	if to <= from {
+		return 0
+	}
+	return float64(t-from) / float64(to-from)
 }
