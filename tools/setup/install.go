@@ -14,6 +14,8 @@ import (
 	"time"
 	"unsafe"
 
+	"gotm/internal/taskmanager"
+
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
@@ -21,13 +23,14 @@ import (
 // layout says where everything goes; tests point it at temporary folders and
 // a throw-away registry key.
 type layout struct {
-	dir             string // install folder
-	startMenu       string // folder that receives the Start menu shortcut
-	desktop         string // folder that receives the optional desktop shortcut
-	regRoot         registry.Key
-	regPath         string                                                  // the Apps & features (Uninstall) entry
-	inspectSecurity func(windows.Handle, bool) error                        // nil uses production ACL policy
-	queryVolume     func(string, windows.Handle) (destinationVolume, error) // nil uses native volume APIs
+	dir              string // install folder
+	startMenu        string // folder that receives the Start menu shortcut
+	desktop          string // folder that receives the optional desktop shortcut
+	regRoot          registry.Key
+	regPath          string                                                  // the Apps & features (Uninstall) entry
+	inspectSecurity  func(windows.Handle, bool) error                        // nil uses production ACL policy
+	queryVolume      func(string, windows.Handle) (destinationVolume, error) // nil uses native volume APIs
+	taskManagerStore *taskmanager.Store                                      // nil uses machine routing; tests always supply an HKCU scratch store
 }
 
 const uninstallKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\gotm`
@@ -74,6 +77,7 @@ func errRunning(err error) bool { return errors.Is(err, errGotmRunning) }
 // install copies the payload, the uninstaller, shortcuts and the Apps &
 // features entry. Re-running it over an existing install upgrades in place.
 func (l layout) install(payload fs.FS, self, ver string, desktop bool) error {
+	_, previousDir := l.installed()
 	var err error
 	l.dir, err = normalizeDestinationPath(l.dir)
 	if err != nil {
@@ -127,7 +131,7 @@ func (l layout) install(payload fs.FS, self, ver string, desktop bool) error {
 			return fmt.Errorf("desktop shortcut: %w", err)
 		}
 	}
-	return l.register(ver, size)
+	return l.commitInstall(previousDir, func() error { return l.register(ver, size) })
 }
 
 func owned(name string) bool {
@@ -175,6 +179,9 @@ func (l layout) uninstall() error {
 	if runningFrom(filepath.Join(l.dir, "gotm.exe")) {
 		return errGotmRunning
 	}
+	if err := l.routingStore().Restore(filepath.Join(l.dir, "gotm.exe")); err != nil {
+		return fmt.Errorf("restore Windows Task Manager before removing gotm: %w", err)
+	}
 	var errs []error
 	for _, f := range ownedFiles {
 		if f == "uninstall.exe" {
@@ -185,6 +192,12 @@ func (l layout) uninstall() error {
 				errs = append(errs, err)
 			}
 		}
+	}
+	// An older installed helper may still exist after a relocation. It owns
+	// its payload, but the newer installation owns shared shortcuts/metadata.
+	_, registeredDir := l.installed()
+	if registeredDir != "" && !strings.EqualFold(registeredDir, l.dir) {
+		return errors.Join(errs...)
 	}
 	for _, d := range []string{l.startMenu, l.desktop} {
 		if d == "" {

@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"golang.org/x/sys/windows"
+	"gotm/internal/taskmanager"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,18 +24,23 @@ func testLayout(t *testing.T) layout {
 	root := t.TempDir()
 	l := layout{
 		inspectSecurity: func(windows.Handle, bool) error { return nil },
-		dir:             filepath.Join(root, "Program Files", "gotm"),
-		startMenu:       filepath.Join(root, "Start Menu"),
-		desktop:         filepath.Join(root, "Desktop"),
-		regRoot:         registry.CURRENT_USER,
-		regPath:         `Software\gotm-setup-test\` + strings.ReplaceAll(t.Name(), "/", "_"),
+		queryVolume: func(string, windows.Handle) (destinationVolume, error) {
+			return destinationVolume{driveType: windows.DRIVE_FIXED, driveDevice: "test-volume", volumeDevice: "test-volume", mountVolume: "test-root", finalRoot: "test-root"}, nil
+		},
+		dir:       filepath.Join(root, "Program Files", "gotm"),
+		startMenu: filepath.Join(root, "Start Menu"),
+		desktop:   filepath.Join(root, "Desktop"),
+		regRoot:   registry.CURRENT_USER,
+		regPath:   `Software\gotm-setup-test\` + strings.ReplaceAll(t.Name(), "/", "_"),
 	}
+	l.taskManagerStore = &taskmanager.Store{Root: registry.CURRENT_USER, Path: l.regPath + "-routing"}
 	for _, d := range []string{l.startMenu, l.desktop} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	t.Cleanup(func() {
+		_ = registry.DeleteKey(registry.CURRENT_USER, l.taskManagerStore.Path)
 		_ = registry.DeleteKey(registry.CURRENT_USER, l.regPath)
 		_ = registry.DeleteKey(registry.CURRENT_USER, `Software\gotm-setup-test`)
 	})

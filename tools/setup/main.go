@@ -42,10 +42,19 @@ const title = "gotm Setup"
 type options struct {
 	silent, uninstall, desktop bool
 	dir                        string
+	taskManager                string
 }
 
 func parseArgs(args []string) (options, error) {
 	var o options
+	// Respect /S even when an earlier argument is invalid, so scripted
+	// maintenance failures never block on an interactive message box.
+	for _, a := range args {
+		switch strings.ToLower(a) {
+		case "/s", "/silent", "/quiet":
+			o.silent = true
+		}
+	}
 	for _, a := range args {
 		switch l := strings.ToLower(a); {
 		case l == "/s" || l == "/silent" || l == "/quiet":
@@ -54,6 +63,12 @@ func parseArgs(args []string) (options, error) {
 			o.uninstall = true
 		case l == "/desktop":
 			o.desktop = true
+		case strings.HasPrefix(l, "/taskmanager="):
+			mode := strings.TrimPrefix(l, "/taskmanager=")
+			if o.taskManager != "" || (mode != "on" && mode != "off") {
+				return o, fmt.Errorf("use exactly one /taskmanager=on or /taskmanager=off")
+			}
+			o.taskManager = mode
 		case strings.HasPrefix(l, "/d="):
 			var err error
 			o.dir, err = normalizeDestinationPath(strings.Trim(a[3:], `"`))
@@ -61,10 +76,13 @@ func parseArgs(args []string) (options, error) {
 				return o, fmt.Errorf("/D= needs an absolute folder, got %q", a[3:])
 			}
 		case l == "/?" || l == "/h" || l == "/help":
-			return o, fmt.Errorf("usage: setup [/S] [/D=folder] [/desktop]   |   uninstall.exe /uninstall [/S]")
+			return o, fmt.Errorf("usage: setup [/S] [/D=folder] [/desktop]   |   uninstall.exe /uninstall [/S]   |   uninstall.exe /taskmanager=on|off [/S]")
 		default:
 			return o, fmt.Errorf("unknown option %q", a)
 		}
+	}
+	if (o.taskManager != "" && (o.uninstall || o.dir != "" || o.desktop)) || (o.uninstall && (o.dir != "" || o.desktop)) {
+		return o, fmt.Errorf("install, uninstall and Task Manager maintenance options cannot be combined")
 	}
 	return o, nil
 }
@@ -80,13 +98,24 @@ func run() int {
 		msg(o.silent, err.Error(), windows.MB_ICONERROR)
 		return 1
 	}
+	if o.taskManager != "" {
+		self, err := os.Executable()
+		if err == nil {
+			err = machineLayout().maintainTaskManager(self, o.taskManager)
+		}
+		if err != nil {
+			msg(o.silent, "Task Manager replacement could not be changed:\n\n"+err.Error(), windows.MB_ICONERROR)
+			return 1
+		}
+		return 0
+	}
+	if o.uninstall {
+		return runUninstall(o)
+	}
 	payload, err := openPayload(payloadFS)
 	if err != nil {
 		msg(o.silent, "This setup is damaged: "+err.Error(), windows.MB_ICONERROR)
 		return 1
-	}
-	if o.uninstall {
-		return runUninstall(o)
 	}
 	return runInstall(o, payload)
 }
@@ -145,7 +174,11 @@ func runUninstall(o options) int {
 		return 1
 	}
 	l := machineLayout()
-	l.dir = filepath.Dir(self)
+	l, err = l.uninstallLayout(self)
+	if err != nil {
+		msg(o.silent, "gotm could not be removed safely:\n\n"+err.Error(), windows.MB_ICONERROR)
+		return 1
+	}
 	if !o.silent && ask("Remove gotm from this computer?", windows.MB_YESNO|windows.MB_ICONQUESTION) != idYes {
 		return 2
 	}

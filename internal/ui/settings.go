@@ -33,6 +33,8 @@ type settingsTab struct {
 	scroll  int // vertical offset, design units
 	content int // total content height from the last paint
 	viewH   int
+
+	taskManager taskManagerSetting
 }
 
 func newSettingsTab(a *App) *settingsTab {
@@ -60,6 +62,7 @@ func (t *settingsTab) build() decl.Widget {
 
 func (t *settingsTab) init() {
 	t.app.registerRoot(pgSettings, t.root)
+	t.refreshTaskManager(true)
 	t.v.onWheel = func(delta int) {
 		t.scrollBy(-delta / 2) // one wheel notch (120) moves 60 design units
 	}
@@ -84,9 +87,9 @@ func (t *settingsTab) scrollBy(d int) {
 		t.v.invalidate()
 	}
 }
-func (t *settingsTab) shown()                   { t.v.invalidate() }
+func (t *settingsTab) shown()                   { t.refreshTaskManager(true); t.v.invalidate() }
 func (t *settingsTab) focusTarget() walk.Window { return t.v.cw }
-func (t *settingsTab) reload()                  { t.v.invalidate() }
+func (t *settingsTab) reload()                  { t.refreshTaskManager(true); t.v.invalidate() }
 
 func (t *settingsTab) pageKey(key walk.Key, mods walk.Modifiers) bool {
 	if key == walk.KeyTab && (mods == 0 || mods == walk.ModShift) || mods == 0 && (key == walk.KeyLeft || key == walk.KeyRight) {
@@ -130,9 +133,8 @@ func (t *settingsTab) pageKey(key walk.Key, mods walk.Modifiers) bool {
 	return true
 }
 func (t *settingsTab) tick(*metrics.Snapshot) {
-	if t.app.sensors.Ryzen() != nil {
-		t.v.invalidate() // keeps the AMD SDK status line live
-	}
+	t.refreshTaskManager(false)
+	t.v.invalidate() // keeps machine-wide settings and AMD SDK status current
 }
 
 // chip draws a pill button and registers its hit area. group names the
@@ -244,6 +246,18 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 	t.chip(cv, 44, top+48, 230, "Keep recording on disk", cfg.RecorderDisk, "recdisk", "")
 	t.note(cv, "Off by default: samples (including process names) stay in memory only.",
 		uiFont(9), T.Muted, rect{290, top + 48, w - 340, 30})
+
+	// ---- Windows Task Manager ----
+	top = y
+	y = t.section(cv, y, w, "Windows Task Manager", 152)
+	label, note := t.taskManagerText()
+	t.chip(cv, 44, top+48, 300, label, t.taskManager.state.Owned, "taskmanager", "")
+	t.note(cv, note, uiFont(9), T.Muted, rect{44, top + 82, w - 88, 26})
+	scope := "Applies to every user. Turn it off here to restore Windows Task Manager."
+	if !t.app.host.Elevated {
+		scope = "Applies to every user. Run as administrator to change it."
+	}
+	t.note(cv, scope, uiFont(9), T.Muted, rect{44, top + 110, w - 88, 26})
 
 	// ---- AMD Ryzen sensors ----
 	top = y
@@ -418,6 +432,8 @@ func (t *settingsTab) onClick(id string, _ walk.MouseButton) {
 		if a.saveConfig(func(c *configT) { c.RecorderDisk = v }) {
 			a.rec.SetPersist(v)
 		}
+	case id == "taskmanager":
+		t.changeTaskManager()
 	case id == "ryzensdk":
 		if !a.host.Elevated {
 			walk.MsgBox(a.mw, "AMD Ryzen sensors",

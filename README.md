@@ -5,7 +5,7 @@ system directly (no cgo, no third-party runtime) behind a dark, owner-drawn
 Win32 interface. No browser, no local web server.
 
 ```
-.\build.ps1 -Version 0.9.3   # resources, vet, tests, gotm.exe, installer and portable zip in dist\release\gotm-0.9.3
+.\build.ps1 -Version 0.9.4   # resources, vet, tests, gotm.exe, installer and portable zip in dist\release\gotm-0.9.4
 .\dist\gotm.exe        # run; reopens the page you last used (or --tab performance|processes|startup|services|power|recorder|connections|apps|drivers|disk|settings)
 .\tools\elevated-check.ps1   # one UAC prompt: runs the administrator-only self-tests and captures the elevated app
 ```
@@ -13,6 +13,30 @@ Win32 interface. No browser, no local web server.
 Windows 10/11 x64. Click **“Run as administrator”** in the footer to
 relaunch as administrator (needed to end protected processes, control most
 services, and read some drive details).
+
+## Replace Windows Task Manager
+
+Install gotm, open its installed copy, choose **Run as administrator**, then
+open **Settings ▸ Windows Task Manager ▸ Replace Task Manager**. Once enabled,
+launches of `taskmgr.exe` (including Ctrl+Shift+Esc and the usual Windows Task
+Manager commands) open gotm's Processes page. The switch applies to every user
+on the PC and remains off until enabled explicitly.
+
+Choose **Restore Windows Task Manager** in the same place to turn it off.
+Uninstall restores any routing still owned by that installation before removing
+the executable. Existing replacements or active launch filters from another
+program are preserved; restore those through their owning program first.
+Portable and unprotected copies cannot enable replacement.
+
+For recovery when the UI cannot open, use an administrator PowerShell window:
+
+```powershell
+& 'C:\Program Files\gotm\uninstall.exe' /taskmanager=off
+```
+
+Use the actual installation folder if a protected custom folder was chosen.
+This recovery action also works when `gotm.exe` is missing. Setup and uninstall
+maintain the setting across in-place upgrades and protected-folder relocations.
 
 ## Distributing
 

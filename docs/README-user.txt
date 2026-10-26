@@ -46,6 +46,23 @@ Using it
   Enter), screen readers such as Narrator read the cards, charts captions and
   settings, and a Windows high-contrast theme is used as soon as it is on.
 
+Use gotm as Windows Task Manager
+-------------------------------
+Install gotm first, open its installed copy and choose "Run as administrator".
+In Settings > Windows Task Manager, select "Replace Task Manager". This applies
+to every user on the PC. Task Manager launches, including Ctrl+Shift+Esc, open
+gotm's Processes page. Replacement stays off until you enable it explicitly.
+
+Select "Restore Windows Task Manager" there to turn it off. Uninstall restores
+gotm's own routing before deleting its files. Other programs' replacements and
+launch filters are preserved; restore those through their own program first.
+Portable copies cannot enable replacement.
+
+If gotm cannot open, run this in an administrator PowerShell window (use your
+actual folder if you installed to a protected custom location):
+  & 'C:\Program Files\gotm\uninstall.exe' /taskmanager=off
+This also works if gotm.exe is missing.
+
 Privacy
 -------
 gotm makes no internet connections and collects nothing. The only network

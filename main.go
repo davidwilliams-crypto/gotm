@@ -19,7 +19,7 @@ import (
 )
 
 // version is overridden at build time: -ldflags "-X main.version=1.2.3".
-var version = "0.9.3-dev"
+var version = "0.9.4-dev"
 
 func init() {
 	// Take the current directory out of the DLL search path (the classic
@@ -32,21 +32,22 @@ func init() {
 }
 
 func main() {
-	showVersion := flag.Bool("version", false, "print version and exit")
-	tab := flag.String("tab", "",
-		"page to open: performance, processes, startup, services, power, recorder, connections, apps, drivers, disk, settings (default: the page open when gotm last closed)")
-	probe := flag.String("ryzen-probe", "",
-		"diagnostic: start the AMD Ryzen Monitoring SDK inside this process and write the result to FILE (run as administrator)")
-	flag.Parse()
-	if *probe != "" {
-		ryzenProbe(*probe)
+	opts, err := parseLaunchOptions(os.Args[1:])
+	if err != nil {
+		if err != flag.ErrHelp {
+			os.Exit(2)
+		}
+		return
+	}
+	if opts.probe != "" {
+		ryzenProbe(opts.probe)
 		return
 	}
 	ui.StartTab = -1
-	if n, ok := ui.PageIDs[*tab]; ok {
+	if n, ok := ui.PageIDs[opts.tab]; ok {
 		ui.StartTab = n
 	}
-	if *showVersion {
+	if opts.showVersion {
 		fmt.Println("gotm", version)
 		return
 	}
@@ -70,6 +71,33 @@ func main() {
 		walk.MsgBox(nil, "gotm", "gotm could not start:\n\n"+err.Error(), walk.MsgBoxIconError)
 		os.Exit(1)
 	}
+}
+
+type launchOptions struct {
+	showVersion bool
+	tab         string
+	probe       string
+	taskManager bool
+}
+
+func parseLaunchOptions(args []string) (launchOptions, error) {
+	// IFEO prefixes our mode before Windows' original taskmgr command line.
+	// Treat the entire suffix as Task Manager arguments, even if it happens
+	// to contain one of gotm's diagnostic or maintenance option names.
+	if len(args) > 0 && (args[0] == "--task-manager" || args[0] == "-task-manager") {
+		return launchOptions{taskManager: true, tab: "processes"}, nil
+	}
+	var opts launchOptions
+	flags := flag.NewFlagSet("gotm", flag.ContinueOnError)
+	flags.BoolVar(&opts.showVersion, "version", false, "print version and exit")
+	flags.BoolVar(&opts.taskManager, "task-manager", false, "open Processes when launched as the Windows Task Manager replacement")
+	flags.StringVar(&opts.tab, "tab", "", "page to open: performance, processes, startup, services, power, recorder, connections, apps, drivers, disk, settings (default: the page open when gotm last closed)")
+	flags.StringVar(&opts.probe, "ryzen-probe", "", "diagnostic: start the AMD Ryzen Monitoring SDK inside this process and write the result to FILE (run as administrator)")
+	err := flags.Parse(args)
+	if err == nil && opts.taskManager {
+		opts = launchOptions{taskManager: true, tab: "processes"}
+	}
+	return opts, err
 }
 
 // ryzenProbe runs the SDK diagnostic in the app's own process: after the GUI
