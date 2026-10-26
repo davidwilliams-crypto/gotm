@@ -5,7 +5,7 @@ system directly (no cgo, no third-party runtime) behind a dark, owner-drawn
 Win32 interface. No browser, no local web server.
 
 ```
-.\build.ps1 -Version 0.9.4   # resources, vet, tests, gotm.exe, installer and portable zip in dist\release\gotm-0.9.4
+.\build.ps1 -Version 0.9.5   # resources, vet, tests, gotm.exe, installer and portable zip in dist\release\gotm-0.9.5
 .\dist\gotm.exe        # run; reopens the page you last used (or --tab performance|processes|startup|services|power|recorder|connections|apps|drivers|disk|settings)
 .\tools\elevated-check.ps1   # one UAC prompt: runs the administrator-only self-tests and captures the elevated app
 ```
@@ -75,7 +75,7 @@ to sign both executables (each build also verifies its signatures):
 | **Startup apps** | registry Run keys, Startup folders, logon scheduled tasks; tick to enable/disable |
 | **Services** | state, start type, PID; start / stop / restart |
 | **Insights ▸ Power & Freq** | sensor tree with live / min / max: CPU clocks per core, ACPI thermal zones, utilization, memory, one group per GPU (temperatures, clocks, power, voltage, fan, engines, memory), drive temperature and NVMe health, power plan; search includes collapsed branches |
-| **Insights ▸ Flight Recorder** | rolling timeline of CPU / memory / GPU; scrub with the mouse or keyboard; markers at the selected moment; CSV export; optional on-disk history |
+| **Insights ▸ Flight Recorder** | manually started timeline of CPU / memory / GPU; scrub with the mouse or keyboard; markers at the selected moment; CSV export; optional on-disk history |
 | **Insights ▸ Connections** | TCP/UDP endpoints with owning process, state and binding (Network vs Local only); binding alone does not determine firewall reachability |
 | **Insights ▸ Installed Apps** | programs registered with Windows: version, publisher, size, date; open folder; uninstall |
 | **Insights ▸ Drivers** | kernel / file-system drivers with publisher and version; filter to running or non-Microsoft |
@@ -96,7 +96,7 @@ to sign both executables (each build also verifies its signatures):
 | ↑ / ↓, Enter (sidebar, status bar, drive strip) | choose a page, a status-bar button or a drive |
 | ↑ / ↓, Home / End | select a resource on Performance; Space or Enter toggles CPU/GPU graph views |
 | ← / →, Home / End | move between recorded samples; Home selects the oldest, End returns to live |
-| Space / Enter (recorder chart) | pause/resume recording / return to live |
+| Space / Enter (recorder chart) | start/pause recording / return to live |
 | Tab / Shift+Tab, Space / Enter (Settings) | select and change a setting; focus scrolls into view |
 | PgUp / PgDn, ↑ / ↓, Home / End (Settings) | scroll the Settings page |
 

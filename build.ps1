@@ -20,7 +20,7 @@
 #>
 param(
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string]$Version = "0.9.4",
+  [string]$Version = "0.9.5",
   [switch]$SkipTests,
   [string]$SignThumbprint = "",
   [switch]$TrustedSigning,

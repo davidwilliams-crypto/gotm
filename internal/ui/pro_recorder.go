@@ -33,7 +33,7 @@ func newRecorderPage(a *App) *recorderPage {
 	p := &recorderPage{app: a, rangeSecs: 900, live: true,
 		rangeChoices: [4]int{300, 900, 3600, 10800}}
 	p.view = newCanvasView(p.paint)
-	p.view.keyboard, p.view.keyName = true, "Flight recording. Left or Right selects a sample, Home the oldest, End returns to live, Space pauses or resumes recording."
+	p.view.keyboard, p.view.keyName = true, "Flight recording. Left or Right selects a sample, Home the oldest, End returns to live, Space starts or pauses recording."
 	p.view.acc, p.view.accName, p.view.accCtl = true, "Flight recording", ctlPane
 	p.view.onClick = p.onClick
 	p.view.onMove = func(x, y int) {
@@ -42,7 +42,7 @@ func newRecorderPage(a *App) *recorderPage {
 		}
 	}
 
-	p.bRec = newButton("Recording", "", 134, func() {
+	p.bRec = newButton("Start recording", "", 150, func() {
 		a.rec.SetEnabled(!a.rec.Enabled())
 		p.sync()
 	})
@@ -185,7 +185,7 @@ func (p *recorderPage) sync() {
 	if on {
 		p.bRec.setText("Recording")
 	} else {
-		p.bRec.setText("Paused")
+		p.bRec.setText("Start recording")
 	}
 	p.bDisk.set(true, p.app.rec.Persist())
 	hasSamples := p.app.rec.Len() > 0
@@ -411,7 +411,7 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	if !ok {
 		message := "Waiting for the first sample…"
 		if !rec.Enabled() {
-			message = "Recording is paused. Select Paused above to start collecting samples."
+			message = "Select Start recording above to collect samples."
 		}
 		drawText(cv, message, uiFont(11), T.Muted, rect{24, dy, w - 48, 30}, taLeft)
 		return

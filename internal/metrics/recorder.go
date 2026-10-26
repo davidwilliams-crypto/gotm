@@ -61,7 +61,8 @@ type Recorder struct {
 	fileDay string
 }
 
-// NewRecorder keeps `retention` of history, one sample per `every`.
+// NewRecorder keeps `retention` of history, one sample per `every`. Capture
+// starts disabled; each app session requires an explicit SetEnabled(true).
 func NewRecorder(retention, every time.Duration, dir string) *Recorder {
 	if every < time.Second {
 		every = time.Second
@@ -70,7 +71,7 @@ func NewRecorder(retention, every time.Duration, dir string) *Recorder {
 	if n < 60 {
 		n = 60
 	}
-	return &Recorder{capacity: n, every: every, enabled: true, dir: dir}
+	return &Recorder{capacity: n, every: every, dir: dir}
 }
 
 func (r *Recorder) SetEnabled(v bool) { r.mu.Lock(); r.enabled = v; r.mu.Unlock() }

@@ -155,6 +155,7 @@ func TestCancelledScanDoesNotReadRootFiles(t *testing.T) {
 
 func TestRecorderClearAcceptsFirstNewSample(t *testing.T) {
 	r := NewRecorder(time.Hour, 2*time.Second, "")
+	r.SetEnabled(true)
 	r.Add(snap(1_700_000_000_000, 10))
 	r.Clear()
 	r.Add(snap(1_700_000_001_000, 20))
@@ -188,6 +189,7 @@ func TestFutureReplayDoesNotBlockLiveRecording(t *testing.T) {
 	}
 	r := NewRecorder(time.Hour, 2*time.Second, dir)
 	r.LoadDisk(time.Hour)
+	r.SetEnabled(true)
 	r.Add(snap(now, 10))
 	got := r.Samples(0, 0)
 	if len(got) != 1 || got[0].CPU != 10 {
@@ -201,6 +203,7 @@ func snap(t int64, cpu float64, procs ...Proc) *Snapshot {
 
 func TestRecorderRingRangeNearestAndMarks(t *testing.T) {
 	r := NewRecorder(2*time.Minute, time.Second, "")
+	r.SetEnabled(true)
 	base := int64(1_700_000_000_000)
 	for i := 0; i < 200; i++ { // 200 s of 1 Hz samples, ring holds 120
 		r.Add(snap(base+int64(i)*1000, float64(i%100),
@@ -239,6 +242,7 @@ func TestRecorderRingRangeNearestAndMarks(t *testing.T) {
 func TestRecorderRespectsIntervalAndPersists(t *testing.T) {
 	dir := t.TempDir()
 	r := NewRecorder(time.Hour, 2*time.Second, dir)
+	r.SetEnabled(true)
 	r.SetPersist(true)
 	// Model a completed recording, ending before replay starts. Future-dated
 	// samples are deliberately excluded from the historical window.

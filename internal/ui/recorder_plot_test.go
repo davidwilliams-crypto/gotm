@@ -21,6 +21,7 @@ func TestRecorderPlotUsesSampleTimes(t *testing.T) {
 		defer func() { gs = oldScale }()
 		const base = int64(1_700_000_000_000)
 		r := metrics.NewRecorder(time.Hour, 2*time.Second, "")
+		r.SetEnabled(true)
 		for _, s := range []struct {
 			seconds int64
 			cpu     float64

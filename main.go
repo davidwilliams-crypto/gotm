@@ -19,7 +19,7 @@ import (
 )
 
 // version is overridden at build time: -ldflags "-X main.version=1.2.3".
-var version = "0.9.4-dev"
+var version = "0.9.5-dev"
 
 func init() {
 	// Take the current directory out of the DLL search path (the classic

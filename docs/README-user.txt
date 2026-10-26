@@ -32,6 +32,9 @@ Using it
 --------
 - The sidebar lists the pages. Ctrl+1 … Ctrl+0 jump between them, Ctrl+F
   searches the current page, F5 reloads it. Settings lists every shortcut.
+- Flight Recorder starts stopped each time gotm launches. Select "Start
+  recording" on its page, press Space on the chart, or click "REC off" in the
+  status bar to begin. The disk-saving setting does not start recording.
 - Ending tasks, controlling services and changing startup entries for other
   users needs administrator rights: click "Run as administrator" in the
   bottom-right corner and gotm restarts elevated.
@@ -67,8 +70,10 @@ Privacy
 -------
 gotm makes no internet connections and collects nothing. The only network
 access is optional and local: reading LibreHardwareMonitor on 127.0.0.1.
-The Flight Recorder keeps its history in memory unless you turn on
-"Keep recording on disk" (stored in %APPDATA%\gotm).
+The Flight Recorder captures only after you start it manually for the current
+app session. It keeps its history in memory unless you turn on "Keep recording
+on disk" (stored in %APPDATA%\gotm). Saved history can be viewed before starting
+a new recording.
 
 Removing
 --------

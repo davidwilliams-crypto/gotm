@@ -47,6 +47,7 @@ func TestPerformanceKeyboardSelectsResources(t *testing.T) {
 
 func TestRecorderKeyboardMovesBetweenActualSamples(t *testing.T) {
 	r := metrics.NewRecorder(time.Hour, 2*time.Second, "")
+	r.SetEnabled(true)
 	const base = int64(1_700_000_000_000)
 	for i := 0; i < 3; i++ {
 		r.Add(&metrics.Snapshot{T: base + int64(i)*5000})
@@ -68,6 +69,7 @@ func TestRecorderKeyboardMovesBetweenActualSamples(t *testing.T) {
 
 func TestRecorderArrowMovesFromDisplayedNearestSample(t *testing.T) {
 	r := metrics.NewRecorder(time.Hour, 2*time.Second, "")
+	r.SetEnabled(true)
 	const base = int64(1_700_000_000_000)
 	for i := 0; i < 3; i++ {
 		r.Add(&metrics.Snapshot{T: base + int64(i)*5000})

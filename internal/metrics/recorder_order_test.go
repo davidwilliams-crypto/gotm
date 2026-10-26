@@ -9,6 +9,7 @@ import (
 
 func TestRecorderClockRollbackKeepsSearchesChronological(t *testing.T) {
 	r := NewRecorder(time.Hour, 2*time.Second, "")
+	r.SetEnabled(true)
 	base := int64(1_700_000_000_000)
 	r.Add(snap(base, 10))
 	r.Add(snap(base+2000, 20))
@@ -37,6 +38,7 @@ func TestRecorderClockRollbackKeepsSearchesChronological(t *testing.T) {
 
 func TestRecorderRollbackReplacesOverlappingTimestamp(t *testing.T) {
 	r := NewRecorder(time.Hour, 2*time.Second, "")
+	r.SetEnabled(true)
 	base := int64(1_700_000_000_000)
 	for i := range 4 {
 		r.Add(snap(base+int64(i)*2000, float64(i)))
@@ -55,6 +57,7 @@ func TestRecorderRollbackReplacesOverlappingTimestamp(t *testing.T) {
 
 func TestRecorderPausedClockRollbackDoesNotChangeHistory(t *testing.T) {
 	r := NewRecorder(time.Hour, 2*time.Second, "")
+	r.SetEnabled(true)
 	base := int64(1_700_000_000_000)
 	r.Add(snap(base, 10))
 	r.SetEnabled(false)
