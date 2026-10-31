@@ -55,7 +55,10 @@ type ExternalSource struct {
 	source  string
 	lastErr error
 
-	cancel context.CancelFunc
+	startMu sync.Mutex
+	running bool
+	cancel  context.CancelFunc
+	done    chan struct{} // closed by the poll goroutine after clearing state
 }
 
 // NewExternalSource returns a poller for rawURL (loopback only).
@@ -64,10 +67,17 @@ func NewExternalSource(rawURL string) *ExternalSource {
 }
 
 // Start begins polling until Stop. Failed polls back off so a missing program
-// costs almost nothing.
+// costs almost nothing. A second Start while a poller runs is a no-op: it
+// would overwrite the cancel handle and orphan the first goroutine.
 func (e *ExternalSource) Start() {
+	e.startMu.Lock()
+	defer e.startMu.Unlock()
+	if e.running {
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	e.cancel = cancel
+	done := make(chan struct{})
+	e.cancel, e.running, e.done = cancel, true, done
 	go func() {
 		wait := time.Second
 		for {
@@ -78,17 +88,31 @@ func (e *ExternalSource) Start() {
 			}
 			select {
 			case <-ctx.Done():
-				return
 			case <-time.After(wait):
+				continue
 			}
+			break
 		}
+		// Clear the state BEFORE closing done, so a Stop that saw this channel
+		// close can be followed by a Start that finds running == false.
+		e.startMu.Lock()
+		e.running, e.cancel, e.done = false, nil, nil
+		e.startMu.Unlock()
+		close(done)
 	}()
 }
 
-// Stop ends polling.
+// Stop ends polling and waits until the poll goroutine has fully stopped, so
+// a following Start reliably restarts it.
 func (e *ExternalSource) Stop() {
-	if e.cancel != nil {
-		e.cancel()
+	e.startMu.Lock()
+	cancel, done := e.cancel, e.done
+	e.startMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
 	}
 }
 

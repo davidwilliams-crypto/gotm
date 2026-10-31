@@ -87,8 +87,14 @@ func colorHeaderText(lv, hdr win.HWND, ink walk.Color) {
 func lvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 	defer uiaGuard(&ret, 0)
 	h := win.HWND(hwnd)
+	prev, hooked := lvPrev[h]
+	if !hooked {
+		// past WM_NCDESTROY the hook is unregistered; uiaHookProc guards the
+		// same window, so mirror it instead of calling CallWindowProc(0, …)
+		return win.DefWindowProc(h, uint32(msg), wp, lp)
+	}
 	if msg == win.WM_NCDESTROY {
-		r := win.CallWindowProc(lvPrev[h], h, uint32(msg), wp, lp)
+		r := win.CallWindowProc(prev, h, uint32(msg), wp, lp)
 		delete(lvPrev, h)
 		delete(headerInk, h)
 		delete(headerOf, h)
@@ -116,7 +122,7 @@ func lvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 			}
 		}
 	}
-	return win.CallWindowProc(lvPrev[h], h, uint32(msg), wp, lp)
+	return win.CallWindowProc(prev, h, uint32(msg), wp, lp)
 }
 
 // ptrFrom turns a message parameter that Windows documents as a pointer back

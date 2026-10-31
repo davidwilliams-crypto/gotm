@@ -49,11 +49,33 @@ func UninstallCommand(a InstalledApp, elevated bool) (exe, cmdline string, err e
 	if exe == "" {
 		return "", "", fmt.Errorf("cannot find the uninstaller in %q", a.Uninstall)
 	}
+	if elevated && inUserProfile(exe) {
+		// The entry lives in HKLM, but the program it points at sits in a
+		// user profile (a common weak-ACL installer defect), where any
+		// program the user runs can replace it. Don't run it as admin.
+		return "", "", fmt.Errorf("this app's uninstaller (%s) is inside a user profile, where programs running as a standard user can replace it; gotm will not start it as administrator. Uninstall this app while gotm is not elevated, or from Settings > Apps", exe)
+	}
 	cmdline = `"` + exe + `"`
 	if args != "" {
 		cmdline += " " + args
 	}
 	return exe, cmdline, nil
+}
+
+// inUserProfile reports whether path lies under the profiles root
+// (C:\Users: every user's own profile and the shared Public folders are
+// user-writable). Resolved from the shell, never from an environment variable.
+func inUserProfile(path string) bool {
+	root, err := windows.KnownFolderPath(windows.FOLDERID_UserProfiles, 0)
+	if err != nil || root == "" {
+		return false // cannot tell: don't refuse
+	}
+	p := filepath.Clean(path)
+	root = filepath.Clean(root)
+	if len(p) <= len(root)+1 || !strings.EqualFold(p[:len(root)], root) || p[len(root)] != '\\' {
+		return false
+	}
+	return true
 }
 
 // splitCommand finds the program at the start of a command line. allowPath
@@ -66,12 +88,23 @@ func splitCommand(s string, allowPath bool) (exe, args string) {
 		}
 		return resolveProgram(s[1:1+end], allowPath), strings.TrimSpace(s[2+end:])
 	}
-	fields := strings.Split(s, " ")
-	for i := 1; i <= len(fields); i++ {
-		cand := strings.Join(fields[:i], " ")
-		if p := resolveProgram(cand, allowPath); p != "" {
-			return p, strings.TrimSpace(strings.Join(fields[i:], " "))
+	// Successively longer prefixes cut at every space of the original string,
+	// exactly like CreateProcess (which also tries the whole string). Cutting
+	// on single spaces and re-joining cannot rebuild a path containing two
+	// consecutive spaces (legal on NTFS).
+	for cut := 0; cut < len(s); {
+		next := strings.IndexByte(s[cut:], ' ')
+		if next < 0 {
+			break
 		}
+		cut += next
+		if p := resolveProgram(s[:cut], allowPath); p != "" {
+			return p, strings.TrimSpace(s[cut+1:])
+		}
+		cut++
+	}
+	if p := resolveProgram(s, allowPath); p != "" { // the whole string: no args
+		return p, ""
 	}
 	return "", ""
 }

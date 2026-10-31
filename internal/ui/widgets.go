@@ -407,8 +407,15 @@ func popupMenu(w walk.Widget, items []menuItem) {
 	// TrackPopupMenu posts the chosen item's WM_COMMAND rather than sending it.
 	// Disposing now would unregister the actions before that message arrives
 	// (the click would do nothing), so dispose from a later posted message.
+	// The app-level queue needs no form; the per-form one is equivalent when
+	// the widget has one.
 	if f := w.Form(); f != nil {
 		f.Synchronize(func() {
+			w.SetContextMenu(nil)
+			m.Dispose()
+		})
+	} else {
+		walk.App().Synchronize(func() {
 			w.SetContextMenu(nil)
 			m.Dispose()
 		})

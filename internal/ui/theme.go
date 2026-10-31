@@ -213,6 +213,7 @@ func iconFamily() string {
 			if fontInstalled("Segoe Fluent Icons") {
 				iconFam = "Segoe Fluent Icons"
 			}
+			f.Dispose() // probe only; one font, once
 		}
 	})
 	return iconFam

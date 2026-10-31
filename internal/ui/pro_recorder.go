@@ -316,6 +316,10 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	if !rec.Enabled() {
 		state, ink = "Paused", T.Warn
 	}
+	if rec.Persist() && rec.DiskErr() != nil {
+		state += " · not saving to disk"
+		ink = T.Warn
+	}
 	fillRound(cv, rect{26, 20, 8, 8}, 4, ink)
 	span := fmt.Sprintf("%s window", humanDur(time.Duration(p.rangeSecs)*time.Second))
 	if p.fitting() {

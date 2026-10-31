@@ -4,10 +4,13 @@ package metrics
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"gotm/internal/safepath"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -57,8 +60,13 @@ type Recorder struct {
 
 	persist bool
 	dir     string
+
+	// fileMu serializes disk writes and is held INSTEAD of mu during file I/O,
+	// so chart reads (Samples, Nearest, Len) never wait on the file system.
+	fileMu  sync.Mutex
 	file    *os.File
 	fileDay string
+	diskErr error // last persistence failure; cleared by the next good write
 }
 
 // NewRecorder keeps `retention` of history, one sample per `every`. Capture
@@ -79,13 +87,28 @@ func (r *Recorder) Enabled() bool     { r.mu.RLock(); defer r.mu.RUnlock(); retu
 
 // SetPersist turns on appending samples to <dir>\yyyy-mm-dd.jsonl.
 func (r *Recorder) SetPersist(v bool) {
+	// fileMu before r.mu, the same order appendDisk uses: an in-flight
+	// appendDisk then sees the switch-off and stops without reopening.
+	r.fileMu.Lock()
+	defer r.fileMu.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.persist = v
-	if !v && r.file != nil {
-		_ = r.file.Close()
-		r.file, r.fileDay = nil, ""
+	r.mu.Unlock()
+	if !v {
+		if r.file != nil {
+			_ = r.file.Close()
+			r.file, r.fileDay = nil, ""
+		}
+		r.diskErr = nil
 	}
+}
+
+// DiskErr reports the last on-disk persistence failure (disk full, locked
+// file, redirected folder while elevated), or nil when writes are succeeding.
+func (r *Recorder) DiskErr() error {
+	r.fileMu.Lock()
+	defer r.fileMu.Unlock()
+	return r.diskErr
 }
 func (r *Recorder) Persist() bool { r.mu.RLock(); defer r.mu.RUnlock(); return r.persist }
 
@@ -95,8 +118,8 @@ func (r *Recorder) Add(s *Snapshot) {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if !r.enabled {
+		r.mu.Unlock()
 		return
 	}
 	if s.T < r.last {
@@ -108,6 +131,7 @@ func (r *Recorder) Add(s *Snapshot) {
 		r.last = 0
 	}
 	if s.T-r.last < r.every.Milliseconds() {
+		r.mu.Unlock()
 		return
 	}
 	r.last = s.T
@@ -120,7 +144,11 @@ func (r *Recorder) Add(s *Snapshot) {
 	if len(r.ring) > r.capacity {
 		r.ring = append([]RecSample(nil), r.ring[len(r.ring)-r.capacity:]...)
 	}
-	if r.persist {
+	persist := r.persist
+	r.mu.Unlock()
+	// The disk write happens without r.mu: readers of the ring never stall
+	// behind a slow or networked recordings folder.
+	if persist {
 		r.appendDisk(rs)
 	}
 }
@@ -150,31 +178,57 @@ func topProcs(procs []Proc) []RecProc {
 	return out
 }
 
+// errRedirectedPath is reported when persistence is on but the recordings
+// folder (or the file) is a link and gotm is elevated: writing through it
+// could aim an administrator's write at a target of someone else's choosing.
+var errRedirectedPath = errors.New("the recordings folder or file is a link; gotm is elevated and will not write through it")
+
 func (r *Recorder) appendDisk(rs RecSample) {
 	if r.dir == "" {
 		return
+	}
+	r.fileMu.Lock()
+	defer r.fileMu.Unlock()
+	r.mu.RLock()
+	persist := r.persist
+	r.mu.RUnlock()
+	if !persist {
+		return // switched off after Add snapshotted it: no trailing write
 	}
 	day := time.UnixMilli(rs.T).Format("2006-01-02")
 	if r.file == nil || r.fileDay != day {
 		if r.file != nil {
 			_ = r.file.Close()
+			r.file, r.fileDay = nil, ""
 		}
 		path := filepath.Join(r.dir, day+".jsonl")
 		if !safepath.WritableFile(path) {
-			r.file = nil
-			return // elevated, and the folder or file is a link: do not write through it
+			r.diskErr = errRedirectedPath
+			return
 		}
 		_ = os.MkdirAll(r.dir, 0o700)
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
-			r.file = nil
+			r.diskErr = err
 			return
 		}
 		r.file, r.fileDay = f, day
 	}
-	if b, err := json.Marshal(rs); err == nil {
-		_, _ = r.file.Write(append(b, '\n'))
+	b, err := json.Marshal(rs)
+	if err != nil {
+		r.diskErr = err
+		return
 	}
+	if _, err := r.file.Write(append(b, '\n')); err != nil {
+		// A failing write must not pass silently: drop the handle so the next
+		// sample reopens (recovering from a locked or replaced file) and
+		// report the error until one write succeeds.
+		r.diskErr = err
+		_ = r.file.Close()
+		r.file, r.fileDay = nil, ""
+		return
+	}
+	r.diskErr = nil
 }
 
 // LoadDisk reloads samples from the last `window` of on-disk files.
@@ -202,14 +256,7 @@ func (r *Recorder) LoadDisk(window time.Duration) int {
 		if err != nil {
 			continue
 		}
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 1<<20), 1<<20)
-		for sc.Scan() {
-			var rs RecSample
-			if json.Unmarshal(sc.Bytes(), &rs) == nil && rs.T >= cut && rs.T <= now {
-				loaded = append(loaded, rs)
-			}
-		}
+		loaded = appendLines(loaded, f, cut, now)
 		f.Close()
 	}
 	r.mu.Lock()
@@ -236,6 +283,35 @@ func (r *Recorder) LoadDisk(window time.Duration) int {
 		r.last = r.ring[len(r.ring)-1].T
 	}
 	return len(loaded)
+}
+
+// appendLines parses one newline-delimited JSON recording file into dst. A
+// line that is corrupt or longer than 1 MiB is skipped; the rest of the file
+// still loads — one damaged line must not silently discard the samples after
+// it (a bufio.Scanner would stop the whole file at its first long line).
+func appendLines(dst []RecSample, f io.Reader, cut, now int64) []RecSample {
+	rd := bufio.NewReaderSize(f, 1<<20)
+	for {
+		line, err := rd.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			for err == bufio.ErrBufferFull { // discard the oversized line's remainder
+				_, err = rd.ReadSlice('\n')
+			}
+			if err != nil {
+				return dst
+			}
+			continue
+		}
+		if len(line) > 0 {
+			var rs RecSample
+			if json.Unmarshal(bytes.TrimRight(line, "\r\n"), &rs) == nil && rs.T >= cut && rs.T <= now {
+				dst = append(dst, rs)
+			}
+		}
+		if err != nil { // io.EOF or a real read error: this file is done
+			return dst
+		}
+	}
 }
 
 // PruneDisk deletes recording files older than maxAge.
@@ -322,7 +398,13 @@ func (r *Recorder) Clear() {
 }
 
 // ExportCSV writes one row per sample (top processes flattened to a column).
+// The chosen path gets the same elevated-link refusal as the on-disk history,
+// and the process-name column is neutralized so spreadsheets open it as text
+// instead of evaluating a name that begins with =, +, - or @ as a formula.
 func (r *Recorder) ExportCSV(path string, from, to int64) error {
+	if !safepath.WritableFile(path) {
+		return errRedirectedPath
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -345,7 +427,7 @@ func (r *Recorder) ExportCSV(path string, from, to int64) error {
 			time.UnixMilli(s.T).Format("2006-01-02 15:04:05"),
 			strconv.FormatFloat(s.CPU, 'f', 1, 64), strconv.FormatFloat(s.Mem, 'f', 1, 64),
 			strconv.FormatFloat(s.GPU, 'f', 1, 64), strconv.FormatFloat(s.DiskP, 'f', 1, 64),
-			strconv.FormatFloat(s.DiskBps, 'f', 0, 64), strconv.FormatFloat(s.NetBps, 'f', 0, 64), top,
+			strconv.FormatFloat(s.DiskBps, 'f', 0, 64), strconv.FormatFloat(s.NetBps, 'f', 0, 64), csvCell(top),
 		})
 	}
 	w.Flush()
@@ -353,4 +435,18 @@ func (r *Recorder) ExportCSV(path string, from, to int64) error {
 		return err
 	}
 	return f.Close()
+}
+
+// csvCell stops spreadsheet formula injection: Windows file names may begin
+// with =, +, - or @, and Excel (and friends) evaluate such a cell — including
+// DDE — when the export is opened. A leading apostrophe forces text.
+func csvCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
 }

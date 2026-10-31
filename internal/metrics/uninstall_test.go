@@ -30,7 +30,10 @@ func TestUninstallCommandResolvesLikeWindows(t *testing.T) {
 		{"MsiExec.exe /X{1234}", filepath.Join(sys, "MsiExec.exe"), "/X{1234}"},
 	}
 	for _, c := range cases {
-		exe, line, err := UninstallCommand(InstalledApp{Uninstall: c.in, Scope: "Machine"}, true)
+		// elevated=false: t.TempDir() is under the user's profile, which an
+		// elevated run now refuses by design (see
+		// TestUninstallCommandRefusesProfileTargetsWhileElevated).
+		exe, line, err := UninstallCommand(InstalledApp{Uninstall: c.in, Scope: "Machine"}, false)
 		if err != nil {
 			t.Errorf("%q: %v", c.in, err)
 			continue

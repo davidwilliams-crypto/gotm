@@ -313,7 +313,10 @@ func (s *Sampler) tick(publish bool) {
 		T: snap.T, CPU: snap.CPU, Mem: round1(snap.Mem.Percent),
 		DiskR: snap.Disk.ReadBps, DiskW: snap.Disk.WriteBps, DiskP: snap.Disk.Percent,
 		NetRx: snap.Net.RxBps, NetTx: snap.Net.TxBps, GPU: snap.GPU.Percent,
-		Cores: snap.Cores,
+		// A private copy: History() hands out shallow copies of the ring, and
+		// a hist point sharing the snapshot's array would alias for every
+		// consumer if anything ever rescaled a core value in place.
+		Cores: append([]float64(nil), snap.Cores...),
 	}
 	for _, g := range snap.GPUs {
 		gh := GPUHist{ID: g.ID, Pct: g.Pct, Ded: float64(g.DedicatedUsed), Shr: float64(g.SharedUsed),
@@ -367,8 +370,10 @@ func (s *Sampler) History() []HistPoint {
 	return append([]HistPoint(nil), s.hist...)
 }
 
-// Subscribe returns a channel of snapshots (one per tick) and a cancel function.
-// Snapshots are shared and must be treated as read-only.
+// Subscribe returns a channel of snapshots (one per tick) and a cancel
+// function. Cancelling removes the subscription and closes the channel, so a
+// consumer ranging over it terminates. Snapshots are shared and must be
+// treated as read-only.
 func (s *Sampler) Subscribe() (<-chan *Snapshot, func()) {
 	ch := make(chan *Snapshot, 2)
 	s.mu.Lock()
@@ -376,7 +381,10 @@ func (s *Sampler) Subscribe() (<-chan *Snapshot, func()) {
 	s.mu.Unlock()
 	return ch, func() {
 		s.mu.Lock()
-		delete(s.subs, ch)
+		if _, ok := s.subs[ch]; ok {
+			delete(s.subs, ch)
+			close(ch) // no further sends: the sampler only sends under s.mu
+		}
 		s.mu.Unlock()
 	}
 }

@@ -47,6 +47,42 @@ func Normalize(path string) (string, error) {
 	return path, nil
 }
 
+// NormalizeInstall additionally rejects 8.3 short-name spellings
+// (C:\PROGRA~1) for a destination the user is choosing now: they name a
+// different long path, and a record spelling the install one way while the
+// file system answers another makes later maintenance refuse. Only components
+// that already exist can be aliases; a not-yet-created path cannot. Resolve
+// paths (an existing install, the running helper) keep plain Normalize: their
+// spelling is compared and proven with the native identity checks instead.
+func NormalizeInstall(path string) (string, error) {
+	path, err := Normalize(path)
+	if err != nil {
+		return "", err
+	}
+	if long, ok := longPathOf(path); ok && !strings.EqualFold(long, path) {
+		return "", fmt.Errorf("ambiguous installation folder (use the full path, not its 8.3 short spelling): %q", path)
+	}
+	return path, nil
+}
+
+var procGetLongPathName = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetLongPathNameW")
+
+// longPathOf returns the long spelling of path when every component exists;
+// ok is false when the path does not exist or the answer would not fit.
+func longPathOf(path string) (string, bool) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", false
+	}
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	r, _, _ := procGetLongPathName.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	n := uint32(r)
+	if n == 0 || n >= uint32(len(buf)) {
+		return "", false
+	}
+	return windows.UTF16ToString(buf[:n]), true
+}
+
 type Guard struct{ handles []windows.Handle }
 
 type Volume struct {

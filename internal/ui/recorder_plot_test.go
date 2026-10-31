@@ -57,6 +57,16 @@ func TestRecorderPlotUsesSampleTimes(t *testing.T) {
 		if !hasColorNear(im, 474, 200, T.Text, 0) {
 			t.Error("45-second selection cursor is not at x=474")
 		}
+		// The area fill under the CPU line must actually paint: below the 20 %
+		// valley at (74,304), down to the plot floor at y=366, only the blended
+		// fill color is drawn (a regression once clamped the fill's column
+		// loop out of existence while the line kept drawing).
+		fillC := blend(T.CPU, T.Card, 0.22)
+		for _, y := range []int{310, 335, 360} {
+			if !hasColorNear(im, 74, y, fillC, 0) {
+				t.Errorf("area fill missing below the CPU line at (74,%d)", y)
+			}
+		}
 		p.view.w, p.view.h = 648, 700
 		for _, pick := range []struct {
 			x    int

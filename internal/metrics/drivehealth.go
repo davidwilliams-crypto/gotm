@@ -189,8 +189,10 @@ func readOneDrive(h windows.Handle, idx int) DriveHealth {
 				}
 				d.HasSMART = true
 				d.Critical = log[0]
-				if k := le.Uint16(log[1:]); k > 0 {
-					d.TempC, d.HasTemp = float64(k)-273.15, true
+				if k := float64(le.Uint16(log[1:])) - 273.15; k > -50 && k < 150 {
+					// same plausibility band as the temperature descriptor: a
+					// not-reported 0xFFFF would otherwise read as 65261 °C
+					d.TempC, d.HasTemp = k, true
 				}
 				d.SparePct = int(log[3])
 				d.SpareThresh = int(log[4])

@@ -98,10 +98,39 @@ func (s Store) Enable(exe string) error {
 	if state.Owned {
 		return nil
 	}
-	if err := k.SetStringValue("Debugger", command); err != nil {
+	// Reaching the write means no Debugger existed; writeDebuggerChecked
+	// restores that absence if a concurrent administrator's value lands in
+	// the check-to-write window instead of silently destroying it.
+	if err := writeDebuggerChecked(k, command, "", false); err != nil {
 		return fmt.Errorf("enable Task Manager replacement: %w", err)
 	}
 	return nil
+}
+
+// writeDebuggerChecked sets Debugger and verifies the write landed on an
+// unchanged key. Registry values have no compare-and-swap: if a concurrent
+// writer's value was overwritten, the pre-write state (absent, or the previous
+// owner) is restored best-effort and an error reports the race instead of a
+// silent loss.
+func writeDebuggerChecked(k registry.Key, command, previous string, hadPrevious bool) error {
+	if err := k.SetStringValue("Debugger", command); err != nil {
+		return err
+	}
+	after, err := queryKey(k, command)
+	if err != nil {
+		return nil // cannot verify further; the write itself succeeded
+	}
+	if after.Owned {
+		return nil
+	}
+	if hadPrevious {
+		if err := k.SetStringValue("Debugger", previous); err != nil {
+			return fmt.Errorf("another administrator changed the Task Manager replacement at the same moment, and putting the earlier value back failed: %w", err)
+		}
+	} else if err := k.DeleteValue("Debugger"); err != nil {
+		return fmt.Errorf("another administrator changed the Task Manager replacement at the same moment, and removing our value failed: %w", err)
+	}
+	return errors.New("another administrator changed the Task Manager replacement at the same moment; the earlier value was put back — try again")
 }
 
 // Restore removes only this executable's exact owned Debugger. A foreign
@@ -175,7 +204,7 @@ func (s Store) Retarget(oldExe, newExe string) (bool, error) {
 	if ownsCommand(state.Command, newCommand) {
 		return false, nil
 	}
-	if err := k.SetStringValue("Debugger", newCommand); err != nil {
+	if err := writeDebuggerChecked(k, newCommand, state.Command, true); err != nil {
 		return false, fmt.Errorf("retarget Task Manager replacement: %w", err)
 	}
 	return true, nil

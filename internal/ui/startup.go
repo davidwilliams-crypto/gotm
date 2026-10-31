@@ -38,10 +38,16 @@ func newStartupTab(a *App) *startupTab {
 	g.left = []decl.Widget{t.bRefr.widget(), t.showMS.widget()}
 
 	g.model.isChecked = func(row int) bool {
+		if row < 0 || row >= len(g.model.rows) { // every other model accessor clamps
+			return false
+		}
 		it, ok := t.items[cell(g.model.rows[row], 3)]
 		return ok && it.Enabled
 	}
 	g.model.setCheck = func(row int, v bool) error {
+		if row < 0 || row >= len(g.model.rows) {
+			return nil
+		}
 		id := cell(g.model.rows[row], 3)
 		if strings.HasPrefix(id, "task|") {
 			// schtasks takes up to a couple of seconds: run it in the background

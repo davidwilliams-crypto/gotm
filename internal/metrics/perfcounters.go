@@ -89,6 +89,7 @@ func newPerfCounters() *perfCounters {
 
 func (pc *perfCounters) close() {
 	if pc != nil {
+		pc.gpuRead.close() // ADL context and NVML session, not just the PDH query
 		pc.q.close()
 	}
 }
@@ -155,7 +156,9 @@ func (pc *perfCounters) read() perfSample {
 	dedVals := pc.gpuMem.values()
 	for _, it := range dedVals {
 		out.GPU.OK = true
-		out.GPU.MemBytes += uint64(it.Value)
+		if it.Value > 0 { // a negative PDH float must not become a huge uint64
+			out.GPU.MemBytes += uint64(it.Value)
+		}
 	}
 	out.GPUs = pc.gpuRead.build(engVals, dedVals, pc.gpuShared.values(), pc.gpuPDed.values(), pc.gpuPShr.values())
 

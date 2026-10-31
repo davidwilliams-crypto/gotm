@@ -162,7 +162,12 @@ func indentRows(tv *walk.TableView, depth func(row int) int) {
 func tvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 	defer uiaGuard(&ret, 0)
 	h := win.HWND(hwnd)
-	r := win.CallWindowProc(tvPrev[h], h, uint32(msg), wp, lp)
+	prev, hooked := tvPrev[h]
+	if !hooked {
+		// past WM_NCDESTROY the hook is unregistered; call nothing's wndproc
+		return win.DefWindowProc(h, uint32(msg), wp, lp)
+	}
+	r := win.CallWindowProc(prev, h, uint32(msg), wp, lp)
 	if msg == win.WM_NCDESTROY {
 		delete(tvPrev, h)
 		delete(tvIndent, h)

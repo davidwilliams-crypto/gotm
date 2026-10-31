@@ -210,11 +210,6 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 		gp.Dispose()
 	}
 
-	capN := st.capacity
-	if capN < 2 {
-		capN = 2
-	}
-	step := float64(W) / float64(capN-1)
 	lw := st.lineW
 	if lw < 1 {
 		lw = 2
@@ -226,22 +221,31 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 			continue
 		}
 		pts := make([]walk.Point, n)
-		x0 := float64(W) - float64(n-1)*step
+		// Without timestamps the series is spread across the full width by
+		// its own length, not by the ring's capacity: n can exceed capN for a
+		// while after the refresh rate is lowered, and a capacity-based step
+		// would push x far off the left edge (and make the fill loop below
+		// stroke tens of thousands of off-chart columns per frame).
+		step := float64(W) / float64(n-1)
+		timed := len(s.times) == n && st.timeTo > st.timeFrom
 		for i, v := range s.vals {
 			y := float64(H) - math.Min(1, math.Max(0, v/maxV))*float64(H-ss)
-			x := x0 + float64(i)*step
-			if len(s.times) == n && st.timeTo > st.timeFrom {
+			x := float64(i) * step
+			if timed {
 				x = timePosition(s.times[i], st.timeFrom, st.timeTo) * float64(W)
 			}
 			pts[i] = walk.Point{X: int(x), Y: int(y)}
 		}
 		if s.fill {
-			// area under the curve, as 1px (supersampled) vertical strokes
+			// area under the curve, as 1px (supersampled) vertical strokes,
+			// clamped to the chart: whatever the x positions, only columns
+			// between the segment's left and right edge inside [0, W) are drawn
 			fillC := blend(s.color, st.bg, 0.22)
 			fp, _ := walk.NewCosmeticPen(walk.PenSolid, fillC)
 			for i := 1; i < n; i++ {
 				a, b := pts[i-1], pts[i]
-				for x := a.X; x <= b.X; x++ {
+				left, right := min(a.X, b.X), max(a.X, b.X)
+				for x := max(left, 0); x <= min(right, W-1); x++ {
 					y := b.Y
 					if b.X != a.X {
 						y = a.Y + (b.Y-a.Y)*(x-a.X)/(b.X-a.X)

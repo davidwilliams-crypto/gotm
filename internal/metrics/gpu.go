@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -353,6 +354,18 @@ func (l *nvmlLib) fill(d nvmlDev, a *GPUAdapter) {
 	}
 }
 
+// close ends the NVML session (only when the entry point exists in this
+// driver) so a stopped sampler leaves no session in the driver.
+func (l *nvmlLib) close() {
+	if l == nil || !l.ok || l.dll == nil {
+		return
+	}
+	if shutdown := l.dll.NewProc("nvmlShutdown"); shutdown.Find() == nil {
+		_, _, _ = shutdown.Call()
+	}
+	l.ok = false
+}
+
 // nvidiaMarketingVersion turns Windows' 32.0.16.1714 into NVIDIA's 617.14.
 func nvidiaMarketingVersion(v string) string {
 	p := strings.Split(v, ".")
@@ -536,12 +549,12 @@ func buildGPUs(static []gpuStatic, eng, ded, shr, pded, pshr []PDHInstanceValue)
 	}
 
 	for _, it := range ded {
-		if id := luidKey(it.Instance); id != "" {
+		if id := luidKey(it.Instance); id != "" && it.Value > 0 {
 			get(id).DedicatedUsed = uint64(it.Value)
 		}
 	}
 	for _, it := range shr {
-		if id := luidKey(it.Instance); id != "" {
+		if id := luidKey(it.Instance); id != "" && it.Value > 0 {
 			get(id).SharedUsed = uint64(it.Value)
 		}
 	}
@@ -563,10 +576,12 @@ func buildGPUs(static []gpuStatic, eng, ded, shr, pded, pshr []PDHInstanceValue)
 				p = &pm{}
 				mem[g.luid][g.pid] = p
 			}
-			if dedicated {
-				p.ded += uint64(it.Value)
-			} else {
-				p.shr += uint64(it.Value)
+			if it.Value > 0 { // a negative PDH float must not become a huge uint64
+				if dedicated {
+					p.ded += uint64(it.Value)
+				} else {
+					p.shr += uint64(it.Value)
+				}
 			}
 		}
 	}
@@ -634,10 +649,37 @@ type gpuReader struct {
 	adl    *adlLib
 	seen   map[string]bool
 	last   map[string]GPUAdapter // last vendor sensor values per adapter ID
+	lastAt map[string]time.Time  // when each cached reading was taken
+}
+
+// sensorStaleAfter bounds how long an unpolled vendor reading (a sleeping
+// dGPU's last values) is still shown: past this it is dropped rather than
+// displayed as if it were live.
+const sensorStaleAfter = 2 * time.Minute
+
+// cachedSensors replays the last reading for adapters that are not being
+// polled right now; readings older than sensorStaleAfter are dropped instead
+// of being shown as if they were live.
+func (r *gpuReader) cachedSensors(a *GPUAdapter) {
+	if t, ok := r.lastAt[a.ID]; !ok || time.Since(t) > sensorStaleAfter {
+		return // no (recent enough) reading: show nothing rather than stale data
+	}
+	copySensors(a, r.last[a.ID])
+}
+
+// close releases the vendor library sessions (the ADL context, the NVML
+// session) so a stopped sampler does not leave them alive in the driver.
+// Called from the sampler goroutine, the only thread that touches the reader.
+func (r *gpuReader) close() {
+	if r == nil {
+		return
+	}
+	r.nv.close()
+	r.adl.close()
 }
 
 func newGPUReader() *gpuReader {
-	r := &gpuReader{seen: map[string]bool{}, last: map[string]GPUAdapter{}}
+	r := &gpuReader{seen: map[string]bool{}, last: map[string]GPUAdapter{}, lastAt: map[string]time.Time{}}
 	r.static = enumerateGPUs()
 	for _, s := range r.static {
 		r.seen[s.id] = true
@@ -685,17 +727,18 @@ func (r *gpuReader) build(eng, ded, shr, pded, pshr []PDHInstanceValue) []GPUAda
 			}
 			list[i].Integrated = r.adl.isAPU(ad)
 			if !wanted && !list[i].Integrated {
-				copySensors(&list[i], r.last[list[i].ID])
+				r.cachedSensors(&list[i])
 				continue
 			}
 			if r.adl.fill(ad, &list[i]) {
 				r.last[list[i].ID] = list[i]
+				r.lastAt[list[i].ID] = time.Now()
 			}
 		}
 	}
 	for n, i := range nvIdx {
 		if !wanted {
-			copySensors(&list[i], r.last[list[i].ID]) // last values; nothing woken up
+			r.cachedSensors(&list[i]) // last values; nothing woken up
 			continue
 		}
 		var dev *nvmlDev
@@ -721,6 +764,7 @@ func (r *gpuReader) build(eng, ded, shr, pded, pshr []PDHInstanceValue) []GPUAda
 		if dev != nil && r.nv != nil {
 			r.nv.fill(*dev, &list[i])
 			r.last[list[i].ID] = list[i]
+			r.lastAt[list[i].ID] = time.Now()
 		}
 	}
 	return list

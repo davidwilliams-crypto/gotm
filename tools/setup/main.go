@@ -70,8 +70,11 @@ func parseArgs(args []string) (options, error) {
 			}
 			o.taskManager = mode
 		case strings.HasPrefix(l, "/d="):
+			if o.dir != "" {
+				return o, fmt.Errorf("use exactly one /D=folder")
+			}
 			var err error
-			o.dir, err = normalizeDestinationPath(strings.Trim(a[3:], `"`))
+			o.dir, err = normalizeInstallDestination(strings.Trim(a[3:], `"`))
 			if err != nil {
 				return o, fmt.Errorf("/D= needs an absolute folder, got %q", a[3:])
 			}
@@ -144,7 +147,11 @@ func runInstall(o options, payload fs.FS) int {
 		}
 	}
 
-	self, _ := os.Executable()
+	self, err := os.Executable()
+	if err != nil {
+		msg(o.silent, "Setup could not find its own executable: "+err.Error(), windows.MB_ICONERROR)
+		return 1
+	}
 	for {
 		err := l.install(payload, self, version, o.desktop)
 		if err == nil {
@@ -209,10 +216,14 @@ func runUninstall(o options) int {
 	return 0
 }
 
-// settingsDir is gotm's per-user settings folder (%APPDATA%\gotm).
+// settingsDir is gotm's per-user settings folder (<RoamingAppData>\gotm).
+// The shell's known folder is used, not the APPDATA variable: any program
+// running as the user can change that variable for an elevating process, and
+// the optional delete here must not be aimed somewhere else (gotm itself
+// resolves the same way).
 func settingsDir() (string, bool) {
-	base := os.Getenv("APPDATA")
-	if base == "" || !filepath.IsAbs(base) {
+	base, err := windows.KnownFolderPath(windows.FOLDERID_RoamingAppData, 0)
+	if err != nil || base == "" || !filepath.IsAbs(base) {
 		return "", false
 	}
 	return filepath.Join(base, "gotm"), true

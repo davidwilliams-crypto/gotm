@@ -197,10 +197,13 @@ func runSchtasks(args ...string) error {
 }
 
 // logonTasks lists scheduled tasks with an enabled logon or boot trigger. It
-// reads `schtasks /query /xml ONE`: the task XML is the same in every Windows
-// display language, unlike the CSV listing's translated, quote-fragile columns.
+// reads `schtasks /query /xml`: the task XML is the same in every Windows
+// display language, unlike the CSV listing's translated, quote-fragile
+// columns. (An earlier revision passed a stray positional "ONE" argument;
+// schtasks ignored it, but a task actually named ONE would have filtered the
+// whole listing to itself.)
 func logonTasks() []StartupItem {
-	out, err := hiddenCmd(system32("schtasks.exe"), "/query", "/xml", "ONE").Output()
+	out, err := hiddenCmd(system32("schtasks.exe"), "/query", "/xml").Output()
 	if err != nil || len(out) == 0 {
 		return nil
 	}
@@ -241,6 +244,7 @@ func parseTaskXML(out []byte) []StartupItem {
 	if !utf8.Valid(out) {
 		out = oemToUTF8(out) // schtasks writes the console code page when redirected
 	}
+	out = stripXMLDecls(out)
 	dec := xml.NewDecoder(bytes.NewReader(out))
 	dec.Strict = false
 	var items []StartupItem
@@ -304,6 +308,26 @@ func parseTaskXML(out []byte) []StartupItem {
 		}
 	}
 	return items
+}
+
+// stripXMLDecls removes every <?xml ...?> declaration from a schtasks /xml
+// listing: plain `schtasks /query /xml` prefixes each task with its own
+// declaration, and a declaration anywhere but the document start is a syntax
+// error for the XML decoder (which is why an earlier revision passed a
+// positional task-name argument to schtasks to suppress them — an
+// undocumented behaviour this instead does not depend on).
+func stripXMLDecls(b []byte) []byte {
+	for {
+		i := bytes.Index(b, []byte("<?xml"))
+		if i < 0 {
+			return b
+		}
+		j := bytes.Index(b[i:], []byte("?>"))
+		if j < 0 {
+			return b
+		}
+		b = append(b[:i:i], b[i+j+2:]...)
+	}
 }
 
 // accountName turns a SID string into DOMAIN\name; other text is returned as is.

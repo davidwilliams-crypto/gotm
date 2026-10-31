@@ -107,12 +107,18 @@ func openTarget(t Target, access uint32, what string, allowCritical bool) (windo
 		}
 		return 0, friendly(err, what, t)
 	}
-	if t.Start != 0 {
-		var created, exited, kernel, user windows.Filetime
-		if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds()/1e6 != t.Start {
-			windows.CloseHandle(h)
-			return 0, fmt.Errorf("%s has exited; its process ID now belongs to another program, which was left alone", t)
-		}
+	if t.Start == 0 {
+		// Without a creation time the PID-reuse check is impossible; refusing
+		// is safer than silently acting on whoever owns the ID now. Real
+		// processes always report one (only the System Idle process does not,
+		// and PID 0 is already refused above).
+		windows.CloseHandle(h)
+		return 0, fmt.Errorf("%s has no recorded start time; refusing to %s it in case its ID was reused", t, what)
+	}
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds()/1e6 != t.Start {
+		windows.CloseHandle(h)
+		return 0, fmt.Errorf("%s has exited; its process ID now belongs to another program, which was left alone", t)
 	}
 	if !allowCritical {
 		if why := criticalReason(h); why != "" {
@@ -271,6 +277,23 @@ func OpenFileLocation(pid uint32) error {
 	if p == "" {
 		return fmt.Errorf("image path for PID %d is not accessible", pid)
 	}
+	return revealInExplorer(p)
+}
+
+// RevealPath reveals an already-known image path in Explorer. The path comes
+// from the row the user acted on, so a reused PID cannot point the folder at
+// an unrelated program.
+func RevealPath(p string) error {
+	if p == "" {
+		return errors.New("the program's location is not known")
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("unexpected program path %q", p)
+	}
+	return revealInExplorer(p)
+}
+
+func revealInExplorer(p string) error {
 	// Explorer needs the whole /select argument as one token.
 	cmd := exec.Command("explorer.exe")
 	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: `explorer.exe /select,"` + p + `"`}

@@ -92,26 +92,47 @@ func (c *pdhCounter) value() (float64, bool) {
 }
 
 // values reads a wildcard counter (e.g. "\GPU Engine(*)\Utilization Percentage").
+// The instance set can grow between the sizing call and the fill call (a new
+// GPU-engine process, a new NIC), so the pair is retried a bounded number of
+// times instead of dropping the whole collection for one poll.
 func (c *pdhCounter) values() []PDHInstanceValue {
 	if c == nil {
 		return nil
 	}
+	var buf []byte
 	var size, count uint32
-	r, _, _ := procPdhGetFormattedArray.Call(c.h, pdhFmtDouble,
-		uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)), 0)
-	if uint32(r) != pdhMoreData || size == 0 {
-		return nil
+	filled := false
+	for attempt := 0; attempt < 4; attempt++ {
+		var r1, r2 uintptr
+		r1, _, _ = procPdhGetFormattedArray.Call(c.h, pdhFmtDouble,
+			uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)), 0)
+		if uint32(r1) != pdhMoreData || size == 0 {
+			return nil
+		}
+		buf = make([]byte, size)
+		r2, _, _ = procPdhGetFormattedArray.Call(c.h, pdhFmtDouble,
+			uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)),
+			uintptr(unsafe.Pointer(&buf[0])))
+		if r2 == 0 {
+			filled = true
+			break
+		}
+		if uint32(r2) != pdhMoreData {
+			return nil
+		}
+		// PDH_MORE_DATA again: instances appeared between the two calls; the
+		// partially written buffer is not trusted, size again and refill.
+		buf = nil
 	}
-	buf := make([]byte, size)
-	r, _, _ = procPdhGetFormattedArray.Call(c.h, pdhFmtDouble,
-		uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)),
-		uintptr(unsafe.Pointer(&buf[0])))
-	if r != 0 {
+	if !filled {
 		return nil
 	}
 	base := uintptr(unsafe.Pointer(&buf[0]))
 	out := make([]PDHInstanceValue, 0, count)
 	for i := uint32(0); i < count; i++ {
+		if int(i)*pdhItemSize+pdhItemSize > len(buf) {
+			break // more instances reported than the buffer holds: stop at the end
+		}
 		item := buf[i*pdhItemSize:]
 		namePtr := *(*uintptr)(unsafe.Pointer(&item[0]))
 		status := *(*uint32)(unsafe.Pointer(&item[pdhValueOffset]))

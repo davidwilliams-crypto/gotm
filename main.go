@@ -52,6 +52,13 @@ func main() {
 		return
 	}
 
+	// One gotm per session: a second launch (Ctrl+Shift+Esc while the Task
+	// Manager replacement routes here, a stray shortcut) activates the running
+	// window instead of racing it for config and recording files.
+	if !ui.GuardSingleInstance() {
+		return
+	}
+
 	// Walk requires InitApp to be the first toolkit call, on the main goroutine.
 	if _, err := walk.InitApp(); err != nil {
 		fmt.Fprintln(os.Stderr, "gotm:", err)

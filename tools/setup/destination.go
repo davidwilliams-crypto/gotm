@@ -12,6 +12,13 @@ func normalizeDestinationPath(path string) (string, error) {
 	return installpath.Normalize(path)
 }
 
+// normalizeInstallDestination is the strict form used for a destination the
+// user supplies at install time (/D=): it also rejects 8.3 short spellings,
+// which Normalize must keep accepting when resolving an existing install.
+func normalizeInstallDestination(path string) (string, error) {
+	return installpath.NormalizeInstall(path)
+}
+
 type destinationGuard struct{ *installpath.Guard }
 
 func (g *destinationGuard) close() {

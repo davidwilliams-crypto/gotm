@@ -83,6 +83,7 @@ const (
 	vtI4      = 3
 	vtBSTR    = 8
 	vtBool    = 11
+	vtEmpty   = 0
 	vtUnknown = 13
 )
 
@@ -631,6 +632,8 @@ func uiaGetPropertyValue(this, prop, out uintptr) (ret uintptr) {
 		return hrOK // VT_EMPTY: let UI Automation use its default
 	}
 	v := (*variant)(ptrFrom(out))
+	v.vt = vtEmpty // an unsupported property reports empty, never garbage the
+	// caller might have left in the out VARIANT
 	view := e.root.view
 	it, present := e.current()
 	root := e.id == ""
@@ -791,8 +794,19 @@ func uiaBoundingRect(this, out uintptr) (ret uintptr) {
 	rc := (*[4]float64)(ptrFrom(out))
 	*rc = [4]float64{}
 	e := elemOf(this)
-	if e == nil || e.id == "" {
-		return hrOK // the host window supplies the root's rectangle
+	if e == nil {
+		return hrOK
+	}
+	if e.id == "" {
+		// The root is the whole canvas: report its real screen rectangle for
+		// hosts that do not derive it from the host window.
+		var cr win.RECT
+		if win.GetClientRect(e.root.hwnd, &cr) {
+			tl := win.POINT{X: cr.Left, Y: cr.Top}
+			win.ClientToScreen(e.root.hwnd, &tl)
+			*rc = [4]float64{float64(tl.X), float64(tl.Y), float64(cr.Right - cr.Left), float64(cr.Bottom - cr.Top)}
+		}
+		return hrOK
 	}
 	it, present := e.current()
 	if !present {

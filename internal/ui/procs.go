@@ -760,10 +760,20 @@ func prioLabel(n string) string {
 }
 
 func (t *procsTab) locate() {
-	if r := t.selected(); r != nil && r.Count >= 1 {
-		if err := metrics.OpenFileLocation(r.PIDs[0]); err != nil {
+	r := t.selected()
+	if r == nil || r.Count < 1 {
+		return
+	}
+	// Reveal the path the user saw on this row, not a fresh lookup by PID:
+	// the process may have exited and its ID reused since the row was drawn.
+	if r.Path != "" {
+		if err := metrics.RevealPath(r.Path); err != nil {
 			t.app.errBox("Open file location", err)
 		}
+		return
+	}
+	if err := metrics.OpenFileLocation(r.PIDs[0]); err != nil {
+		t.app.errBox("Open file location", err)
 	}
 }
 

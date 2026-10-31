@@ -3,6 +3,7 @@
 package metrics
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -49,6 +50,23 @@ func TestParseTaskXML(t *testing.T) {
 	}
 	if boot.Name != "BootThing" || !boot.Enabled || boot.Command != "COM handler {ABC}" {
 		t.Errorf("boot task: %+v", boot)
+	}
+}
+
+// plain `schtasks /query /xml` prefixes every task with its own XML
+// declaration; the parser must strip them or the first one ends the stream.
+func TestParseTaskXMLHandlesPerTaskDeclarations(t *testing.T) {
+	decl := `<?xml version="1.0" encoding="UTF-16"?>`
+	stripped := stripXMLDecls([]byte("<Tasks>" + decl + "<Task></Task>" + decl + "<Task></Task></Tasks>"))
+	if bytes.Contains(stripped, []byte("<?xml")) {
+		t.Fatalf("declarations survived: %s", stripped)
+	}
+	withDecls := strings.ReplaceAll(sampleTasks, "<Task ", decl+"<Task ")
+	if items := parseTaskXML([]byte(withDecls)); len(items) != 2 {
+		t.Fatalf("got %d items with per-task declarations, want 2", len(items))
+	}
+	if items := parseTaskXML([]byte(sampleTasks)); len(items) != 2 {
+		t.Fatalf("declaration-free input regressed: %d items", len(items))
 	}
 }
 

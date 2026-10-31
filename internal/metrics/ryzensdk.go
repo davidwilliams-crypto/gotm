@@ -390,9 +390,9 @@ func decodeRyzenParams(p *ryzenParams, now time.Time) (RyzenReading, error) {
 		CHTCLimit: float64(p.CHTCLimit),
 		FCLKMHz:   float64(p.FCLK), CCLKFmaxMHz: float64(p.CCLKFmax),
 	}
-	n := int(p.FreqLen)
-	if n < 0 || n > ryzenMaxCores {
-		return RyzenReading{}, fmt.Errorf("implausible core count %d", n)
+	n := int(p.FreqLen) // uint32: no negative case exists; the cap is the whole guard
+	if n > ryzenMaxCores {
+		return RyzenReading{}, fmt.Errorf("implausible core count %d", p.FreqLen)
 	}
 	for i := 0; i < n; i++ {
 		c := RyzenCore{Index: i}
@@ -411,6 +411,31 @@ func decodeRyzenParams(p *ryzenParams, now time.Time) (RyzenReading, error) {
 		r.Cores = append(r.Cores, c)
 	}
 	return r, nil
+}
+
+// vetSDKDirectory requires every DLL in the SDK bin folder to be validly
+// signed by AMD: WinVerifyTrust plus signer pinning per file. One unsigned or
+// foreign-signed DLL refuses the whole start-up. The loader resolves imports
+// case-insensitively, so the extension comparison is case-insensitive too
+// (filepath.Glob is not, and a planted Helper.DLL would slip past "*.dll").
+func vetSDKDirectory(dir string) error {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".dll") {
+			continue
+		}
+		f := filepath.Join(dir, e.Name())
+		if err := verifySigned(f); err != nil {
+			return fmt.Errorf("Refusing to start the AMD SDK: %s failed the signature check (%v)", e.Name(), err)
+		}
+		if err := signedByAMD(f); err != nil { // valid is not enough: it must be AMD's
+			return fmt.Errorf("Refusing to start the AMD SDK: %v", err)
+		}
+	}
+	return nil
 }
 
 // ---- worker --------------------------------------------------------------------
@@ -439,14 +464,17 @@ func (r *RyzenSDK) run(stop <-chan struct{}) {
 			r.fail("SDK file missing: " + f)
 			return
 		}
-		if err := verifySigned(f); err != nil {
-			r.fail(fmt.Sprintf("Refusing to load %s: signature check failed (%v)", filepath.Base(f), err))
-			return
-		}
-		if err := signedByAMD(f); err != nil { // valid is not enough: it must be AMD's
-			r.fail("Refusing to load " + filepath.Base(f) + ": " + err.Error())
-			return
-		}
+	}
+	// Platform.dll is loaded with its own directory on the DLL search path,
+	// so its static imports resolve from this folder too: a helper DLL planted
+	// next to it would ride into this elevated process without any check.
+	// Every DLL in the folder must therefore be AMD-signed, not just the two
+	// we name. (Verification runs before the load; swapping a file in between
+	// remains possible only for an attacker who can already write to this
+	// admin-only folder.)
+	if err := vetSDKDirectory(dir); err != nil {
+		r.fail(err.Error())
+		return
 	}
 
 	_ = r.marker.set(true)

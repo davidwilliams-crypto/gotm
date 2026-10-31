@@ -75,6 +75,7 @@ type App struct {
 	elevatedAs string // set when elevated as an account other than the signed-in user
 
 	endSessionCB, prevMainProc uintptr // main-window hook for WM_ENDSESSION
+	pumpDone                   chan struct{}
 	startupTab                 int
 }
 
@@ -265,8 +266,10 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	})
 
 	a.navigate(start)
+	a.pumpDone = make(chan struct{})
 	go a.pump()
 	walk.App().Run()
+	close(a.pumpDone) // pump unsubscribes and exits instead of blocking forever
 	return nil
 }
 
@@ -339,12 +342,21 @@ func (a *App) onSideClick(id string) {
 }
 
 // pump forwards each sampler tick to the UI thread, coalescing bursts so a
-// busy UI never builds up a backlog.
+// busy UI never builds up a backlog. It returns when the window closes.
 func (a *App) pump() {
 	ch, cancel := a.sampler.Subscribe()
 	defer cancel()
-	for snap := range ch {
-		s := snap
+	for {
+		var snap *metrics.Snapshot
+		select {
+		case <-a.pumpDone:
+			return
+		case s, ok := <-ch:
+			if !ok {
+				return
+			}
+			snap = s
+		}
 		select {
 		case a.scheduled <- struct{}{}:
 		default:
@@ -352,7 +364,7 @@ func (a *App) pump() {
 		}
 		a.mw.Synchronize(func() {
 			<-a.scheduled
-			a.onSnapshot(s)
+			a.onSnapshot(snap)
 		})
 	}
 }
@@ -388,7 +400,13 @@ func (a *App) elevate() {
 			return
 		}
 	}
+	// Hand the single-instance slot to the elevated replacement before it is
+	// launched: it reaches the guard while this instance is still closing,
+	// and would otherwise treat itself as a second copy and exit right after
+	// UAC was accepted.
+	ReleaseSingleInstance()
 	if err := metrics.RelaunchElevated("--tab " + a.pages[a.cur].id); err != nil {
+		GuardSingleInstance() // UAC cancelled/denied: this instance keeps running
 		walk.MsgBox(a.mw, "Run as administrator",
 			"The elevated copy could not be started (UAC was cancelled or denied).\n\n"+err.Error(),
 			walk.MsgBoxIconWarning)
@@ -543,7 +561,13 @@ func (a *App) saveWindowState() {
 // the message itself).
 func (a *App) watchSystem() {
 	const spiSetHighContrast = 0x0043
+	activation := activationMsg()
 	a.endSessionCB = syscall.NewCallback(func(hwnd win.HWND, msg uint32, wp, lp uintptr) uintptr {
+		if activation != 0 && msg == activation {
+			// a second launch asked this instance to show itself
+			activateMainWindow(hwnd)
+			return 0
+		}
 		switch msg {
 		case win.WM_ENDSESSION:
 			if wp != 0 {
@@ -559,6 +583,7 @@ func (a *App) watchSystem() {
 		return win.CallWindowProc(a.prevMainProc, hwnd, msg, wp, lp)
 	})
 	a.prevMainProc = win.SetWindowLongPtr(win.HWND(a.mw.Handle()), win.GWLP_WNDPROC, a.endSessionCB)
+	signalActivationReady() // second launches can stop knocking now
 }
 
 // retheme re-applies the palette after a system colour change. Owner-drawn

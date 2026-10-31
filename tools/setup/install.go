@@ -150,12 +150,16 @@ func (l layout) register(ver string, size int64) error {
 	}
 	defer k.Close()
 	unin := filepath.Join(l.dir, "uninstall.exe")
+	icon := filepath.Join(l.dir, "gotm.exe")
+	if !strings.Contains(icon, ",") { // a comma in the folder splits path from icon index
+		icon += ",0"
+	}
 	strs := map[string]string{
 		"DisplayName":          "gotm",
 		"DisplayVersion":       ver,
 		"Publisher":            "gotm",
 		"InstallLocation":      l.dir,
-		"DisplayIcon":          filepath.Join(l.dir, "gotm.exe") + ",0",
+		"DisplayIcon":          icon,
 		"UninstallString":      `"` + unin + `" /uninstall`,
 		"QuietUninstallString": `"` + unin + `" /uninstall /S`,
 		"InstallDate":          time.Now().Format("20060102"),
@@ -188,6 +192,15 @@ func (l layout) uninstall() error {
 			continue // the running uninstaller; removed after it exits
 		}
 		for _, p := range []string{filepath.Join(l.dir, f), filepath.Join(l.dir, f+".new")} {
+			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	// staging files from an install that died mid-write; without this the
+	// empty-folder rmdir below never succeeds
+	if leftovers, _ := filepath.Glob(filepath.Join(l.dir, ".gotm-*")); len(leftovers) > 0 {
+		for _, p := range leftovers {
 			if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				errs = append(errs, err)
 			}

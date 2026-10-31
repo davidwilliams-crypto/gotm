@@ -38,7 +38,9 @@ if (-not (Test-Path -LiteralPath $dlib)) {
   Remove-Item -LiteralPath $tmp -Force
   if (-not (Test-Path -LiteralPath $dlib)) { throw "the package did not contain bin\x64\Azure.CodeSigning.Dlib.dll" }
 }
-# Verified on every use, not just after the download: the cache is a plain folder.
+# Verified on every use, not just after the download: the cache is a plain
+# folder. The dlib loads its dependencies from the same folder, so every DLL
+# there must be Microsoft-signed, not just the dlib itself.
 Test-MicrosoftSigned $dlib
-Get-ChildItem -LiteralPath (Split-Path $dlib) -Filter 'Azure.CodeSigning*.dll' | ForEach-Object { Test-MicrosoftSigned $_.FullName }
+Get-ChildItem -LiteralPath (Split-Path $dlib) -Filter '*.dll' -Recurse | ForEach-Object { Test-MicrosoftSigned $_.FullName }
 Write-Output $dlib
