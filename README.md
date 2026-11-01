@@ -70,8 +70,8 @@ to sign both executables (each build also verifies its signatures):
 
 | Page | What it does |
 |---|---|
-| **Performance** | resource cards (CPU, Memory, **one per GPU**, Disk, Network) with live sparklines; GPU detail with per-engine graphs, dedicated/shared memory history, clocks/power/temperature (NVIDIA via NVML, AMD via the driver's ADL library), driver and PCI location, and which processes hold video memory; big graph; per-core grid with clocks; facts grid (speed, sockets, cores, caches, virtualization, power plan…) |
-| **Processes** | program icons; sort, search, **tree view** (collapse, subtree totals), group by name; end task / tree, priority (button menu or right-click ▸ Set priority), affinity, suspend / resume, open location |
+| **Performance** | resource cards (CPU, Memory, **one per GPU**, Disk, Network) with live sparklines; hover the big graph for the value and age at any point; GPU detail with per-engine graphs, dedicated/shared memory history, clocks/power/temperature (NVIDIA via NVML, AMD via the driver's ADL library), driver and PCI location, and which processes hold video memory; big graph; per-core grid with clocks; facts grid (speed, sockets, cores, caches, virtualization, power plan…) |
+| **Processes** | program icons; sort, search, **tree view** (collapse, subtree totals), group by name; end task / tree, priority (button menu or right-click ▸ Set priority), affinity, suspend / resume, open location; double-click opens a program's folder (or expands a branch in the tree) |
 | **Startup apps** | registry Run keys, Startup folders, logon scheduled tasks; tick to enable/disable |
 | **Services** | state, start type, PID; start / stop / restart |
 | **Insights ▸ Power & Freq** | sensor tree with live / min / max: CPU clocks per core, ACPI thermal zones, utilization, memory, one group per GPU (temperatures, clocks, power, voltage, fan, engines, memory), drive temperature and NVMe health, power plan; search includes collapsed branches |
@@ -89,6 +89,7 @@ to sign both executables (each build also verifies its signatures):
 | Ctrl+1 … Ctrl+9, Ctrl+0 | go to a page, in sidebar order |
 | Ctrl+, | Settings |
 | Ctrl+F | search the current page (Esc clears, ↓ or Enter moves into the list) |
+| Ctrl+C | copy the selected row, with its column headers (table pages) |
 | F5 | reload the current page |
 | Delete | end the selected task (Processes) |
 | ← / → | collapse / expand a branch in the process tree |

@@ -432,6 +432,15 @@ func (a *App) elevate() {
 
 // ---- shared helpers -------------------------------------------------------------
 
+// copyRows copies the selected row of the current page's table to the
+// clipboard (visible columns, tab-separated, header first). Pages without a
+// table do nothing.
+func (a *App) copyRows() {
+	if c, ok := a.pages[a.cur].impl.(interface{ copyRow() }); ok {
+		c.copyRow()
+	}
+}
+
 func (a *App) saveConfig(mutate func(*config.Config)) bool {
 	c := a.store.Get()
 	// Header sorting is kept live until shutdown; other settings must retain it.

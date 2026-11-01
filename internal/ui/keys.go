@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"syscall"
 	"unsafe"
 
 	"github.com/tailscale/walk"
@@ -25,6 +26,7 @@ var shortcutHelp = [][2]string{
 	{"Ctrl+1 … Ctrl+9, Ctrl+0", "Go to a page, in sidebar order"},
 	{"Ctrl+,", "Settings"},
 	{"Ctrl+F", "Search the current page"},
+	{"Ctrl+C", "Copy the selected row (tables)"},
 	{"Esc", "Clear the search"},
 	{"F5", "Reload the current page"},
 	{"Delete", "End the selected task (Processes)"},
@@ -37,9 +39,10 @@ var shortcutHelp = [][2]string{
 }
 
 type shortcut struct {
-	mods walk.Modifiers
-	key  walk.Key
-	fn   func()
+	mods  walk.Modifiers
+	key   walk.Key
+	fn    func()
+	guard func() bool // when set, the shortcut only fires while guard() is true
 }
 
 // keyRouter runs gotm's shortcuts before a message reaches the focused
@@ -60,7 +63,7 @@ func (r *keyRouter) OnPreTranslate(msg *win.MSG) bool {
 	}
 	key, mods := walk.Key(msg.WParam), walk.ModifiersDown()
 	for _, k := range r.keys {
-		if k.key == key && k.mods == mods {
+		if k.key == key && k.mods == mods && (k.guard == nil || k.guard()) {
 			k.fn()
 			return true
 		}
@@ -91,7 +94,7 @@ func (r *keyRouter) OnPreTranslate(msg *win.MSG) bool {
 func (a *App) setupShortcuts() {
 	r := &keyRouter{hwnd: win.HWND(a.mw.Handle()), app: a}
 	add := func(mods walk.Modifiers, key walk.Key, fn func()) {
-		r.keys = append(r.keys, shortcut{mods, key, fn})
+		r.keys = append(r.keys, shortcut{mods: mods, key: key, fn: fn})
 	}
 	digits := []walk.Key{walk.Key1, walk.Key2, walk.Key3, walk.Key4, walk.Key5,
 		walk.Key6, walk.Key7, walk.Key8, walk.Key9, walk.Key0}
@@ -105,12 +108,27 @@ func (a *App) setupShortcuts() {
 	}
 	add(walk.ModControl, walk.KeyOEMComma, func() { a.navigate(pgSettings) })
 	add(walk.ModControl, walk.KeyF, a.focusSearch)
+	// Copy-row must not swallow the search box's own text copy, so it stands
+	// down while an edit control has focus.
+	r.keys = append(r.keys, shortcut{mods: walk.ModControl, key: walk.KeyC, fn: a.copyRows, guard: focusNotEdit})
 	add(0, walk.KeyF5, func() {
 		if rl, ok := a.pages[a.cur].impl.(reloader); ok {
 			rl.reload()
 		}
 	})
 	walk.App().AddPreTranslateHandlerForHWND(r.hwnd, r)
+}
+
+// focusNotEdit reports whether keyboard focus is outside an edit control, so
+// Ctrl+C there copies the selected table row instead of the caret's text.
+func focusNotEdit() bool {
+	h := win.GetFocus()
+	if h == 0 {
+		return false
+	}
+	var buf [8]uint16
+	n, _ := win.GetClassName(h, &buf[0], len(buf))
+	return n == 0 || syscall.UTF16ToString(buf[:n]) != "Edit"
 }
 
 // focusSearch puts the caret in the current page's search box, text selected.

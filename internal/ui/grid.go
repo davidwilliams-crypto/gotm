@@ -354,6 +354,20 @@ func (g *gridPage) init() {
 func (g *gridPage) searchBox() *walk.LineEdit { return g.filter }
 func (g *gridPage) focusTarget() walk.Window  { return g.tv }
 
+// copyRow puts the selected row on the clipboard, tab-separated, header first,
+// so a pasted bug report carries the column names (Ctrl+C).
+func (g *gridPage) copyRow() {
+	row := g.model.selectedRow()
+	if row == nil {
+		return
+	}
+	var head []string
+	for _, c := range g.cols {
+		head = append(head, c.Title)
+	}
+	_ = walk.Clipboard().SetText(strings.Join(head, "\t") + "\n" + strings.Join(row, "\t"))
+}
+
 func (g *gridPage) setStatus(s string) {
 	if s != g.last {
 		g.last = s

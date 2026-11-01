@@ -2,7 +2,10 @@
 
 package ui
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 func fmtBytes(n uint64) string {
 	const unit = 1024.0
@@ -40,4 +43,18 @@ func fmtDur(sec uint64) string {
 		return fmt.Sprintf("%dd %02d:%02d:%02d", d, h, m, s)
 	}
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+// startedLabel formats a process start time for the table: the clock time for
+// processes started today, month and time within this year, and the full date
+// for older starts. Sorting still uses the raw timestamp.
+func startedLabel(t time.Time) string {
+	now := time.Now()
+	switch {
+	case t.Year() == now.Year() && t.YearDay() == now.YearDay():
+		return t.Format("15:04:05")
+	case t.Year() == now.Year():
+		return t.Format("Jan _2 15:04")
+	}
+	return t.Format("2006-01-02 15:04")
 }

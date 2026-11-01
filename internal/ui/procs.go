@@ -98,7 +98,7 @@ func colDefs() []colDef {
 				if r.Start == 0 {
 					return ""
 				}
-				return time.UnixMilli(r.Start).Format("2006-01-02 15:04:05")
+				return startedLabel(time.UnixMilli(r.Start))
 			},
 			less: func(a, b *metrics.Row) bool { return a.Start < b.Start }},
 		{key: "path", title: "Image path", width: 380,
@@ -350,7 +350,7 @@ func (t *procsTab) build() decl.Widget {
 						Columns:               cols,
 						ColumnsOrderable:      true,
 						ContextMenuItems:      t.contextMenu(),
-						OnItemActivated:       t.toggleSelected,
+						OnItemActivated:       t.activateRow,
 						OnKeyDown:             t.onKeyDown,
 						OnCurrentIndexChanged: t.onSelectionChanged,
 					},
@@ -373,6 +373,7 @@ func (t *procsTab) contextMenu() []decl.MenuItem {
 		decl.Menu{Text: "Set priority", Items: t.priorityItems()},
 		decl.Separator{},
 		decl.Action{Text: "Open file location", OnTriggered: t.locate},
+		decl.Action{Text: "Copy details", OnTriggered: t.copyRow},
 		decl.Action{Text: "Copy image path", OnTriggered: t.copyPath},
 		decl.Separator{},
 		decl.Action{Text: "Expand / collapse branch", OnTriggered: t.toggleSelected},
@@ -486,7 +487,13 @@ func (t *procsTab) refresh() {
 	case metrics.LayoutTree:
 		unit = "shown"
 	}
-	if txt := fmt.Sprintf("%d %s", len(rows), unit); txt != t.lastCount {
+	txt := fmt.Sprintf("%d %s", len(rows), unit)
+	if len(rows) == 0 {
+		if q := strings.TrimSpace(t.filter.Text()); q != "" {
+			txt = fmt.Sprintf("No processes match “%s” — Esc clears the search", q)
+		}
+	}
+	if txt != t.lastCount {
 		t.lastCount = txt
 		_ = t.count.SetText(txt)
 	}
@@ -566,6 +573,20 @@ func (t *procsTab) setLayout(tree, group bool) {
 	t.app.saveConfig(func(c *configT) { c.TreeView, c.GroupByName = tree, group })
 	t.syncToggles()
 	t.refresh()
+}
+
+// activateRow handles a double-click: expand or collapse a branch in the tree
+// layout, otherwise open the program's folder.
+func (t *procsTab) activateRow() {
+	r := t.selected()
+	if r == nil {
+		return
+	}
+	if t.app.cfg.TreeView && r.HasKids {
+		t.toggleSelected()
+		return
+	}
+	t.locate()
 }
 
 func (t *procsTab) toggleSelected() {
@@ -776,6 +797,25 @@ func (t *procsTab) locate() {
 	if err := metrics.OpenFileLocation(r.PIDs[0]); err != nil {
 		t.app.errBox("Open file location", err)
 	}
+}
+
+// copyRow puts the selected row's visible columns on the clipboard,
+// tab-separated with a header line (Ctrl+C), so a pasted bug report carries
+// the column names.
+func (t *procsTab) copyRow() {
+	r := t.selected()
+	if r == nil || t.tv == nil {
+		return
+	}
+	cols := t.tv.Columns()
+	var head, vals []string
+	for i, c := range t.model.cols {
+		if cols.At(i).Visible() {
+			head = append(head, c.title)
+			vals = append(vals, c.text(r))
+		}
+	}
+	_ = walk.Clipboard().SetText(strings.Join(head, "\t") + "\n" + strings.Join(vals, "\t"))
 }
 
 func (t *procsTab) copyPath() {

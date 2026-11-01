@@ -4,6 +4,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -30,6 +31,12 @@ type perfPage struct {
 	gpuList   rect
 	gpuRows   int
 	gpuProcs  int
+
+	// hover readout on the main graph: the sample under the mouse (-1 = none)
+	// and the plot area it maps to, recorded while painting.
+	hoverIdx     int
+	hoverGraph   rect
+	hoverGraphOn bool
 }
 
 // resItem is one card on the left: a resource kind, plus which adapter for GPUs.
@@ -82,7 +89,7 @@ func resColor(kind int) walk.Color {
 }
 
 func newPerfPage(a *App) *perfPage {
-	p := &perfPage{app: a, perCore: true}
+	p := &perfPage{app: a, perCore: true, hoverIdx: -1}
 	if v := os.Getenv("GOTM_PERF_SEL"); v != "" { // debugging aid: open on a given card
 		fmt.Sscanf(v, "%d", &p.sel)
 	}
@@ -135,7 +142,34 @@ func (p *perfPage) init() {
 		p.clampGPUScroll()
 		p.v.invalidate()
 	}
+	// Hovering the big graph pins a marker on the sample under the cursor and
+	// repaints only when that sample changes, so a sweep costs no more than the
+	// regular refresh.
+	p.v.onMove = func(x, y int) {
+		if idx := p.hoverIndexAt(x, y); idx != p.hoverIdx {
+			p.hoverIdx = idx
+			p.v.invalidate()
+		}
+	}
 	p.v.attachWheel()
+}
+
+// hoverIndexAt maps a mouse position (device pixels) to the history sample it
+// sits over, or -1 when the position is off the main graph.
+func (p *perfPage) hoverIndexAt(x, y int) int {
+	if !p.hoverGraphOn {
+		return -1
+	}
+	r := p.hoverGraph.px()
+	if !r.contains(x, y) {
+		return -1
+	}
+	n := len(p.hist)
+	if n < 2 || r.W <= 0 {
+		return -1
+	}
+	f := (float64(x) - float64(r.X)) / float64(r.W)
+	return clampI(int(math.Round(f*float64(n-1))), 0, n-1)
 }
 
 func (p *perfPage) clampGPUScroll() {
@@ -267,6 +301,7 @@ func (p *perfPage) headline(it resItem, s *metrics.Snapshot) (value, sub string,
 func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	s := p.app.snap
 	p.gpuRows = 0 // set again by the GPU detail when it draws a process list
+	p.hoverGraphOn = false
 	if s == nil {
 		drawText(cv, "Collecting the first sample…", uiFont(12), T.Muted, rect{24, 24, w - 48, 30}, taLeft)
 		return
@@ -420,6 +455,7 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	maxV := plotSeries(cv, inner, p.seriesFor(cur),
 		graphStyle{bg: T.Card, max: p.fixedMax(kind), capacity: p.capacity(), grid: true, lineW: 2})
 	strokeRound(cv, gr, 10, T.Stroke)
+	p.hoverGraph, p.hoverGraphOn = inner, true
 	axis := "100%"
 	if kind == resDisk || kind == resNet {
 		axis = fmtRate(maxV)
@@ -428,6 +464,30 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	drawText(cv, fmt.Sprintf("%s ago", time.Duration(p.app.cfg.HistorySeconds)*time.Second), uiFont(8), T.Faint,
 		rect{inner.X + 6, inner.Y + inner.H - 16, 120, 14}, taLeft)
 	drawText(cv, "now", uiFont(8), T.Faint, rect{inner.X + inner.W - 60, inner.Y + inner.H - 16, 54, 14}, taRight)
+
+	// hover readout: a hairline at the sample under the mouse and a small
+	// caption with its value and age, the way the classic Task Manager does.
+	if i := p.hoverIdx; i >= 0 && i < len(p.hist) && len(p.hist) >= 2 {
+		hp := &p.hist[i]
+		x := inner.X + int(float64(inner.W)*float64(i)/float64(len(p.hist)-1))
+		if pen, err := walk.NewCosmeticPen(walk.PenSolid, blend(T.Text, T.Card, 0.45)); err == nil {
+			_ = cv.DrawLinePixels(pen, walk.Point{X: sc(x), Y: sc(inner.Y)}, walk.Point{X: sc(x), Y: sc(inner.Y + inner.H)})
+			pen.Dispose()
+		}
+		label := hoverLabel(kind, hp)
+		if age := time.Now().UnixMilli() - hp.T; age > 750 {
+			label += "  ·  " + humanDur(time.Duration(age)*time.Millisecond) + " ago"
+		}
+		lw := textWidth(cv, label, uiFont(9)) + 20
+		ly := inner.Y + 6
+		if kind == resCPU {
+			ly = inner.Y + 36 // below the per-core chip, which owns the top-right corner
+		}
+		br := rect{clampI(x-lw/2, inner.X+4, inner.X+inner.W-lw-4), ly, lw, 20}
+		fillRound(cv, br, 6, blend(T.Text, T.Card, 0.15))
+		strokeRound(cv, br, 6, T.Stroke)
+		drawText(cv, label, uiFont(9), T.Text, br, taCenter)
+	}
 
 	// per-core toggle chip (CPU only)
 	if kind == resCPU {
@@ -496,6 +556,21 @@ func heatColor(pct float64) walk.Color {
 		return T.Warn
 	}
 	return T.CPU
+}
+
+// hoverLabel is the value caption shown for one history sample under the mouse.
+func hoverLabel(kind int, h *metrics.HistPoint) string {
+	switch kind {
+	case resCPU:
+		return fmt.Sprintf("%.0f%% CPU", h.CPU)
+	case resMem:
+		return fmt.Sprintf("%.0f%% memory", h.Mem)
+	case resGPU:
+		return fmt.Sprintf("%.0f%% GPU", h.GPU)
+	case resDisk:
+		return fmt.Sprintf("R %s · W %s", fmtRate(h.DiskR), fmtRate(h.DiskW))
+	}
+	return fmt.Sprintf("↓ %s · ↑ %s", fmtRate(h.NetRx), fmtRate(h.NetTx))
 }
 
 func (p *perfPage) coreSeries(i int) []float64 {
