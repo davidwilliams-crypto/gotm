@@ -25,14 +25,16 @@ var (
 	activateMsgId uint32
 	activateOnce  sync.Once
 
-	// activationWait bounds how long a second launch waits for the running
-	// instance to confirm (window hook installed) before giving up.
+	// activationWait bounds how long a second launch keeps asking the running
+	// instance to show itself before giving up (the running instance may
+	// still be building its window, and a closing one may hand the slot
+	// over — see secondLaunch).
 	activationWait = 4 * time.Second
-	// takeoverWait is how long a blocked launch keeps retrying the mutex
-	// before treating the holder as permanent: a closing instance hands the
-	// slot over within moments (Run as administrator), so a brief retry
-	// covers the relaunch race instead of exiting after UAC was accepted.
-	takeoverWait = 1500 * time.Millisecond
+
+	// Object names are variables so tests can use their own namespace
+	// instead of fighting a real gotm running in the session.
+	instanceMutexName   = `Local\gotm.single-instance`
+	activationEventName = `Local\gotm.activation-ready`
 )
 
 const (
@@ -55,40 +57,71 @@ func activationMsg() uint32 {
 // ReleaseSingleInstance); when another gotm already runs it asks that
 // instance to show itself and returns false. A guard failure never refuses to
 // start the app.
+//
+// The named mutex is created WITHOUT ownership: Go's scheduler may retire the
+// thread that took it, and an owned mutex then reads "abandoned" while its
+// process is perfectly alive (which once made this guard hand a live
+// instance's slot to a second launch). The object's EXISTENCE is the slot —
+// a process's handles all close when it exits, and elevate() releases
+// explicitly before relaunching its replacement.
 func GuardSingleInstance() bool {
-	name, _ := windows.UTF16PtrFromString(`Local\gotm.single-instance`)
-	h, err := windows.CreateMutex(nil, true, name)
-	switch {
-	case err == nil: // created and owned
+	name, _ := windows.UTF16PtrFromString(instanceMutexName)
+	h, err := windows.CreateMutex(nil, false, name)
+	switch err {
+	case nil: // created: the slot is ours
 		instanceMutex = h
 		return true
-	case err == windows.ERROR_ALREADY_EXISTS:
-		// The holder may be an instance that is shutting down and handing the
-		// slot over. Retry briefly; if the mutex frees or is abandoned, take
-		// it over cleanly with a fresh create.
-		start := time.Now()
-		for {
-			ev, werr := windows.WaitForSingleObject(h, 250)
-			if werr == nil && (ev == windows.WAIT_OBJECT_0 || ev == windows.WAIT_ABANDONED) {
-				windows.CloseHandle(h)
-				if h2, err2 := windows.CreateMutex(nil, true, name); err2 == nil {
-					instanceMutex = h2
-					return true
-				}
-				return true // cannot recreate: do not block startup
-			}
-			if time.Since(start) >= takeoverWait {
-				break
-			}
-		}
-		if ev, werr := windows.WaitForSingleObject(h, 0); werr == nil && ev == uint32(windows.WAIT_TIMEOUT) {
-			windows.CloseHandle(h)
-			activateRunningInstance()
-			return false
-		}
-		windows.CloseHandle(h)
+	case windows.ERROR_ALREADY_EXISTS:
+		secondLaunch(h)
+		return false
 	}
 	return true // unexpected error: never refuse to start over the guard
+}
+
+// secondLaunch serves a launch that found the slot taken. The running
+// instance is asked to show itself IMMEDIATELY (the healthy case is a Ctrl+
+// Shift+Esc: the window must come up at once, not after any retry), and it
+// keeps asking briefly while that instance finishes building its window.
+func secondLaunch(h windows.Handle) {
+	defer windows.CloseHandle(h)
+	knock()
+	deadline := time.Now().Add(activationWait)
+	for time.Now().Before(deadline) {
+		if activationConfirmed() {
+			return // the running instance heard us: this launch is done
+		}
+		time.Sleep(100 * time.Millisecond)
+		knock()
+	}
+}
+
+// knock asks the running gotm to show its window. The process the user just
+// launched holds foreground permission; handing it to whoever is listening
+// lets the running instance's SetForegroundWindow be honoured instead of
+// only flashing the taskbar.
+func knock() {
+	msg := activationMsg()
+	if msg == 0 {
+		return
+	}
+	_, _, _ = procAllowSetForegroundWindow.Call(asfwAny)
+	win.PostMessage(hwndBroadcast, msg, 0, 0)
+}
+
+// activationConfirmed reports whether a running instance has said "I hear
+// you" (its main window hook is installed and the ready event is set).
+func activationConfirmed() bool {
+	name, err := windows.UTF16PtrFromString(activationEventName)
+	if err != nil {
+		return false
+	}
+	ev, err := windows.OpenEvent(windows.SYNCHRONIZE, false, name)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(ev)
+	evWait, _ := windows.WaitForSingleObject(ev, 0)
+	return evWait == windows.WAIT_OBJECT_0
 }
 
 // ReleaseSingleInstance drops the slot: used by tests, and by elevate() to
@@ -102,52 +135,15 @@ func ReleaseSingleInstance() {
 
 var procAllowSetForegroundWindow = windows.NewLazySystemDLL("user32.dll").NewProc("AllowSetForegroundWindow")
 
-// activateRunningInstance asks the running gotm to show its window. It keeps
-// knocking while the other instance finishes starting (its window may not
-// exist yet) and returns as soon as that instance confirms it heard us.
-func activateRunningInstance() {
-	msg := activationMsg()
-	if msg == 0 {
-		return
-	}
-	const (
-		eventName = `Local\gotm.activation-ready`
-		step      = 250 * time.Millisecond
-	)
-	deadline := time.Now().Add(activationWait)
-	for {
-		// The process the user just launched has foreground permission; hand
-		// it to whoever is listening so the running instance's
-		// SetForegroundWindow is honoured instead of flashing the taskbar.
-		_, _, _ = procAllowSetForegroundWindow.Call(asfwAny)
-		win.PostMessage(hwndBroadcast, msg, 0, 0)
-		if name, err := windows.UTF16PtrFromString(eventName); err == nil {
-			if ev, err := windows.OpenEvent(windows.SYNCHRONIZE, false, name); err == nil {
-				evWait, _ := windows.WaitForSingleObject(ev, uint32(step.Milliseconds()))
-				windows.CloseHandle(ev)
-				if evWait == windows.WAIT_OBJECT_0 {
-					return // the running instance heard us
-				}
-			} else {
-				time.Sleep(step) // the running instance has not come up yet
-			}
-		}
-		if !time.Now().Before(deadline) {
-			return
-		}
-	}
-}
-
 // signalActivationReady lets second launches stop knocking: this instance's
 // main window exists and its hook has seen the activation message. The event
 // is manual-reset and initially set, and this handle stays open for the
 // process lifetime, so every later launch is answered by its first knock.
 func signalActivationReady() {
-	const eventName = `Local\gotm.activation-ready`
 	if readyEvent != 0 {
 		return // already signaled by an earlier call
 	}
-	name, err := windows.UTF16PtrFromString(eventName)
+	name, err := windows.UTF16PtrFromString(activationEventName)
 	if err != nil {
 		return
 	}
@@ -167,5 +163,19 @@ func activateMainWindow(hwnd win.HWND) {
 		return
 	}
 	win.ShowWindow(hwnd, win.SW_RESTORE) // unhides, un-minimizes and activates
-	win.SetForegroundWindow(hwnd)
+	if win.SetForegroundWindow(hwnd) {
+		return // the launching process handed us its foreground permission
+	}
+	// No permission was handed over (the launch may not have had any itself,
+	// and Windows otherwise only flashes the taskbar): briefly attach to the
+	// foreground thread — the standard fallback — and bring the window up.
+	if fg := win.GetForegroundWindow(); fg != 0 {
+		mine := win.GetCurrentThreadId()
+		if other := win.GetWindowThreadProcessId(fg, nil); other != 0 && other != mine {
+			win.AttachThreadInput(int32(mine), int32(other), true)
+			win.BringWindowToTop(hwnd)
+			win.SetForegroundWindow(hwnd)
+			win.AttachThreadInput(int32(mine), int32(other), false)
+		}
+	}
 }

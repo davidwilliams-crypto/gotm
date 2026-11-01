@@ -3,8 +3,10 @@
 package ui
 
 import (
+	"fmt"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/tailscale/walk"
@@ -93,6 +95,16 @@ func lvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 		// same window, so mirror it instead of calling CallWindowProc(0, …)
 		return win.DefWindowProc(h, uint32(msg), wp, lp)
 	}
+	// Diagnostic: any single list-view message that blocks the UI thread for a
+	// perceptible time is named in the stall log (comctl32 internals are
+	// otherwise invisible to goroutine dumps).
+	t0 := time.Now()
+	defer func() {
+		if d := time.Since(t0); d > 150*time.Millisecond {
+			stallLine(fmt.Sprintf("list view msg 0x%04X took %s", msg, d.Round(10*time.Millisecond)))
+		}
+	}()
+	stallBeat.Store(time.Now().UnixMilli())
 	if msg == win.WM_NCDESTROY {
 		r := win.CallWindowProc(prev, h, uint32(msg), wp, lp)
 		delete(lvPrev, h)

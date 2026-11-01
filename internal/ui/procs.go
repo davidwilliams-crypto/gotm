@@ -4,8 +4,6 @@ package ui
 
 import (
 	"fmt"
-	"golang.org/x/sys/windows"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -149,24 +147,27 @@ func (m *procModel) Value(row, col int) interface{} {
 	return s
 }
 
-// Image gives each row its program's icon. Walk resolves a file path through
-// the shell's system image list (cached per path), so this costs nothing per
-// refresh. Processes whose image path is hidden (System, protected processes
-// when not elevated) get the generic application icon.
+// Image gives each row its program's icon as an already-extracted walk Icon:
+// handing Walk a file PATH instead would make the UI thread call
+// SHGetFileInfo (shell + file access), which on a cold machine or a sleeping
+// disk blocks for seconds and the window flags "not responding" — see
+// procIconCache. Until a worker has extracted the program's icon, the row
+// shows the stock application icon.
 func (m *procModel) Image(row int) interface{} {
 	if row < 0 || row >= len(m.rows) {
 		return nil
 	}
 	if p := m.rows[row].Path; p != "" {
-		return p
+		if ic := procIcons.icon(p); ic != nil {
+			return ic
+		}
+		procIcons.enqueue(p)
 	}
 	return genericExeIcon
 }
 
-var genericExeIcon = func() string {
-	dir, _ := windows.GetSystemDirectory()
-	return filepath.Join(dir, "svchost.exe")
-}()
+// genericExeIcon is the stock application icon: no file access, instant.
+var genericExeIcon = walk.IconApplicationSmall()
 
 // ID lets the table identify rows across rebuilds.
 func (m *procModel) ID(row int) interface{} {

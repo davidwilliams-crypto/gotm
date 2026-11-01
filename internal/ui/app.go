@@ -22,6 +22,7 @@ import (
 
 	"gotm/internal/config"
 	"gotm/internal/metrics"
+	"gotm/internal/safepath"
 )
 
 // page is one screen in the sidebar.
@@ -113,10 +114,19 @@ var PageIDs = map[string]int{
 
 // Run builds the window and blocks until it is closed.
 func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
+	// Diagnostic log of start-up phases and any ≥1.5 s UI-thread stall (with
+	// goroutine stacks): <settings>\stall.log. Refuses redirected folders
+	// while elevated, like every other settings write.
+	if dir := config.Dir(); dir != "" && !safepath.Redirected(dir) {
+		InitStallLog(dir)
+	} else {
+		InitStallLog("")
+	}
 	// The UI thread is a COM single-threaded apartment: UI Automation (uia.go)
 	// marshals screen-reader calls to it, and Walk's own annotations need it.
 	_ = windows.CoInitializeEx(0, windows.COINIT_APARTMENTTHREADED)
 	applyTheme() // gotm's dark palette, or the system colours in high-contrast mode
+	stallPhase("theme applied")
 	a := &App{
 		version: version, store: store, cfg: store.Get(), sampler: sampler,
 		host: metrics.ReadHostInfo(), alertSince: map[int]int64{}, alertShown: map[int]time.Time{},
@@ -222,6 +232,7 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 		},
 	}.Create()
 	debugf("window created, err=%v", err)
+	stallPhase("main window created")
 	if err != nil {
 		return err
 	}
@@ -247,6 +258,7 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	for _, p := range a.pages {
 		p.impl.init()
 	}
+	stallPhase("pages initialized")
 	a.setupShortcuts()
 	a.setupTray(icon)
 	// pages may have trimmed their minimum width during init: apply the real size now
@@ -266,6 +278,7 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	})
 
 	a.navigate(start)
+	stallPhase("first page shown; entering message loop")
 	a.pumpDone = make(chan struct{})
 	go a.pump()
 	walk.App().Run()
@@ -356,6 +369,9 @@ func (a *App) pump() {
 				return
 			}
 			snap = s
+			// Recording happens here, on this background goroutine: the
+			// ring update and any on-disk write never block a paint.
+			a.rec.Add(snap)
 		}
 		select {
 		case a.scheduled <- struct{}{}:
@@ -374,7 +390,6 @@ func (a *App) onSnapshot(s *metrics.Snapshot) {
 	if p, ok := a.pages[pgPower].impl.(*powerPage); ok {
 		p.rows = a.sensors.Update(s, a.host)
 	}
-	a.rec.Add(s)
 	a.updateTray(s)
 	a.checkAlerts(s)
 	a.invalidateChrome()
@@ -563,6 +578,7 @@ func (a *App) watchSystem() {
 	const spiSetHighContrast = 0x0043
 	activation := activationMsg()
 	a.endSessionCB = syscall.NewCallback(func(hwnd win.HWND, msg uint32, wp, lp uintptr) uintptr {
+		stallBeat.Store(time.Now().UnixMilli()) // the UI thread is alive
 		if activation != 0 && msg == activation {
 			// a second launch asked this instance to show itself
 			activateMainWindow(hwnd)
