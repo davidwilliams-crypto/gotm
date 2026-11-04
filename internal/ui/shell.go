@@ -184,7 +184,7 @@ func (a *App) checkAlerts(s *metrics.Snapshot) {
 	val := map[string]float64{"cpu": s.CPU, "mem": s.Mem.Percent, "disk": s.Disk.Percent, "gpu": s.GPU.Percent}
 	var firing []string
 	for i, al := range a.cfg.Alerts {
-		if !al.Enabled || val[al.Metric] <= al.Above {
+		if !al.Enabled || (al.Metric == "gpu" && !s.GPU.OK) || val[al.Metric] <= al.Above {
 			delete(a.alertSince, i)
 			continue
 		}

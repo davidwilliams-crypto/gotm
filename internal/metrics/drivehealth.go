@@ -115,17 +115,20 @@ func busName(b uint32) string {
 	return fmt.Sprintf("bus %d", b)
 }
 
-// ReadDriveHealth queries \\.\PhysicalDrive0.. and returns what it could read.
+// ReadDriveHealth queries physical drives enumerated by Windows and returns
+// what it could read. RAID controllers may expose only logical drives; member
+// sensors hidden by their firmware cannot be queried through this interface.
 func ReadDriveHealth() []DriveHealth {
 	var out []DriveHealth
-	misses := 0
-	for i := 0; i < 32 && misses < 4; i++ {
+	indices, err := discoverPhysicalDrives()
+	if err != nil {
+		return out
+	}
+	for _, i := range indices {
 		h, err := openPhysical(i)
 		if err != nil {
-			misses++
 			continue
 		}
-		misses = 0
 		out = append(out, readOneDrive(h, i))
 		windows.CloseHandle(h)
 	}
@@ -133,11 +136,17 @@ func ReadDriveHealth() []DriveHealth {
 }
 
 func readOneDrive(h windows.Handle, idx int) DriveHealth {
+	return readDriveHealth(idx, func(id uint32, extra []byte, outSize int) ([]byte, error) {
+		return storageQuery(h, id, extra, outSize)
+	})
+}
+
+func readDriveHealth(idx int, query func(uint32, []byte, int) ([]byte, error)) DriveHealth {
 	d := DriveHealth{Index: idx}
 	le := binary.LittleEndian
 
 	// model + bus: STORAGE_DEVICE_DESCRIPTOR
-	if b, err := storageQuery(h, propStorageDevice, nil, 1024); err == nil && len(b) >= 36 {
+	if b, err := query(propStorageDevice, nil, 1024); err == nil && len(b) >= 36 {
 		str := func(off uint32) string {
 			if off == 0 || int(off) >= len(b) {
 				return ""
@@ -159,7 +168,7 @@ func readOneDrive(h windows.Handle, idx int) DriveHealth {
 	// temperature: DEVICE_TEMPERATURE_DATA_DESCRIPTOR (works for NVMe and many SATA)
 	// DEVICE_TEMPERATURE_DATA_DESCRIPTOR: a 24-byte header, then InfoCount
 	// 16-byte DEVICE_TEMPERATURE_INFO entries whose Temperature is at +2.
-	if b, err := storageQuery(h, propDeviceTemperature, nil, 256); err == nil && len(b) >= 24+16 {
+	if b, err := query(propDeviceTemperature, nil, 256); err == nil && len(b) >= 24+16 {
 		count := int(le.Uint16(b[12:]))
 		if count > 0 && len(b) >= 24+16*count {
 			t := int16(le.Uint16(b[26:])) // TemperatureInfo[0].Temperature, deg C
@@ -178,12 +187,21 @@ func readOneDrive(h windows.Handle, idx int) DriveHealth {
 		le.PutUint32(sp[12:], 0)
 		le.PutUint32(sp[16:], protoSpecificSize) // ProtocolDataOffset
 		le.PutUint32(sp[20:], healthLogBytes)    // ProtocolDataLength
-		b, err := storageQuery(h, propProtocolSpecific, sp[:], 8+protoSpecificSize+healthLogBytes)
-		if err == nil && len(b) >= 8+protoSpecificSize+64 {
+		b, err := query(propProtocolSpecific, sp[:], 8+protoSpecificSize+healthLogBytes)
+		if err == nil && len(b) >= 8+protoSpecificSize {
 			off := le.Uint32(b[8+16:]) // returned ProtocolDataOffset
-			base := 8 + int(off)
-			if base+200 <= len(b) {
-				log := b[base:]
+			// The IOCTL may succeed while a bridge/driver returns an incomplete
+			// descriptor. Validate the declared payload before trusting any health
+			// bytes; otherwise the descriptor itself can become a healthy log.
+			version, descriptorSize := le.Uint32(b), le.Uint32(b[4:])
+			length := le.Uint32(b[28:])
+			base := uint64(8) + uint64(off)
+			end := base + uint64(length)
+			if version >= 8+protoSpecificSize && descriptorSize >= version &&
+				le.Uint32(b[8:]) == protocolNVMe && le.Uint32(b[12:]) == nvmeDataTypeLogPage &&
+				off >= protoSpecificSize && base >= uint64(descriptorSize) &&
+				length >= healthLogBytes && end <= uint64(len(b)) {
+				log := b[int(base):int(end)]
 				u128 := func(o int) float64 { // low 64 bits are plenty for these counters
 					return float64(le.Uint64(log[o:]))
 				}

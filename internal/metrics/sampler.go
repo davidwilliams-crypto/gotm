@@ -18,21 +18,22 @@ import (
 
 // Proc is one row of the process table.
 type Proc struct {
-	PID     uint32  `json:"pid"`
-	PPID    uint32  `json:"ppid"`
-	Name    string  `json:"name"`
-	Path    string  `json:"path,omitempty"`
-	User    string  `json:"user,omitempty"`
-	CPU     float64 `json:"cpu"`     // percent of all logical CPUs
-	Mem     uint64  `json:"mem"`     // working set, bytes
-	Private uint64  `json:"private"` // private bytes
-	Threads uint32  `json:"threads"`
-	Handles uint32  `json:"handles"`
-	IO      float64 `json:"io"`  // bytes/sec (read+write transfer)
-	GPU     float64 `json:"gpu"` // percent, busiest engine type
-	Prio    string  `json:"prio"`
-	Session uint32  `json:"session"`
-	Start   int64   `json:"start"` // unix ms
+	PID            uint32  `json:"pid"`
+	PPID           uint32  `json:"ppid"`
+	Name           string  `json:"name"`
+	Path           string  `json:"path,omitempty"`
+	User           string  `json:"user,omitempty"`
+	CPU            float64 `json:"cpu"`     // percent of all logical CPUs
+	Mem            uint64  `json:"mem"`     // working set, bytes
+	Private        uint64  `json:"private"` // private bytes
+	Threads        uint32  `json:"threads"`
+	Handles        uint32  `json:"handles"`
+	IO             float64 `json:"io"`  // bytes/sec (read+write transfer)
+	GPU            float64 `json:"gpu"` // percent, busiest engine type
+	GPUUnavailable bool    `json:"gpuUnavailable,omitempty"`
+	Prio           string  `json:"prio"`
+	Session        uint32  `json:"session"`
+	Start          int64   `json:"start"` // unix ms
 }
 
 // DiskInfo / NetInfo / GPUInfo are system-wide rates.
@@ -86,17 +87,19 @@ type HistPoint struct {
 	NetRx float64   `json:"rx"`
 	NetTx float64   `json:"tx"`
 	GPU   float64   `json:"gpu"`
+	GPUOK bool      `json:"gpuOK"`
 	Cores []float64 `json:"cores"`
 	GPUs  []GPUHist `json:"gpus,omitempty"`
 }
 
 // GPUHist is one adapter's point on the graphs.
 type GPUHist struct {
-	ID  string
-	Pct float64
-	Ded float64 // bytes in use
-	Shr float64
-	Eng map[string]float64
+	ID                                                string
+	Pct                                               float64
+	Ded                                               float64 // bytes in use
+	Shr                                               float64
+	Eng                                               map[string]float64
+	HasUtilization, HasDedicatedUsage, HasSharedUsage bool
 }
 
 type procKey struct {
@@ -256,7 +259,8 @@ func (s *Sampler) tick(publish bool) {
 		live := make(map[procKey]struct{}, len(raws))
 		for _, r := range raws {
 			pp := Proc{
-				PID: r.PID, PPID: r.PPID, Name: r.Name,
+				GPUUnavailable: !snap.GPU.OK,
+				PID:            r.PID, PPID: r.PPID, Name: r.Name,
 				Mem: r.WorkingSet, Private: r.Private,
 				Threads: r.Threads, Handles: r.Handles,
 				Prio: prioName(r.BasePrio), Session: r.Session,
@@ -266,7 +270,9 @@ func (s *Sampler) tick(publish bool) {
 			}
 			if prev, ok := s.prevProcs[r.PID]; ok && prev.create == r.CreateTime && totalDelta > 0 {
 				if r.CPUTime >= prev.cpu {
-					pp.CPU = round1(float64(r.CPUTime-prev.cpu) * 100 / float64(totalDelta))
+					// Core and process totals come from separate OS queries. Their
+					// sampling windows can differ, especially for the idle process.
+					pp.CPU = round1(math.Min(100, float64(r.CPUTime-prev.cpu)*100/float64(totalDelta)))
 				}
 				if elapsed > 0 && r.IOBytes >= prev.io {
 					pp.IO = math.Round(float64(r.IOBytes-prev.io) / elapsed)
@@ -312,7 +318,7 @@ func (s *Sampler) tick(publish bool) {
 	hp := HistPoint{
 		T: snap.T, CPU: snap.CPU, Mem: round1(snap.Mem.Percent),
 		DiskR: snap.Disk.ReadBps, DiskW: snap.Disk.WriteBps, DiskP: snap.Disk.Percent,
-		NetRx: snap.Net.RxBps, NetTx: snap.Net.TxBps, GPU: snap.GPU.Percent,
+		NetRx: snap.Net.RxBps, NetTx: snap.Net.TxBps, GPU: snap.GPU.Percent, GPUOK: snap.GPU.OK,
 		// A private copy: History() hands out shallow copies of the ring, and
 		// a hist point sharing the snapshot's array would alias for every
 		// consumer if anything ever rescaled a core value in place.
@@ -320,6 +326,7 @@ func (s *Sampler) tick(publish bool) {
 	}
 	for _, g := range snap.GPUs {
 		gh := GPUHist{ID: g.ID, Pct: g.Pct, Ded: float64(g.DedicatedUsed), Shr: float64(g.SharedUsed),
+			HasUtilization: g.UtilizationAvailable(), HasDedicatedUsage: g.HasDedicatedUsage, HasSharedUsage: g.HasSharedUsage,
 			Eng: make(map[string]float64, len(g.Engines))}
 		for _, e := range g.Engines {
 			gh.Eng[e.Name] = e.Pct

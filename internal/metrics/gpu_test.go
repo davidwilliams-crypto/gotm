@@ -34,6 +34,12 @@ func TestBuildGPUsFromSyntheticCounters(t *testing.T) {
 	pshr := []PDHInstanceValue{{Instance: "pid_200_luid_0x00000000_0x000175F6_phys_0", Value: 90 << 20}}
 
 	gpus := buildGPUs(static, eng, ded, shr, pded, pshr)
+	if got := summarizeGPUs(gpus); got.Percent != 100 || got.MemBytes != (2<<30)+(33<<20) || !got.OK {
+		t.Errorf("summary must use busiest visible adapter and their total memory: %+v", got)
+	}
+	if got := summarizeGPUs(nil); got != (GPUInfo{}) {
+		t.Errorf("no adapters should have no GPU summary: %+v", got)
+	}
 	if len(gpus) != 2 {
 		t.Fatalf("got %d adapters, want 2 (software adapter hidden): %+v", len(gpus), gpus)
 	}

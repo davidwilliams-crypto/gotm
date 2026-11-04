@@ -10,6 +10,45 @@ import (
 	"github.com/tailscale/win"
 )
 
+func TestStyledTableKeepsPaletteDuringSystemColorRefresh(t *testing.T) {
+	runNativeTest(t, func() {
+		mw, err := walk.NewMainWindow()
+		if err != nil {
+			panic(err)
+		}
+		defer mw.Dispose()
+		tv, err := walk.NewTableView(mw)
+		if err != nil {
+			panic(err)
+		}
+		defer delete(lvCache, tv)
+		before := len(styledTables)
+		defer func() { styledTables = styledTables[:before] }()
+		styleTable(tv)
+		if bg, ok := tv.Background().(*walk.SolidColorBrush); !ok || bg.Color() != T.TableBG {
+			t.Error("table container lacks palette background during loading")
+		}
+		tv.ApplySysColors() // Walk can reset native backgrounds after styling.
+		for _, lv := range listViews(tv) {
+			if got := win.SendMessage(lv, 0x1000 /* LVM_GETBKCOLOR */, 0, 0); got != colorref(T.TableBG) {
+				t.Errorf("native background=%x, want palette %x", got, colorref(T.TableBG))
+			}
+		}
+		oldPalette := T
+		defer func() { T = oldPalette }()
+		T.TableBG = walk.RGB(250, 250, 250)
+		colorTable(tv)
+		if bg := tv.Background().(*walk.SolidColorBrush); bg.Color() != T.TableBG {
+			t.Error("container did not adopt changed palette")
+		}
+		for _, lv := range listViews(tv) {
+			if got := win.SendMessage(lv, 0x1000, 0, 0); got != colorref(T.TableBG) {
+				t.Error("native list did not adopt changed palette")
+			}
+		}
+	})
+}
+
 // Each refresh enumerates list views. Go allows only ~2000 callbacks per
 // process and aborts the program past that, so the enumeration must reuse one.
 func TestChildEnumerationDoesNotExhaustCallbacks(t *testing.T) {

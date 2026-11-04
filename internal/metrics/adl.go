@@ -183,18 +183,23 @@ func (l *adlLib) isAPU(ad adlAdapter) bool {
 	return ad.integrated || (l != nil && l.apu[ad.index])
 }
 
-// adlPickAdapters keeps one entry per physical AMD adapter: ADL lists one
-// record per display output, all sharing the PCI bus number. Records that
-// are neither present nor existing describe hardware that was removed.
+// adlPickAdapters coalesces display outputs with the same nonempty vendor
+// UDID. A PCI bus alone cannot identify a physical card across PCI domains.
+// Without a UDID retain distinct indices so matching can reject ambiguity.
 func adlPickAdapters(all []adlAdapterInfo) []adlAdapter {
 	var out []adlAdapter
-	seen := map[int32]bool{}
+	seenID := map[string]bool{}
+	seenIndex := map[int32]bool{}
 	for i := range all {
 		a := &all[i]
-		if a.VendorID != adlVendorAMD || (a.Present == 0 && a.Exist == 0) || seen[a.Bus] {
+		id := strings.ToUpper(cString(a.UDID[:]))
+		if a.VendorID != adlVendorAMD || (a.Present == 0 && a.Exist == 0) || seenIndex[a.Index] || (id != "" && seenID[id]) {
 			continue
 		}
-		seen[a.Bus] = true
+		seenIndex[a.Index] = true
+		if id != "" {
+			seenID[id] = true
+		}
 		out = append(out, adlAdapter{index: a.Index, bus: int(a.Bus), name: cString(a.Name[:])})
 	}
 	return out
@@ -217,22 +222,22 @@ func (l *adlLib) close() {
 	}
 }
 
-// find returns the ADL adapter on this PCI bus, else one with this name.
-func (l *adlLib) find(bus int, name string) (adlAdapter, bool) {
+// find accepts only a bus or name unique in both discovery and ADL. Callers
+// sampling a discovered list pass peers so identical cards cannot share sensors.
+func (l *adlLib) find(bus int, name string, peers ...gpuStatic) (adlAdapter, bool) {
 	if l == nil || !l.ok {
 		return adlAdapter{}, false
 	}
-	if bus >= 0 {
-		for _, a := range l.adapters {
-			if a.bus == bus {
-				return a, true
-			}
-		}
+	local := vendorGPUIdentities(peers, 0x1002)
+	if len(peers) == 0 {
+		local = []vendorGPUIdentity{{bus, name}}
 	}
+	var remote []vendorGPUIdentity
 	for _, a := range l.adapters {
-		if strings.EqualFold(shortName(a.name), shortName(name)) {
-			return a, true
-		}
+		remote = append(remote, vendorGPUIdentity{a.bus, a.name})
+	}
+	if i := matchVendorGPU(bus, name, local, remote); i >= 0 {
+		return l.adapters[i], true
 	}
 	return adlAdapter{}, false
 }

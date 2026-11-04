@@ -75,9 +75,19 @@ func colDefs() []colDef {
 			less: func(a, b *metrics.Row) bool { return a.IO < b.IO },
 			heat: func(r *metrics.Row, _ uint64) float64 { return r.IO / 40e6 }},
 		{key: "gpu", title: "GPU", width: 70, numeric: true,
-			text: func(r *metrics.Row) string { return pct(r.GPU) },
+			text: func(r *metrics.Row) string {
+				if r.GPUUnavailable {
+					return "n/a"
+				}
+				return pct(r.GPU)
+			},
 			less: func(a, b *metrics.Row) bool { return a.GPU < b.GPU },
-			heat: func(r *metrics.Row, _ uint64) float64 { return r.GPU / 40 }},
+			heat: func(r *metrics.Row, _ uint64) float64 {
+				if r.GPUUnavailable {
+					return 0
+				}
+				return r.GPU / 40
+			}},
 		{key: "threads", title: "Threads", width: 70, numeric: true,
 			text: func(r *metrics.Row) string { return fmt.Sprint(r.Threads) },
 			less: func(a, b *metrics.Row) bool { return a.Threads < b.Threads }},

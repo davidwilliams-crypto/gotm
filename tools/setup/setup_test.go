@@ -22,6 +22,18 @@ import (
 func testLayout(t *testing.T) layout {
 	t.Helper()
 	root := t.TempDir()
+	// TEMP may use ADMINI~1. Real installs require long paths, and ShellLink
+	// expands aliases on readback; use that same spelling for fixtures.
+	p, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n, err := windows.GetLongPathName(p, &buf[0], uint32(len(buf)))
+	if err != nil || n == 0 || n >= uint32(len(buf)) {
+		t.Fatalf("expand fixture path: n=%d err=%v", n, err)
+	}
+	root = windows.UTF16ToString(buf[:n])
 	l := layout{
 		inspectSecurity: func(windows.Handle, bool) error { return nil },
 		queryVolume: func(string, windows.Handle) (destinationVolume, error) {

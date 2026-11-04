@@ -4,6 +4,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -37,7 +38,7 @@ func gpuSubtitle(g *metrics.GPUAdapter, idx int) string {
 func (p *perfPage) gpuSeries(id string, f func(*metrics.GPUHist) float64) []float64 {
 	out := make([]float64, 0, len(p.hist))
 	for i := range p.hist {
-		var v float64
+		v := math.NaN()
 		for k := range p.hist[i].GPUs {
 			if p.hist[i].GPUs[k].ID == id {
 				v = f(&p.hist[i].GPUs[k])
@@ -59,8 +60,10 @@ func gpuFacts(g *metrics.GPUAdapter) [][2]string {
 		notExposed = "Not exposed by Intel"
 	}
 	switch {
-	case g.HasClock && g.MemClockMHz > 0:
+	case g.HasClock && (g.HasMemClock || g.MemClockMHz > 0):
 		add("Clock speed", fmt.Sprintf("%.0f MHz · mem %.0f", g.ClockMHz, g.MemClockMHz))
+	case g.HasMemClock && !g.HasClock:
+		add("Clock speed", fmt.Sprintf("Memory %.0f MHz", g.MemClockMHz))
 	case g.HasClock:
 		add("Clock speed", fmt.Sprintf("%.0f MHz", g.ClockMHz))
 	default:
@@ -186,9 +189,18 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, s *metrics.Snapshot, g *metrics
 		area.H = 60
 	}
 	switch {
+	case !g.UtilizationAvailable():
+		fillRound(cv, area, 10, T.Card)
+		drawText(cv, "Utilization unavailable", uiFont(10), T.Muted, area, taCenter)
+		v.addText(area, "Utilization unavailable")
 	case p.gpuOver || len(g.Engines) == 0:
 		fillRound(cv, rect{area.X - 1, area.Y - 1, area.W + 2, area.H + 2}, 10, T.Card)
-		plotSeries(cv, area.inset(8), []series{{vals: p.gpuSeries(g.ID, func(h *metrics.GPUHist) float64 { return h.Pct }), color: T.GPU, fill: true}},
+		plotSeries(cv, area.inset(8), []series{{vals: p.gpuSeries(g.ID, func(h *metrics.GPUHist) float64 {
+			if !h.HasUtilization && len(h.Eng) == 0 {
+				return math.NaN()
+			}
+			return h.Pct
+		}), color: T.GPU, fill: true}},
 			graphStyle{bg: T.Card, max: 100, capacity: p.capacity(), grid: true, lineW: 2})
 		strokeRound(cv, area, 10, T.Stroke)
 		drawText(cv, "100%", uiFont(8), T.Faint, rect{area.X + 14, area.Y + 10, 80, 14}, taLeft)
@@ -224,7 +236,13 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, s *metrics.Snapshot, g *metrics
 			cr := rect{cx, cy, cw, cellH}
 			fillRound(cv, cr, 8, T.Card)
 			name := e.Name
-			vals := p.gpuSeries(g.ID, func(h *metrics.GPUHist) float64 { return h.Eng[name] })
+			vals := p.gpuSeries(g.ID, func(h *metrics.GPUHist) float64 {
+				v, ok := h.Eng[name]
+				if !ok {
+					return math.NaN()
+				}
+				return v
+			})
 			plotSeries(cv, rect{cr.X + 4, cr.Y + 4, cr.W - 8, cr.H - 8},
 				[]series{{vals: vals, color: heatColorGPU(e.Pct), fill: true}},
 				graphStyle{bg: T.Card, max: 100, capacity: p.capacity(), lineW: 2})
@@ -247,9 +265,20 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, s *metrics.Snapshot, g *metrics
 		used, tot  uint64
 		pick       func(*metrics.GPUHist) float64
 		colorIsMem bool
+		available  bool
 	}{
-		{"Dedicated GPU memory", g.DedicatedUsed, g.DedicatedTotal, func(x *metrics.GPUHist) float64 { return x.Ded }, false},
-		{"Shared GPU memory", g.SharedUsed, g.SharedTotal, func(x *metrics.GPUHist) float64 { return x.Shr }, true},
+		{"Dedicated GPU memory", g.DedicatedUsed, g.DedicatedTotal, func(x *metrics.GPUHist) float64 {
+			if !x.HasDedicatedUsage {
+				return math.NaN()
+			}
+			return x.Ded
+		}, false, g.HasDedicatedUsage},
+		{"Shared GPU memory", g.SharedUsed, g.SharedTotal, func(x *metrics.GPUHist) float64 {
+			if !x.HasSharedUsage {
+				return math.NaN()
+			}
+			return x.Shr
+		}, true, g.HasSharedUsage},
 	} {
 		cr := rect{x0 + i*(half+gap), y, half, memH}
 		fillRound(cv, cr, 8, T.Card)
@@ -263,8 +292,12 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, s *metrics.Snapshot, g *metrics
 			graphStyle{bg: T.Card, max: maxV, capacity: p.capacity(), grid: true, lineW: 2})
 		strokeRound(cv, cr, 8, T.Stroke)
 		drawText(cv, m.title, uiFont(8), T.Muted, rect{cr.X + 8, cr.Y + 3, cr.W - 150, 16}, taLeft)
-		drawText(cv, memPair(m.used, m.tot), uiFont(8), T.Text, rect{cr.X + cr.W - 168, cr.Y + 3, 160, 16}, taRight)
-		v.addText(cr, m.title+": "+memPair(m.used, m.tot))
+		caption := "n/a"
+		if m.available {
+			caption = memPair(m.used, m.tot)
+		}
+		drawText(cv, caption, uiFont(8), T.Text, rect{cr.X + cr.W - 168, cr.Y + 3, 160, 16}, taRight)
+		v.addText(cr, m.title+": "+caption)
 	}
 	y += memH + gap
 
@@ -306,8 +339,8 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, s *metrics.Snapshot, g *metrics
 	}
 	ry := y + 30
 	if len(g.Procs) == 0 {
-		drawText(cv, "No process is using this adapter right now.", uiFont(9), T.Faint, rect{colName, ry + 2, dw - 16, 18}, taLeft)
-		v.addText(rect{colName, ry + 2, dw - 16, 18}, "No process is using this adapter right now.")
+		drawText(cv, "No per-process GPU activity reported.", uiFont(9), T.Faint, rect{colName, ry + 2, dw - 16, 18}, taLeft)
+		v.addText(rect{colName, ry + 2, dw - 16, 18}, "No per-process GPU activity reported.")
 		return
 	}
 	p.gpuList = rect{x0, y, dw, h - y}
@@ -332,9 +365,13 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, s *metrics.Snapshot, g *metrics
 		drawText(cv, fmt.Sprint(pr.PID), uiFont(9), T.Muted, rect{colPID, ry, 80, 16}, taLeft)
 		drawText(cv, fmtBytes(pr.Dedicated), uiFont(9), T.Text, rect{colDed, ry, dw/8 + 20, 16}, taLeft)
 		drawText(cv, fmtBytes(pr.Shared), uiFont(9), T.Text, rect{colShr, ry, dw/8 + 20, 16}, taLeft)
-		drawText(cv, fmt.Sprintf("%.1f%%", pr.Pct), uiFont(9), heatColorGPU(pr.Pct), rect{colPct, ry, 80, 16}, taLeft)
-		v.addText(rect{colName, ry, dw - 16, 16}, fmt.Sprintf("%s, PID %d, dedicated %s, shared %s, engine %.1f%%",
-			pr.Name, pr.PID, fmtBytes(pr.Dedicated), fmtBytes(pr.Shared), pr.Pct))
+		engineText := "n/a"
+		if g.UtilizationAvailable() {
+			engineText = fmt.Sprintf("%.1f%%", pr.Pct)
+		}
+		drawText(cv, engineText, uiFont(9), heatColorGPU(pr.Pct), rect{colPct, ry, 80, 16}, taLeft)
+		v.addText(rect{colName, ry, dw - 16, 16}, fmt.Sprintf("%s, PID %d, dedicated %s, shared %s, engine %s",
+			pr.Name, pr.PID, fmtBytes(pr.Dedicated), fmtBytes(pr.Shared), engineText))
 		ry += 20
 	}
 }

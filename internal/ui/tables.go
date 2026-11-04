@@ -118,6 +118,9 @@ func nameTable(tv *walk.TableView, name string) {
 
 // colorTable applies the palette's table colours (also after a theme change).
 func colorTable(tv *walk.TableView) {
+	// Walk's container can paint before its native list views finish loading
+	// or resizing. Color that surface too, not just the rows inside it.
+	setBackground(tv, T.TableBG)
 	for _, lv := range listViews(tv) {
 		if hdr := win.HWND(win.SendMessage(lv, lvmGetHeader, 0, 0)); hdr != 0 {
 			colorHeaderText(lv, hdr, T.Muted)

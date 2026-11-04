@@ -16,6 +16,33 @@ func rowByID(rows []SensorRow, id string) (SensorRow, bool) {
 	return SensorRow{}, false
 }
 
+func TestNativeSensorAvailabilityRows(t *testing.T) {
+	h := NewSensorHubWith(nil)
+	rows := h.Update(&Snapshot{GPUs: []GPUAdapter{{ID: "missing"}, {ID: "idle", HasUtilization: true, HasDedicatedUsage: true, HasSharedUsage: true, HasMemClock: true, MemClockMHz: 800}}}, HostInfo{})
+	for _, id := range []string{"gpu.missing.load.0", "gpu.missing.mem.ded", "gpu.missing.mem.shr"} {
+		r, ok := rowByID(rows, id)
+		if !ok || r.Kind != "note" || r.Value != "—" {
+			t.Errorf("missing reading %s: %+v", id, r)
+		}
+	}
+	for _, id := range []string{"gpu.idle.load.0", "gpu.idle.mem.ded", "gpu.idle.mem.shr"} {
+		r, ok := rowByID(rows, id)
+		if !ok || r.Kind == "note" || r.Value == "—" {
+			t.Errorf("idle reading %s: %+v", id, r)
+		}
+	}
+	if r, ok := rowByID(rows, "gpu.idle.clk.mem"); !ok || r.Value != "800 MHz" {
+		t.Errorf("independent memory clock: %+v", r)
+	}
+}
+
+func TestDefaultSensorHubIsSelfContained(t *testing.T) {
+	h := NewSensorHub()
+	if h.External() != nil {
+		t.Fatal("default sensor hub must not start a companion connection")
+	}
+}
+
 // Each adapter with vendor sensors gets its own group in the tree, and an
 // APU's CPU-side readings appear under the CPU with an honest source label.
 func TestSensorRowsIncludeGPUAdapters(t *testing.T) {
@@ -57,7 +84,7 @@ func TestSensorRowsIncludeGPUAdapters(t *testing.T) {
 	if r, _ := rowByID(rows, "gpu.b.pwr.0"); r.Name != "Power draw" {
 		t.Errorf("NVIDIA power label %q", r.Name)
 	}
-	if r, ok := rowByID(rows, "gpu.c.none"); !ok || !strings.Contains(r.Name, "Intel") {
+	if r, ok := rowByID(rows, "gpu.c.none"); !ok || !strings.Contains(r.Name, "installed display driver") {
 		t.Errorf("adapter without sensors should carry a note, got %+v", r)
 	}
 	// the APU's CPU temperature is the fallback when no SDK or external source exists

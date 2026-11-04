@@ -104,6 +104,7 @@ func buildGroups(list []Proc, q string, v View) []Row {
 		r.Private += p.Private
 		r.IO += p.IO
 		r.GPU = minF(100, r.GPU+p.GPU)
+		r.GPUUnavailable = r.GPUUnavailable || p.GPUUnavailable
 		r.Threads += p.Threads
 		r.Handles += p.Handles
 	}
@@ -180,6 +181,7 @@ func buildTree(list []Proc, q string, v View) []Row {
 			agg.Private += ca.Private
 			agg.IO += ca.IO
 			agg.GPU = minF(100, agg.GPU+ca.GPU)
+			agg.GPUUnavailable = agg.GPUUnavailable || ca.GPUUnavailable
 			agg.Threads += ca.Threads
 			agg.Handles += ca.Handles
 			desc += 1 + cn.row.Desc
@@ -192,6 +194,7 @@ func buildTree(list []Proc, q string, v View) []Row {
 		if collapsed {
 			row.CPU, row.Mem, row.Private, row.IO = agg.CPU, agg.Mem, agg.Private, agg.IO
 			row.GPU, row.Threads, row.Handles = agg.GPU, agg.Threads, agg.Handles
+			row.GPUUnavailable = agg.GPUUnavailable
 		}
 		n.row = row
 		return n, agg

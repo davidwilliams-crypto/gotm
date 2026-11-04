@@ -244,9 +244,19 @@ func (p *perfPage) seriesFor(it resItem) []series {
 		return []series{{vals: pick(func(h *metrics.HistPoint) float64 { return h.Mem }), color: col, fill: true}}
 	case resGPU:
 		if it.gpu >= 0 && p.app.snap != nil && it.gpu < len(p.app.snap.GPUs) {
-			return []series{{vals: p.gpuSeries(p.app.snap.GPUs[it.gpu].ID, func(g *metrics.GPUHist) float64 { return g.Pct }), color: col, fill: true}}
+			return []series{{vals: p.gpuSeries(p.app.snap.GPUs[it.gpu].ID, func(g *metrics.GPUHist) float64 {
+				if !g.HasUtilization && len(g.Eng) == 0 {
+					return math.NaN()
+				}
+				return g.Pct
+			}), color: col, fill: true}}
 		}
-		return []series{{vals: pick(func(h *metrics.HistPoint) float64 { return h.GPU }), color: col, fill: true}}
+		return []series{{vals: pick(func(h *metrics.HistPoint) float64 {
+			if !h.GPUOK {
+				return math.NaN()
+			}
+			return h.GPU
+		}), color: col, fill: true}}
 	case resDisk:
 		return []series{
 			{vals: pick(func(h *metrics.HistPoint) float64 { return h.DiskR }), color: T.Disk, fill: true},
@@ -286,6 +296,9 @@ func (p *perfPage) headline(it resItem, s *metrics.Snapshot) (value, sub string,
 	case resGPU:
 		if it.gpu >= 0 && it.gpu < len(s.GPUs) {
 			g := &s.GPUs[it.gpu]
+			if !g.UtilizationAvailable() {
+				return "n/a", shortGPUName(g.Name), 0
+			}
 			return fmt.Sprintf("%.0f%%", g.Pct), shortGPUName(g.Name), g.Pct
 		}
 		if !s.GPU.OK {
@@ -368,7 +381,7 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	}
 	cur := items[p.sel]
 	kind := cur.kind
-	metrics.SetGPUSensorsWanted(kind == resGPU && p.app.cur == pgPerformance)
+	metrics.SetGPUSensorsWanted(p.app.gpuSensorsWanted())
 	infoColor := resColor(kind)
 	title := resTitle(kind)
 	switch kind {
@@ -566,6 +579,9 @@ func hoverLabel(kind int, h *metrics.HistPoint) string {
 	case resMem:
 		return fmt.Sprintf("%.0f%% memory", h.Mem)
 	case resGPU:
+		if !h.GPUOK {
+			return "GPU n/a"
+		}
 		return fmt.Sprintf("%.0f%% GPU", h.GPU)
 	case resDisk:
 		return fmt.Sprintf("R %s · W %s", fmtRate(h.DiskR), fmtRate(h.DiskW))
@@ -638,8 +654,16 @@ func (p *perfPage) statsFor(it resItem, s *metrics.Snapshot) [][2]string {
 		add("Installed", fmtBytes(s.Mem.Total))
 		add("Processes", fmt.Sprint(s.Mem.Processes))
 	case resGPU:
-		add("Utilization", fmtPct(s.GPU.Percent))
-		add("Dedicated memory in use", fmtBytes(s.GPU.MemBytes))
+		if s.GPU.OK {
+			add("Utilization", fmtPct(s.GPU.Percent))
+		} else {
+			add("Utilization", "n/a")
+		}
+		if s.GPU.OK {
+			add("Dedicated memory in use", fmtBytes(s.GPU.MemBytes))
+		} else {
+			add("Dedicated memory in use", "n/a")
+		}
 	case resDisk:
 		add("Active time", fmtPct(s.Disk.Percent))
 		add("Read", fmtRate(s.Disk.ReadBps))

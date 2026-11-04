@@ -31,14 +31,15 @@ type RecProc struct {
 // RecSample is one moment of the flight recording: the headline numbers plus
 // the processes that were busiest, so a spike can be explained afterwards.
 type RecSample struct {
-	T       int64     `json:"t"`
-	CPU     float64   `json:"cpu"`
-	Mem     float64   `json:"mem"`
-	GPU     float64   `json:"gpu"`
-	DiskP   float64   `json:"diskP"`
-	DiskBps float64   `json:"diskBps"`
-	NetBps  float64   `json:"netBps"`
-	Top     []RecProc `json:"top"`
+	T              int64     `json:"t"`
+	CPU            float64   `json:"cpu"`
+	Mem            float64   `json:"mem"`
+	GPU            float64   `json:"gpu"`
+	GPUUnavailable bool      `json:"gpuUnavailable,omitempty"`
+	DiskP          float64   `json:"diskP"`
+	DiskBps        float64   `json:"diskBps"`
+	NetBps         float64   `json:"netBps"`
+	Top            []RecProc `json:"top"`
 }
 
 // Mark is a user bookmark on the timeline.
@@ -137,7 +138,8 @@ func (r *Recorder) Add(s *Snapshot) {
 	r.last = s.T
 
 	rs := RecSample{T: s.T, CPU: s.CPU, Mem: round1(s.Mem.Percent), GPU: s.GPU.Percent,
-		DiskP: s.Disk.Percent, DiskBps: s.Disk.ReadBps + s.Disk.WriteBps, NetBps: s.Net.RxBps + s.Net.TxBps}
+		GPUUnavailable: !s.GPU.OK,
+		DiskP:          s.Disk.Percent, DiskBps: s.Disk.ReadBps + s.Disk.WriteBps, NetBps: s.Net.RxBps + s.Net.TxBps}
 	rs.Top = topProcs(s.Procs)
 
 	r.ring = append(r.ring, rs)
@@ -426,7 +428,7 @@ func (r *Recorder) ExportCSV(path string, from, to int64) error {
 		_ = w.Write([]string{
 			time.UnixMilli(s.T).Format("2006-01-02 15:04:05"),
 			strconv.FormatFloat(s.CPU, 'f', 1, 64), strconv.FormatFloat(s.Mem, 'f', 1, 64),
-			strconv.FormatFloat(s.GPU, 'f', 1, 64), strconv.FormatFloat(s.DiskP, 'f', 1, 64),
+			recordedGPUCSV(s), strconv.FormatFloat(s.DiskP, 'f', 1, 64),
 			strconv.FormatFloat(s.DiskBps, 'f', 0, 64), strconv.FormatFloat(s.NetBps, 'f', 0, 64), csvCell(top),
 		})
 	}
@@ -435,6 +437,13 @@ func (r *Recorder) ExportCSV(path string, from, to int64) error {
 		return err
 	}
 	return f.Close()
+}
+
+func recordedGPUCSV(s RecSample) string {
+	if s.GPUUnavailable {
+		return ""
+	}
+	return strconv.FormatFloat(s.GPU, 'f', 1, 64)
 }
 
 // csvCell stops spreadsheet formula injection: Windows file names may begin

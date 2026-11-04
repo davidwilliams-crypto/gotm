@@ -173,7 +173,7 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 	if maxV == 0 {
 		for _, s := range ser {
 			for _, v := range s.vals {
-				if v > maxV {
+				if !math.IsInf(v, 0) && v > maxV {
 					maxV = v
 				}
 			}
@@ -229,6 +229,9 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 		step := float64(W) / float64(n-1)
 		timed := len(s.times) == n && st.timeTo > st.timeFrom
 		for i, v := range s.vals {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
 			y := float64(H) - math.Min(1, math.Max(0, v/maxV))*float64(H-ss)
 			x := float64(i) * step
 			if timed {
@@ -243,6 +246,9 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 			fillC := blend(s.color, st.bg, 0.22)
 			fp, _ := walk.NewCosmeticPen(walk.PenSolid, fillC)
 			for i := 1; i < n; i++ {
+				if !finiteValue(s.vals[i-1]) || !finiteValue(s.vals[i]) {
+					continue
+				}
 				a, b := pts[i-1], pts[i]
 				left, right := min(a.X, b.X), max(a.X, b.X)
 				for x := max(left, 0); x <= min(right, W-1); x++ {
@@ -258,7 +264,11 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 		br := solid(s.color)
 		gp, err := walk.NewGeometricPen(walk.PenSolid|walk.PenCapRound|walk.PenJoinRound, lw*ss, br)
 		if err == nil {
-			_ = cv.DrawPolylinePixels(gp, pts)
+			for _, span := range finiteSpans(s.vals) {
+				if span[1]-span[0] >= 2 {
+					_ = cv.DrawPolylinePixels(gp, pts[span[0]:span[1]])
+				}
+			}
 			gp.Dispose()
 		}
 		br.Dispose()
@@ -279,4 +289,23 @@ func timePosition(t, from, to int64) float64 {
 		return 0
 	}
 	return float64(t-from) / float64(to-from)
+}
+
+func finiteValue(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// finiteSpans preserves missing samples as gaps rather than joining across them.
+func finiteSpans(values []float64) [][2]int {
+	var spans [][2]int
+	for i := 0; i < len(values); {
+		if !finiteValue(values[i]) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(values) && finiteValue(values[i]) {
+			i++
+		}
+		spans = append(spans, [2]int{start, i})
+	}
+	return spans
 }

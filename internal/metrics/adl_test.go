@@ -26,9 +26,11 @@ func TestADLStructLayout(t *testing.T) {
 	}
 }
 
-func TestADLPickAdaptersOnePerBus(t *testing.T) {
+func TestADLPickAdaptersOnePerUDID(t *testing.T) {
 	mk := func(idx, bus, vendor, present int32, name string) adlAdapterInfo {
 		a := adlAdapterInfo{Index: idx, Bus: bus, VendorID: vendor, Present: present}
+		// These records represent outputs on the same physical card per bus.
+		a.UDID[0] = byte('A' + bus)
 		copy(a.Name[:], name)
 		return a
 	}

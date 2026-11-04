@@ -53,11 +53,12 @@ type perfCounters struct {
 }
 
 func newPerfCounters() *perfCounters {
+	pc := &perfCounters{gpuRead: newGPUReader()}
 	q, err := openPdh()
 	if err != nil {
-		return nil
+		return pc
 	}
-	pc := &perfCounters{q: q}
+	pc.q = q
 	pc.diskR, _ = q.add(`\PhysicalDisk(_Total)\Disk Read Bytes/sec`)
 	pc.diskW, _ = q.add(`\PhysicalDisk(_Total)\Disk Write Bytes/sec`)
 	pc.netRx, _ = q.add(`\Network Interface(*)\Bytes Received/sec`)
@@ -70,7 +71,6 @@ func newPerfCounters() *perfCounters {
 	// what Task Manager shows per process.
 	pc.gpuPDed, _ = q.add(`\GPU Process Memory(*)\Local Usage`)
 	pc.gpuPShr, _ = q.add(`\GPU Process Memory(*)\Shared Usage`)
-	pc.gpuRead = newGPUReader()
 	pc.cpuFreq, _ = q.add(`\Processor Information(*)\Processor Frequency`)
 	// Processor Frequency is the nominal clock (4.2 GHz here, never the boost);
 	// % Processor Performance is relative to it and goes above 100 while boosting.
@@ -96,7 +96,14 @@ func (pc *perfCounters) close() {
 
 func (pc *perfCounters) read() perfSample {
 	var out perfSample
-	if pc == nil || !pc.q.collect() {
+	if pc == nil {
+		return out
+	}
+	if pc.q == nil || !pc.q.collect() {
+		// Inventory and installed-driver sensors do not depend on PDH being
+		// enabled or its counters succeeding on this machine.
+		out.GPUs = pc.gpuRead.build(nil, nil, nil, nil, nil)
+		out.GPU = summarizeGPUs(out.GPUs)
 		return out
 	}
 	if v, ok := pc.diskR.value(); ok {
@@ -121,20 +128,26 @@ func (pc *perfCounters) read() perfSample {
 	//   pid_<pid>_luid_<hi>_<lo>_phys_<n>_eng_<n>_engtype_<type>
 	// A process's utilisation is the busiest engine type (summed within a type);
 	// the system figure is the busiest single engine across all processes.
-	byPID := map[uint32]map[string]float64{}
-	byEngine := map[string]float64{}
 	engVals := pc.gpu.values()
+	dedVals := pc.gpuMem.values()
+	out.GPUs = pc.gpuRead.build(engVals, dedVals, pc.gpuShared.values(), pc.gpuPDed.values(), pc.gpuPShr.values())
+	out.GPU = summarizeGPUs(out.GPUs)
+	visible := make(map[string]bool, len(out.GPUs))
+	for _, g := range out.GPUs {
+		visible[g.ID] = true
+	}
+	byPID := map[uint32]map[string]float64{}
 	for _, it := range engVals {
-		out.GPU.OK = true
-		pid, eng, typ, ok := parseGPUInstance(it.Instance)
-		if !ok {
+		// Use the same display-adapter set for the process table, cards and
+		// recorder; unrelated PDH devices must not inflate just one view.
+		pid, _, typ, ok := parseGPUInstance(it.Instance)
+		if !ok || !visible[luidKey(it.Instance)] || !validGPUCounter(it.Value) {
 			continue
 		}
 		if byPID[pid] == nil {
 			byPID[pid] = map[string]float64{}
 		}
 		byPID[pid][typ] += it.Value
-		byEngine[eng] += it.Value
 	}
 	out.GPUByPID = make(map[uint32]float64, len(byPID))
 	for pid, types := range byPID {
@@ -146,21 +159,6 @@ func (pc *perfCounters) read() perfSample {
 		}
 		out.GPUByPID[pid] = math.Min(best, 100)
 	}
-	var sys float64
-	for _, v := range byEngine {
-		if v > sys {
-			sys = v
-		}
-	}
-	out.GPU.Percent = round1(math.Min(sys, 100))
-	dedVals := pc.gpuMem.values()
-	for _, it := range dedVals {
-		out.GPU.OK = true
-		if it.Value > 0 { // a negative PDH float must not become a huge uint64
-			out.GPU.MemBytes += uint64(it.Value)
-		}
-	}
-	out.GPUs = pc.gpuRead.build(engVals, dedVals, pc.gpuShared.values(), pc.gpuPDed.values(), pc.gpuPShr.values())
 
 	// per-logical-processor clock: instances are "<group>,<index>" plus totals
 	type fq struct {
@@ -229,6 +227,20 @@ func (pc *perfCounters) read() perfSample {
 	for i := range out.PerDisk {
 		out.PerDisk[i].ReadBps = math.Round(rd[out.PerDisk[i].Name])
 		out.PerDisk[i].WriteBps = math.Round(wr[out.PerDisk[i].Name])
+	}
+	return out
+}
+
+// summarizeGPUs derives the headline and recorder values from the same
+// adapters shown by Performance, after software/unknown-device filtering.
+func summarizeGPUs(adapters []GPUAdapter) GPUInfo {
+	out := GPUInfo{}
+	for _, g := range adapters {
+		if g.UtilizationAvailable() {
+			out.OK = true
+			out.Percent = math.Max(out.Percent, g.Pct)
+		}
+		out.MemBytes += g.DedicatedUsed
 	}
 	return out
 }

@@ -153,7 +153,7 @@ Verified by sampling the window ~75 times a second for 8 s per page: the visible
 | Per-core CPU | `NtQuerySystemInformation(SystemProcessorPerformanceInformation)` |
 | Memory, commit, pools, handles | `GetPerformanceInfo` |
 | Disk, network, GPU engines and memory (per adapter and per process), per-core clock, thermal zones, power meters | PDH counters (disk active time = 100 − `% Idle Time`) |
-| GPU names, memory sizes, LUIDs, PCI location | DXGI (`CreateDXGIFactory1`, vtable calls), D3DKMT adapter address; driver version/date from the registry |
+| GPU names, memory sizes, LUIDs, PCI location | DXGI, D3DKMT and present SetupAPI devices joined by exact LUID or unambiguous PCI location; device-specific driver version/date |
 | NVIDIA GPU clock, power, temperature, fan | NVML (`nvml.dll`, shipped with the driver) |
 | AMD GPU / APU clocks, temperatures, power, voltage, fan (and the CPU side of an APU where the driver reports it) | AMD Display Library (`atiadlxx.dll`, shipped with the driver): `ADL2_New_QueryPMLogData_Get`, falling back to Overdrive 5; adapters matched by PCI bus |
 | CPU topology, caches, ratings | `GetLogicalProcessorInformationEx`, `CallNtPowerInformation` |
@@ -176,16 +176,15 @@ Verified by sampling the window ~75 times a second for 8 s per page: the visible
 ## Known limits
 
 - **Ryzen power** (package and per core) comes from Windows' own Energy Meter counters and needs no driver.
-- **Ryzen die temperature (Tctl/Tdie), per-core temperature, PPT/TDC/EDC, rail power, effective clocks** are not exposed by Windows; they need a kernel driver. gotm never ships or installs one. Two optional sources, both off until you turn them on:
-  - **AMD Ryzen Master Monitoring SDK** (Settings ▸ AMD Ryzen sensors). Install AMD's SDK first (it brings its signed driver); gotm then loads `Platform.dll` from the path the SDK registers in HKLM, requires a valid Authenticode signature *by AMD*, and only reads. The switch is machine-wide (HKLM\SOFTWARE\gotm), so it is changed while gotm runs as administrator; a marker there turns it off after a crash during start-up.
-  - **LibreHardwareMonitor** with its web server on `127.0.0.1:8085` (loopback only).
-  If neither is available the tree says so instead of inventing a number.
-- AMD GPU sensors come from the driver's ADL library, which reports what the hardware exposes: an APU shows its graphics temperature, core and memory clocks, voltage and the package power shared with the CPU (labelled as such), not a separate graphics-only power figure. Intel graphics expose no clocks or temperature through a public Windows API, and gotm says so instead of guessing.
+- GOTM is self-contained by default: it does not start a monitoring companion, install a kernel driver, or poll a companion web server. CPU die temperatures, motherboard fans and voltages require an available Windows or installed-driver source. Missing readings are labelled unavailable.
+- The existing opt-in AMD Ryzen Master Monitoring SDK integration remains in Settings for users who already have the SDK installed. It is not required for native GPU or disk discovery.
+- GPU sensors combine installed NVIDIA NVML / AMD ADL libraries with optional native WDDM queries for missing temperatures, fan RPM and clocks across vendors. Unsupported fields stay unavailable. Native power percentages are never presented as watts, and APU package power is labelled as shared CPU/GPU power.
+- GPU inventory combines DXGI, graphics-kernel and present SetupAPI devices. It includes legacy, virtual and remote display adapters and excludes software rasterizers and compute-only devices. Detection does not imply telemetry support: missing utilization displays as `n/a`, leaves a graph gap and exports as an empty CSV field; measured zero stays zero.
 - Per-process GPU memory is "resident in video memory" (the `Local Usage` counter). The per-process `Dedicated Usage` counter reports virtual allocations (dwm.exe read 46 GB on a 15 GB card) and is not used.
-- NVMe S.M.A.R.T. is read natively; SATA drives show model and temperature where the drive reports it.
+- Physical-drive discovery supports sparse and high device numbers. NVMe S.M.A.R.T. and standard storage temperatures are read natively where exposed. RAID controllers may hide member-drive health and temperatures.
 - ACPI thermal zones are shown as board temperatures, except zones that report a constant placeholder (many desktop boards fill an unused zone with 290 K, shown by Windows as 16.9 °C): those are labelled as placeholders, not temperatures.
 - Affinity covers processor group 0 only (≤ 64 logical CPUs); CPU usage itself reads every processor group.
-- GPU figures need WDDM counters (Windows 10 1709+).
+- GPU utilization needs WDDM counters; native sensor fallback uses optional WDDM performance queries. Availability depends on the installed driver. API layouts follow [Microsoft's Windows SDK headers](https://github.com/microsoft/win32metadata/tree/main/generation/WinSDK/RecompiledIdlHeaders/shared).
 - Scheduled-task startup entries come from `schtasks /query /xml` (independent of the display language).
 - Screen readers hear the drawn surfaces through gotm's own UI Automation provider; the graphs themselves are summarised by their captions and values rather than read point by point.
 - Dark theme (or the system's high-contrast colours). Context menus and table headers are dark (via the same uxtheme dark-mode switches Explorer uses, looked up defensively); native dialogs such as file pickers and message boxes stay light.

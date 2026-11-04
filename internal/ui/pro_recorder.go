@@ -4,6 +4,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"time"
@@ -347,7 +348,12 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	}
 	ser := []series{
 		{vals: mk(func(s metrics.RecSample) float64 { return s.Mem }), times: times, color: T.Mem},
-		{vals: mk(func(s metrics.RecSample) float64 { return s.GPU }), times: times, color: T.GPU},
+		{vals: mk(func(s metrics.RecSample) float64 {
+			if s.GPUUnavailable {
+				return math.NaN()
+			}
+			return s.GPU
+		}), times: times, color: T.GPU},
 		{vals: mk(func(s metrics.RecSample) float64 { return s.CPU }), times: times, color: T.CPU, fill: true},
 	}
 	plotSeries(cv, pr, ser, graphStyle{bg: T.Card, max: 100, timeFrom: from, timeTo: to, grid: true, lineW: 2})
@@ -400,7 +406,7 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		plotName = "Timeline, at " + time.UnixMilli(selT).Format("15:04:05")
 	}
 	if cur, ok := rec.Nearest(selT); ok {
-		plotName += fmt.Sprintf(": CPU %.0f%%, memory %.0f%%, GPU %.0f%%", cur.CPU, cur.Mem, cur.GPU)
+		plotName += fmt.Sprintf(": CPU %.0f%%, memory %.0f%%, GPU %s", cur.CPU, cur.Mem, recordedGPUText(cur))
 	}
 	p.view.addItem(rect{pr.X, pr.Y - 14, pr.W, pr.H + 28}, "plot", plotName, ctlSlider, false)
 
@@ -455,7 +461,14 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	}
 	stat("CPU", s.CPU, T.CPU, "%")
 	stat("Memory", s.Mem, T.Mem, "%")
-	stat("GPU", s.GPU, T.GPU, "%")
+	if s.GPUUnavailable {
+		drawText(cv, "GPU", uiFont(10), T.Muted, rect{left.X + 16, y, 120, 22}, taLeft)
+		drawText(cv, "n/a", uiBold(10), T.Text, rect{left.X + left.W - 70, y, 54, 22}, taRight)
+		p.view.addText(rect{left.X + 16, y, left.W - 32, 22}, "GPU unavailable")
+		y += step
+	} else {
+		stat("GPU", s.GPU, T.GPU, "%")
+	}
 	stat("Disk busy", s.DiskP, T.Disk, "%")
 	drawText(cv, "Disk "+fmtRate(s.DiskBps)+"   Network "+fmtRate(s.NetBps), uiFont(9), T.Muted,
 		rect{left.X + 16, y + 2, left.W - 32, 20}, taLeft)
@@ -512,7 +525,7 @@ func (p *recorderPage) paintCompactDetail(cv *walk.Canvas, selT int64, w, y, h i
 	if p.live {
 		when = "Live " + when
 	}
-	line := fmt.Sprintf("%s · CPU %.0f%% · Memory %.0f%% · GPU %.0f%% · Disk %.0f%%", when, s.CPU, s.Mem, s.GPU, s.DiskP)
+	line := fmt.Sprintf("%s · CPU %.0f%% · Memory %.0f%% · GPU %s · Disk %.0f%%", when, s.CPU, s.Mem, recordedGPUText(s), s.DiskP)
 	if len(s.Top) > 0 {
 		var names []string
 		for i, pr := range s.Top {
@@ -531,4 +544,11 @@ func (p *recorderPage) paintCompactDetail(cv *walk.Canvas, selT int64, w, y, h i
 		drawText(cv, "Go live", uiFont(9), T.Text, r, taCenter)
 		p.view.addItem(r, "live", "Go live", ctlButton, false)
 	}
+}
+
+func recordedGPUText(s metrics.RecSample) string {
+	if s.GPUUnavailable {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.0f%%", s.GPU)
 }

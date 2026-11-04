@@ -329,7 +329,7 @@ func (a *App) navigate(i int) {
 	a.mw.RequestImmediateLayout()
 	a.side.invalidate()
 	a.invalidateChrome()
-	metrics.SetGPUSensorsWanted(false) // the Performance page turns it back on for a GPU view
+	metrics.SetGPUSensorsWanted(a.gpuSensorsWanted())
 	a.sensors.SetDetailWanted(i == pgPower)
 	a.pages[i].impl.shown()
 	if a.snap != nil {
@@ -654,4 +654,21 @@ func setBackground(w walk.Window, c walk.Color) {
 	if b, ok := old.(*walk.SolidColorBrush); ok && b != nil {
 		b.Dispose()
 	}
+}
+
+// gpuSensorsWanted derives demand from the visible page so a hidden Performance
+// repaint cannot turn off the sensors used by Power & Freq.
+func (a *App) gpuSensorsWanted() bool {
+	if a.cur == pgPower {
+		return true
+	}
+	if a.cur != pgPerformance || len(a.pages) <= pgPerformance || a.pages[pgPerformance] == nil {
+		return false
+	}
+	p, ok := a.pages[pgPerformance].impl.(*perfPage)
+	if !ok {
+		return false
+	}
+	items := p.items(a.snap)
+	return items[clampI(p.sel, 0, len(items)-1)].kind == resGPU
 }

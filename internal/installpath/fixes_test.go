@@ -22,6 +22,14 @@ func TestNormalizeRejectsShortNameAliases(t *testing.T) {
 	if _, err := NormalizeInstall(`C:\PROGRA~1\gotm`); err == nil || !strings.Contains(err.Error(), "8.3") {
 		t.Fatalf("an 8.3-spelled destination was accepted: err = %v", err)
 	}
+	// A fresh installation has no leaf yet; ancestor aliases still matter.
+	missing := filepath.Join(`C:\PROGRA~1`, "gotm-nonexistent-path-test", "nested")
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("expected absent fixture path, got %v", err)
+	}
+	if _, err := NormalizeInstall(missing); err == nil || !strings.Contains(err.Error(), "8.3") {
+		t.Fatalf("alias in ancestor of missing destination accepted: %v", err)
+	}
 	if _, err := Normalize(`C:\PROGRA~1\gotm`); err != nil {
 		// resolving existing installs must keep accepting aliased spellings
 		t.Fatalf("Normalize rejected a path that resolution stages must accept: %v", err)
@@ -29,13 +37,20 @@ func TestNormalizeRejectsShortNameAliases(t *testing.T) {
 }
 
 func TestNormalizeAcceptsLiteralTildeNames(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "tools~2")
+	root, ok := longPathOf(t.TempDir())
+	if !ok {
+		t.Fatal("cannot resolve fixture root")
+	}
+	dir := filepath.Join(root, "tools~2")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// "tools~2" is the directory's real long name (created by us): a tilde
 	// alone must not be mistaken for an 8.3 alias.
-	if _, err := Normalize(dir); err != nil {
+	if _, err := NormalizeInstall(dir); err != nil {
 		t.Fatalf("a literal tilde name was rejected: %v", err)
+	}
+	if _, err := NormalizeInstall(filepath.Join(dir, "missing", "child")); err != nil {
+		t.Fatalf("a new destination below a literal tilde name was rejected: %v", err)
 	}
 }

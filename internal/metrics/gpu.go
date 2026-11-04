@@ -43,9 +43,11 @@ type GPUAdapter struct {
 	DedicatedUsed  uint64
 	SharedUsed     uint64
 
-	Pct     float64 // busiest engine
-	Engines []GPUEngine
-	Procs   []GPUProcMem // by dedicated+shared, descending
+	Pct                               float64 // busiest engine
+	HasUtilization                    bool
+	HasDedicatedUsage, HasSharedUsage bool
+	Engines                           []GPUEngine
+	Procs                             []GPUProcMem // by dedicated+shared, descending
 
 	Driver     string
 	DriverDate string
@@ -53,6 +55,7 @@ type GPUAdapter struct {
 
 	// vendor sensors (NVML for NVIDIA, ADL for AMD); Has* says whether the value is real
 	HasTemp, HasPower, HasClock, HasFan bool
+	HasMemClock                         bool
 	TempC, PowerW, PowerLimitW          float64
 	ClockMHz, MemClockMHz               float64
 	FanPct, FanRPM                      float64
@@ -95,8 +98,24 @@ func vendorName(id uint32) string {
 		return "Intel"
 	case 0x1414:
 		return "Microsoft"
+	case 0x102b:
+		return "Matrox"
+	case 0x1a03:
+		return "ASPEED"
+	case 0x15ad:
+		return "VMware"
 	}
 	return ""
+}
+
+// UtilizationAvailable distinguishes measured idle from a detected adapter
+// whose installed driver supplies no utilization counters.
+func (g GPUAdapter) UtilizationAvailable() bool {
+	return g.HasUtilization || len(g.Engines) > 0
+}
+
+func validGPUCounter(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0
 }
 
 // ---- DXGI enumeration (vtable calls, no cgo) -----------------------------------
@@ -124,7 +143,7 @@ type dxgiDesc1 struct {
 	Flags           uint32
 }
 
-func enumerateGPUs() []gpuStatic {
+func enumerateDXGIGPUs() []gpuStatic {
 	if procCreateDXGIFact1.Find() != nil {
 		return nil
 	}
@@ -275,6 +294,68 @@ type nvmlDev struct {
 	bus    int
 }
 
+type vendorGPUIdentity struct {
+	bus  int
+	name string
+}
+
+func vendorGPUIdentities(static []gpuStatic, vendor uint32) []vendorGPUIdentity {
+	var out []vendorGPUIdentity
+	for _, st := range static {
+		if st.vendorID == vendor && !st.software {
+			out = append(out, vendorGPUIdentity{st.bus, st.name})
+		}
+	}
+	return out
+}
+
+// matchVendorGPU requires uniqueness on both sides. Bus numbers alone are not
+// globally unique across PCI domains, and enumeration order is never identity.
+// With no unambiguous match, native Windows queries still use the exact LUID.
+func matchVendorGPU(bus int, name string, local, remote []vendorGPUIdentity) int {
+	if bus >= 0 {
+		lc, rc, found := 0, 0, -1
+		for _, d := range local {
+			if d.bus == bus {
+				lc++
+			}
+		}
+		for i, d := range remote {
+			if d.bus == bus {
+				rc++
+				found = i
+			}
+		}
+		if lc == 1 && rc == 1 {
+			return found
+		}
+	}
+	name = shortName(name)
+	if name == "" {
+		return -1
+	}
+	lc, rc, found := 0, 0, -1
+	for _, d := range local {
+		if strings.EqualFold(shortName(d.name), name) {
+			lc++
+		}
+	}
+	for i, d := range remote {
+		if strings.EqualFold(shortName(d.name), name) {
+			rc++
+			found = i
+		}
+	}
+	if lc == 1 && rc == 1 {
+		// A friendly-name match cannot override contradictory PCI evidence.
+		if bus >= 0 && remote[found].bus >= 0 && bus != remote[found].bus {
+			return -1
+		}
+		return found
+	}
+	return -1
+}
+
 func openNVML() *nvmlLib {
 	l := &nvmlLib{dll: windows.NewLazySystemDLL("nvml.dll")}
 	if l.dll.Load() != nil {
@@ -347,7 +428,7 @@ func (l *nvmlLib) fill(d nvmlDev, a *GPUAdapter) {
 		a.ClockMHz, a.HasClock = float64(u), true
 	}
 	if r, _, _ := l.getClock.Call(d.handle, 2, uintptr(unsafe.Pointer(&u))); r == 0 { // memory
-		a.MemClockMHz = float64(u)
+		a.MemClockMHz, a.HasMemClock = float64(u), true
 	}
 	if r, _, _ := l.getFan.Call(d.handle, uintptr(unsafe.Pointer(&u))); r == 0 {
 		a.FanPct, a.HasFan = float64(u), true
@@ -494,10 +575,10 @@ func buildGPUs(static []gpuStatic, eng, ded, shr, pded, pshr []PDHInstanceValue)
 	procPct := map[string]map[uint32]map[string]float64{} // luid -> pid -> type -> pct
 	for _, it := range eng {
 		g, ok := parseGPUInst(it.Instance)
-		if !ok {
+		if !ok || g.typ == "" || !validGPUCounter(it.Value) {
 			continue
 		}
-		get(g.luid)
+		get(g.luid).HasUtilization = true
 		sums[ek{g.luid, g.eng, g.typ}] += it.Value
 		if g.pid != 0 {
 			if procPct[g.luid] == nil {
@@ -549,13 +630,15 @@ func buildGPUs(static []gpuStatic, eng, ded, shr, pded, pshr []PDHInstanceValue)
 	}
 
 	for _, it := range ded {
-		if id := luidKey(it.Instance); id != "" && it.Value > 0 {
+		if id := luidKey(it.Instance); id != "" && validGPUCounter(it.Value) && it.Value < 1<<60 {
 			get(id).DedicatedUsed = uint64(it.Value)
+			get(id).HasDedicatedUsage = true
 		}
 	}
 	for _, it := range shr {
-		if id := luidKey(it.Instance); id != "" && it.Value > 0 {
+		if id := luidKey(it.Instance); id != "" && validGPUCounter(it.Value) && it.Value < 1<<60 {
 			get(id).SharedUsed = uint64(it.Value)
+			get(id).HasSharedUsage = true
 		}
 	}
 
@@ -576,7 +659,7 @@ func buildGPUs(static []gpuStatic, eng, ded, shr, pded, pshr []PDHInstanceValue)
 				p = &pm{}
 				mem[g.luid][g.pid] = p
 			}
-			if it.Value > 0 { // a negative PDH float must not become a huge uint64
+			if validGPUCounter(it.Value) && it.Value > 0 && it.Value < 1<<60 {
 				if dedicated {
 					p.ded += uint64(it.Value)
 				} else {
@@ -643,13 +726,14 @@ func buildGPUs(static []gpuStatic, eng, ded, shr, pded, pshr []PDHInstanceValue)
 
 // gpuReader owns the slow-changing parts of the GPU picture.
 type gpuReader struct {
-	static []gpuStatic
-	nv     *nvmlLib
-	nvDevs []nvmlDev
-	adl    *adlLib
-	seen   map[string]bool
-	last   map[string]GPUAdapter // last vendor sensor values per adapter ID
-	lastAt map[string]time.Time  // when each cached reading was taken
+	static        []gpuStatic
+	nv            *nvmlLib
+	nvDevs        []nvmlDev
+	adl           *adlLib
+	seen          map[string]bool
+	last          map[string]GPUAdapter // last vendor sensor values per adapter ID
+	lastAt        map[string]time.Time  // when each cached reading was taken
+	lastDiscovery time.Time
 }
 
 // sensorStaleAfter bounds how long an unpolled vendor reading (a sleeping
@@ -681,6 +765,7 @@ func (r *gpuReader) close() {
 func newGPUReader() *gpuReader {
 	r := &gpuReader{seen: map[string]bool{}, last: map[string]GPUAdapter{}, lastAt: map[string]time.Time{}}
 	r.static = enumerateGPUs()
+	r.lastDiscovery = time.Now()
 	for _, s := range r.static {
 		r.seen[s.id] = true
 	}
@@ -695,8 +780,18 @@ func (r *gpuReader) build(eng, ded, shr, pded, pshr []PDHInstanceValue) []GPUAda
 	if r == nil {
 		return nil
 	}
+	// A disappearing adapter need not leave a PDH instance behind. Periodic
+	// discovery handles unplug/disable/driver resets as well as new devices.
+	if time.Since(r.lastDiscovery) >= 30*time.Second {
+		r.static = enumerateGPUs()
+		r.lastDiscovery = time.Now()
+		r.seen = map[string]bool{}
+		for _, st := range r.static {
+			r.seen[st.id] = true
+		}
+	}
 	// a LUID we have no DXGI record for: rescan once (hot-plug, driver reset)
-	for _, it := range ded {
+	for _, it := range append(append([]PDHInstanceValue(nil), ded...), eng...) {
 		if id := luidKey(it.Instance); id != "" && !r.seen[id] {
 			r.static = enumerateGPUs()
 			for _, s := range r.static {
@@ -721,50 +816,45 @@ func (r *gpuReader) build(eng, ded, shr, pded, pshr []PDHInstanceValue) []GPUAda
 			// An APU's graphics is the CPU's own silicon: reading it wakes
 			// nothing, and its table may carry the CPU temperature the CPU
 			// card shows all the time. A discrete card waits for a GPU view.
-			ad, found := r.adl.find(busOf[list[i].ID], list[i].Name)
+			ad, found := r.adl.find(busOf[list[i].ID], list[i].Name, r.static...)
 			if !found {
 				continue
 			}
 			list[i].Integrated = r.adl.isAPU(ad)
 			if !wanted && !list[i].Integrated {
-				r.cachedSensors(&list[i])
 				continue
 			}
-			if r.adl.fill(ad, &list[i]) {
-				r.last[list[i].ID] = list[i]
-				r.lastAt[list[i].ID] = time.Now()
-			}
+			r.adl.fill(ad, &list[i])
+			// ADL only assigns positive, validated memory clocks. Availability
+			// is independent of whether its graphics-clock query succeeded.
+			list[i].HasMemClock = list[i].MemClockMHz > 0
 		}
 	}
-	for n, i := range nvIdx {
+	nvLocal := vendorGPUIdentities(r.static, 0x10de)
+	var nvRemote []vendorGPUIdentity
+	for _, d := range r.nvDevs {
+		nvRemote = append(nvRemote, vendorGPUIdentity{d.bus, d.name})
+	}
+	for _, i := range nvIdx {
 		if !wanted {
-			r.cachedSensors(&list[i]) // last values; nothing woken up
 			continue
 		}
-		var dev *nvmlDev
-		if bus, ok := busOf[list[i].ID]; ok && bus >= 0 {
-			for d := range r.nvDevs {
-				if r.nvDevs[d].bus == bus {
-					dev = &r.nvDevs[d]
-					break
-				}
-			}
+		if d := matchVendorGPU(busOf[list[i].ID], list[i].Name, nvLocal, nvRemote); d >= 0 && r.nv != nil {
+			r.nv.fill(r.nvDevs[d], &list[i])
 		}
-		if dev == nil {
-			for d := range r.nvDevs {
-				if strings.EqualFold(r.nvDevs[d].name, list[i].Name) {
-					dev = &r.nvDevs[d]
-					break
-				}
-			}
+	}
+	for i := range list {
+		g := &list[i]
+		if wanted {
+			fillNativeGPUSensors(g)
 		}
-		if dev == nil && len(nvIdx) == len(r.nvDevs) {
-			dev = &r.nvDevs[n]
-		}
-		if dev != nil && r.nv != nil {
-			r.nv.fill(*dev, &list[i])
-			r.last[list[i].ID] = list[i]
-			r.lastAt[list[i].ID] = time.Now()
+		if wanted || g.Integrated {
+			// Cache the completed sample once, including native fallback values.
+			// A failed fresh read stays unavailable rather than replaying it as live.
+			r.last[g.ID], r.lastAt[g.ID] = *g, time.Now()
+		} else {
+			// This also covers AMD/NVIDIA adapters without their vendor library.
+			r.cachedSensors(g)
 		}
 	}
 	return list
@@ -825,6 +915,7 @@ var gpuSensorsWanted atomic.Bool
 func SetGPUSensorsWanted(on bool) { gpuSensorsWanted.Store(on) }
 
 func copySensors(dst *GPUAdapter, src GPUAdapter) {
+	dst.HasMemClock = src.HasMemClock
 	dst.HasTemp, dst.HasPower, dst.HasClock, dst.HasFan = src.HasTemp, src.HasPower, src.HasClock, src.HasFan
 	dst.TempC, dst.PowerW, dst.PowerLimitW = src.TempC, src.PowerW, src.PowerLimitW
 	dst.ClockMHz, dst.MemClockMHz, dst.FanPct, dst.FanRPM = src.ClockMHz, src.MemClockMHz, src.FanPct, src.FanRPM

@@ -59,8 +59,12 @@ func NormalizeInstall(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if long, ok := longPathOf(path); ok && !strings.EqualFold(long, path) {
-		return "", fmt.Errorf("ambiguous installation folder (use the full path, not its 8.3 short spelling): %q", path)
+	// The leaf may not exist on a fresh install. Inspect each existing ancestor
+	// as well, so a missing suffix cannot conceal a short-name alias.
+	for ancestor := path; len(ancestor) > 3; ancestor = filepath.Dir(ancestor) {
+		if long, ok := longPathOf(ancestor); ok && !strings.EqualFold(long, ancestor) {
+			return "", fmt.Errorf("ambiguous installation folder (use the full path, not its 8.3 short spelling): %q", path)
+		}
 	}
 	return path, nil
 }

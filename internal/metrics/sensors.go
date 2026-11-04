@@ -50,9 +50,7 @@ type SensorHub struct {
 
 // NewSensorHub starts empty; the first Update triggers the slow readers.
 func NewSensorHub() *SensorHub {
-	ext := NewExternalSource(DefaultExternalURL)
-	ext.Start()
-	return NewSensorHubWith(ext)
+	return NewSensorHubWith(nil)
 }
 
 // NewSensorHubWith is NewSensorHub with an explicit external source (or nil).
@@ -63,7 +61,7 @@ func NewSensorHubWith(ext *ExternalSource) *SensorHub {
 	return h
 }
 
-// External exposes the optional external sensor source (never nil after NewSensorHub).
+// External exposes the optional external sensor source (nil in the self-contained default configuration).
 func (h *SensorHub) External() *ExternalSource { return h.ext }
 
 // SetRyzen attaches (or detaches, with nil) the AMD Monitoring SDK reader.
@@ -267,9 +265,9 @@ func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 			val("cpu.temp.rz.htc", "Thermal limit (cHTC)", "temp", 3, rz.CHTCLimit, fTemp)
 		}
 	} else if t, label, ok := h.cpuTempLocked(); ok {
-		val("cpu.temp.ext", label+" (external)", "temp", 3, t, fTemp)
+		val("cpu.temp.ext", label, "temp", 3, t, fTemp)
 	} else {
-		msg := "CPU die temperature needs the AMD Monitoring SDK (Settings) or an external sensor program"
+		msg := "CPU die temperature is unavailable from Windows and installed drivers"
 		switch rzState {
 		case RyzenStarting:
 			msg = "AMD Monitoring SDK is starting…"
@@ -441,10 +439,12 @@ func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 				val(id+".temp.soc", "SoC", "temp", 3, g.SocTempC, fTemp)
 			}
 		}
-		if g.HasClock {
+		if g.HasClock || g.HasMemClock {
 			group(id+".clk", "Clocks", "clock", 2)
-			val(id+".clk.core", "GPU core", "clock", 3, g.ClockMHz, fClock)
-			if g.MemClockMHz > 0 {
+			if g.HasClock {
+				val(id+".clk.core", "GPU core", "clock", 3, g.ClockMHz, fClock)
+			}
+			if g.HasMemClock || (g.HasClock && g.MemClockMHz > 0) {
 				val(id+".clk.mem", "GPU memory", "clock", 3, g.MemClockMHz, fClock)
 			}
 		}
@@ -469,7 +469,11 @@ func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 			}
 		}
 		group(id+".load", "Utilization", "load", 2)
-		val(id+".load.0", "Busiest engine", "gpu", 3, g.Pct, fPct)
+		if g.UtilizationAvailable() {
+			val(id+".load.0", "Busiest engine", "gpu", 3, g.Pct, fPct)
+		} else {
+			text(id+".load.0", "Utilization unavailable from this driver", "note", 3, "—")
+		}
 		if g.HasDriverPct {
 			val(id+".load.drv", "GPU busy (driver)", "gpu", 3, g.DriverPct, fPct)
 		}
@@ -477,9 +481,17 @@ func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 			val(fmt.Sprintf("%s.load.e%d", id, k), e.Name, "gpu", 3, e.Pct, fPct)
 		}
 		group(id+".mem", "Memory", "mem", 2)
-		val(id+".mem.ded", "Dedicated in use", "mem", 3, float64(g.DedicatedUsed), fData)
-		val(id+".mem.shr", "Shared in use", "mem", 3, float64(g.SharedUsed), fData)
-		if !g.HasTemp && !g.HasClock {
+		if g.HasDedicatedUsage {
+			val(id+".mem.ded", "Dedicated in use", "mem", 3, float64(g.DedicatedUsed), fData)
+		} else {
+			text(id+".mem.ded", "Dedicated usage unavailable", "note", 3, "—")
+		}
+		if g.HasSharedUsage {
+			val(id+".mem.shr", "Shared in use", "mem", 3, float64(g.SharedUsed), fData)
+		} else {
+			text(id+".mem.shr", "Shared usage unavailable", "note", 3, "—")
+		}
+		if !g.HasTemp && !g.HasClock && !g.HasMemClock {
 			text(id+".none", gpuSensorNote(g), "note", 2, "—")
 		}
 	}
@@ -503,6 +515,13 @@ func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 		if d.HasTemp {
 			group(id+".temp", "Temperatures", "temp", 2)
 			val(id+".temp.0", "Composite", "temp", 3, d.TempC, fTemp)
+		}
+		if !d.HasTemp {
+			note := "Temperature unavailable from this storage driver or controller"
+			if d.Bus == "RAID" {
+				note = "RAID controller does not expose member-drive temperatures"
+			}
+			text(id+".temp.none", note, "note", 2, "—")
 		}
 		if st, ok := byIndex[d.Index]; ok {
 			group(id+".load", "Utilization", "load", 2)
@@ -534,7 +553,7 @@ func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 			val(id+".smart.unsafe", "Unsafe Shutdowns", "data", 3, d.Unsafe, fCount)
 			val(id+".smart.err", "Media Errors", "data", 3, d.MediaErrors, fCount)
 		} else {
-			text(id+".smart.none", "S.M.A.R.T. not exposed for this bus (run as administrator or use the vendor tool)", "note", 2, "—")
+			text(id+".smart.none", "S.M.A.R.T. unavailable from this storage driver or controller", "note", 2, "—")
 		}
 	}
 
@@ -638,15 +657,7 @@ func GPUPowerLabel(g *GPUAdapter) string {
 }
 
 func gpuSensorNote(g *GPUAdapter) string {
-	switch g.Vendor {
-	case "NVIDIA":
-		return "Clocks and temperature come from the NVIDIA driver's NVML; they appear while a GPU view is open"
-	case "AMD":
-		return "The AMD display library (atiadlxx.dll) reported no sensors for this adapter"
-	case "Intel":
-		return "Intel does not expose clocks or temperature through a public Windows API"
-	}
-	return "This adapter exposes no clock or temperature sensors"
+	return "Windows and the installed display driver report no clock or temperature readings"
 }
 
 func kindFor(group string) string {
