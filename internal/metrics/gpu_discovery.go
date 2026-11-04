@@ -24,8 +24,8 @@ type gpuIdentity struct {
 func enumerateGPUs() []gpuStatic {
 	var dx []gpuIdentity
 	for _, st := range enumerateDXGIGPUs() {
-		// The legacy DXGI reader can guess these from matching model/name registry
-		// entries. Discard that guess; SetupAPI supplies the exact devnode's driver.
+		// DXGI provides identity and memory totals. SetupAPI supplies the exact
+		// devnode's driver, and the LUID query supplies its physical location.
 		st.driver, st.date, st.location, st.bus = "", "", "", -1
 		var hi, lo uint32
 		if _, err := fmt.Sscanf(st.id, "0X%08X_0X%08X", &hi, &lo); err == nil {

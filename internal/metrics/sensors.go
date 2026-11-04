@@ -38,6 +38,8 @@ type SensorHub struct {
 	power        PowerStatic
 	drives       []DriveHealth
 	maxMHz       []uint32
+	currentMHz   []float64
+	clocking     bool
 	slowAt       time.Time
 	slowing      bool
 	powerAt      time.Time
@@ -55,10 +57,24 @@ func NewSensorHub() *SensorHub {
 
 // NewSensorHubWith is NewSensorHub with an explicit external source (or nil).
 func NewSensorHubWith(ext *ExternalSource) *SensorHub {
-	h := &SensorHub{mm: map[string]*minMax{}, ext: ext}
+	h := NewSensorHubDeferred()
+	h.ext = ext
 	h.power = ReadPowerStatic() // cheap; avoids showing "Battery" until the first slow read
 	h.topo = ReadTopology()
 	return h
+}
+
+// NewSensorHubDeferred creates an immediately usable hub without querying drivers.
+// Initialize performs its static reads on the application's startup worker.
+func NewSensorHubDeferred() *SensorHub { return &SensorHub{mm: map[string]*minMax{}} }
+
+func (h *SensorHub) Initialize() {
+	power, topo := ReadPowerStatic(), ReadTopology()
+	h.mu.Lock()
+	h.power, h.topo = power, topo
+	h.powerAt = time.Now()
+	h.mu.Unlock()
+	h.clockSnapshot(ReadCPUClocks)
 }
 
 // External exposes the optional external sensor source (nil in the self-contained default configuration).
@@ -141,11 +157,11 @@ func (h *SensorHub) refreshSlowWith(readDrives func() []DriveHealth, readPower f
 	}
 	h.mu.Unlock()
 	if powerDue {
+		h.clockSnapshot(readClocks)
 		go func() {
 			p := readPower()
-			_, mx := readClocks()
 			h.mu.Lock()
-			h.power, h.maxMHz = p, mx
+			h.power = p
 			h.powerAt, h.powering = time.Now(), false
 			h.mu.Unlock()
 		}()
@@ -159,6 +175,32 @@ func (h *SensorHub) refreshSlowWith(readDrives func() []DriveHealth, readPower f
 			h.mu.Unlock()
 		}()
 	}
+}
+
+// clockSnapshot never waits on the power driver. Cached slices are immutable;
+// a single in-flight request bounds work even when a driver stops responding.
+func (h *SensorHub) clockSnapshot(read func() ([]uint32, []uint32)) []float64 {
+	h.mu.Lock()
+	current := h.currentMHz
+	launch := !h.clocking
+	if launch {
+		h.clocking = true
+	}
+	h.mu.Unlock()
+	if launch {
+		go func() {
+			cur, maxMHz := read()
+			values := make([]float64, len(cur))
+			for i, v := range cur {
+				values[i] = float64(v)
+			}
+			h.mu.Lock()
+			h.currentMHz, h.maxMHz = values, maxMHz
+			h.clocking = false
+			h.mu.Unlock()
+		}()
+	}
+	return current
 }
 
 func (h *SensorHub) track(id string, v float64) *minMax {
@@ -215,6 +257,11 @@ func rateStr(n float64) string { return bytesStr(n) + "/s" }
 // Update rebuilds the tree for one snapshot.
 func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 	h.refreshSlow()
+	// Read cached fallback clocks and request at most one background refresh.
+	freqs := s.CPUFreq
+	if len(freqs) == 0 {
+		freqs = h.clockSnapshot(ReadCPUClocks)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -285,13 +332,6 @@ func (h *SensorHub) Update(s *Snapshot, host HostInfo) []SensorRow {
 	}
 
 	group("cpu.clk", "Clocks", "clock", 2)
-	freqs := s.CPUFreq
-	if len(freqs) == 0 {
-		cur, _ := ReadCPUClocks()
-		for _, c := range cur {
-			freqs = append(freqs, float64(c))
-		}
-	}
 	if len(freqs) > 0 {
 		var sum float64
 		for _, f := range freqs {

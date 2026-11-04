@@ -4,6 +4,7 @@ package metrics
 
 import (
 	"fmt"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -153,13 +154,30 @@ func (c *pdhCounter) values() []PDHInstanceValue {
 
 // utf16At decodes a NUL-terminated UTF-16LE string starting at off in b.
 func utf16At(b []byte, off int) string {
-	var u []uint16
-	for i := off; i+1 < len(b); i += 2 {
-		c := uint16(b[i]) | uint16(b[i+1])<<8
+	if off < 0 || off >= len(b) {
+		return ""
+	}
+	end, ascii := off, true
+	for end+1 < len(b) {
+		c := uint16(b[end]) | uint16(b[end+1])<<8
 		if c == 0 {
 			break
 		}
-		u = append(u, c)
+		ascii = ascii && c < 128
+		end += 2
 	}
-	return windows.UTF16ToString(append(u, 0))
+	if ascii {
+		var out strings.Builder
+		out.Grow((end - off) / 2)
+		for i := off; i < end; i += 2 {
+			out.WriteByte(b[i])
+		}
+		return out.String()
+	}
+	u := make([]uint16, (end-off)/2)
+	for i := off; i < end; i += 2 {
+		c := uint16(b[i]) | uint16(b[i+1])<<8
+		u[(i-off)/2] = c
+	}
+	return windows.UTF16ToString(u)
 }

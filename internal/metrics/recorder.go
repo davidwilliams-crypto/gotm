@@ -100,17 +100,19 @@ func (r *Recorder) SetPersist(v bool) {
 			_ = r.file.Close()
 			r.file, r.fileDay = nil, ""
 		}
-		r.diskErr = nil
+		r.setDiskErr(nil)
 	}
 }
 
 // DiskErr reports the last on-disk persistence failure (disk full, locked
 // file, redirected folder while elevated), or nil when writes are succeeding.
 func (r *Recorder) DiskErr() error {
-	r.fileMu.Lock()
-	defer r.fileMu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.diskErr
 }
+func (r *Recorder) setDiskErr(err error) { r.mu.Lock(); r.diskErr = err; r.mu.Unlock() }
+
 func (r *Recorder) Persist() bool { r.mu.RLock(); defer r.mu.RUnlock(); return r.persist }
 
 // Add records a snapshot if enabled and the interval has elapsed.
@@ -128,6 +130,7 @@ func (r *Recorder) Add(s *Snapshot) {
 		// Supersede the old future tail (including any sample at this time),
 		// just as the sampler does for its graph history after a clock change.
 		i := sort.Search(len(r.ring), func(i int) bool { return r.ring[i].T >= s.T })
+		clear(r.ring[i:])
 		r.ring = r.ring[:i]
 		r.last = 0
 	}
@@ -144,7 +147,9 @@ func (r *Recorder) Add(s *Snapshot) {
 
 	r.ring = append(r.ring, rs)
 	if len(r.ring) > r.capacity {
-		r.ring = append([]RecSample(nil), r.ring[len(r.ring)-r.capacity:]...)
+		n := copy(r.ring, r.ring[len(r.ring)-r.capacity:])
+		clear(r.ring[n:])
+		r.ring = r.ring[:n]
 	}
 	persist := r.persist
 	r.mu.Unlock()
@@ -155,28 +160,63 @@ func (r *Recorder) Add(s *Snapshot) {
 	}
 }
 
+// Only thirteen leaders can be retained. Fixed-size ranked selections avoid
+// sorting and allocating an index for every process in a busy system.
 func topProcs(procs []Proc) []RecProc {
-	idx := make([]int, 0, len(procs))
-	for i := range procs {
-		if procs[i].PID != 0 {
-			idx = append(idx, i)
+	var cpu [10]int
+	var mem [3]int
+	nc, nm := 0, 0
+	insert := func(top []int, n *int, idx int, better func(int, int) bool) {
+		at := 0
+		for at < *n && !better(idx, top[at]) {
+			at++
 		}
+		if at == len(top) {
+			return
+		}
+		if *n < len(top) {
+			*n++
+		}
+		copy(top[at+1:*n], top[at:*n-1])
+		top[at] = idx
 	}
-	pick := map[int]bool{}
-	sort.Slice(idx, func(a, b int) bool { return procs[idx[a]].CPU > procs[idx[b]].CPU })
-	for i := 0; i < len(idx) && i < 10; i++ {
-		pick[idx[i]] = true
+	for i := range procs {
+		if procs[i].PID == 0 {
+			continue
+		}
+		insert(cpu[:], &nc, i, func(a, b int) bool { return procs[a].CPU > procs[b].CPU })
+		insert(mem[:], &nm, i, func(a, b int) bool { return procs[a].Mem > procs[b].Mem })
 	}
-	sort.Slice(idx, func(a, b int) bool { return procs[idx[a]].Mem > procs[idx[b]].Mem })
-	for i := 0; i < len(idx) && i < 3; i++ {
-		pick[idx[i]] = true
-	}
-	out := make([]RecProc, 0, len(pick))
-	for i := range pick {
-		p := procs[i]
+	out := make([]RecProc, 0, nc+nm)
+	add := func(idx int) {
+		p := procs[idx]
 		out = append(out, RecProc{PID: p.PID, Name: p.Name, CPU: p.CPU, Mem: p.Mem})
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a].CPU > out[b].CPU })
+	for _, idx := range cpu[:nc] {
+		add(idx)
+	}
+	for _, idx := range mem[:nm] {
+		found := false
+		for _, c := range cpu[:nc] {
+			if c == idx {
+				found = true
+				break
+			}
+		}
+		if !found {
+			add(idx)
+		}
+	}
+	// Small stable insertion sort avoids a reflection closure allocation.
+	for i := 1; i < len(out); i++ {
+		v := out[i]
+		j := i
+		for j > 0 && out[j-1].CPU < v.CPU {
+			out[j] = out[j-1]
+			j--
+		}
+		out[j] = v
+	}
 	return out
 }
 
@@ -205,32 +245,32 @@ func (r *Recorder) appendDisk(rs RecSample) {
 		}
 		path := filepath.Join(r.dir, day+".jsonl")
 		if !safepath.WritableFile(path) {
-			r.diskErr = errRedirectedPath
+			r.setDiskErr(errRedirectedPath)
 			return
 		}
 		_ = os.MkdirAll(r.dir, 0o700)
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
-			r.diskErr = err
+			r.setDiskErr(err)
 			return
 		}
 		r.file, r.fileDay = f, day
 	}
 	b, err := json.Marshal(rs)
 	if err != nil {
-		r.diskErr = err
+		r.setDiskErr(err)
 		return
 	}
 	if _, err := r.file.Write(append(b, '\n')); err != nil {
 		// A failing write must not pass silently: drop the handle so the next
 		// sample reopens (recovering from a locked or replaced file) and
 		// report the error until one write succeeds.
-		r.diskErr = err
+		r.setDiskErr(err)
 		_ = r.file.Close()
 		r.file, r.fileDay = nil, ""
 		return
 	}
-	r.diskErr = nil
+	r.setDiskErr(nil)
 }
 
 // LoadDisk reloads samples from the last `window` of on-disk files.

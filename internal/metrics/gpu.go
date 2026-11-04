@@ -174,14 +174,9 @@ func enumerateDXGIGPUs() []gpuStatic {
 			ded:      uint64(d.DedicatedVideo),
 			shr:      uint64(d.SharedSystem),
 		}
-		st.driver, st.date = driverInfo(d.VendorID, d.DeviceID, st.name)
+		// enumerateGPUs attaches exact devnode metadata and the LUID's PCI
+		// address. Avoid registry/model guesses that it would discard anyway.
 		st.bus = -1
-		if bus, dev, fn, ok := adapterAddress(d.LuidLow, d.LuidHigh); ok {
-			// exact for this adapter, even with two identical cards
-			st.bus, st.location = int(bus), fmt.Sprintf("%02X:%02X.%X", bus, dev, fn)
-		} else {
-			st.location = pciLocation(d.VendorID, d.DeviceID)
-		}
 		out = append(out, st)
 	}
 	return out
@@ -472,11 +467,17 @@ type gpuInst struct {
 
 // luidKey extracts "0X........_0X........" from an instance name.
 func luidKey(inst string) string {
+	return strings.ToUpper(rawLUIDKey(inst))
+}
+
+// rawLUIDKey returns a view into the instance name without allocating. The
+// discovery cache accepts these aliases; public adapter IDs stay canonical.
+func rawLUIDKey(inst string) string {
 	i := strings.Index(inst, "luid_")
 	if i < 0 || len(inst) < i+5+21 {
 		return ""
 	}
-	return strings.ToUpper(inst[i+5 : i+5+21])
+	return inst[i+5 : i+5+21]
 }
 
 func parseGPUInst(inst string) (gpuInst, bool) {
@@ -768,6 +769,7 @@ func newGPUReader() *gpuReader {
 	r.lastDiscovery = time.Now()
 	for _, s := range r.static {
 		r.seen[s.id] = true
+		r.seen[strings.ToLower(s.id)] = true
 	}
 	r.nv = openNVML()
 	r.nvDevs = r.nv.devices()
@@ -775,32 +777,47 @@ func newGPUReader() *gpuReader {
 	return r
 }
 
+// refreshGPUDiscovery coalesces a periodic refresh and newly observed PDH
+// devices into one inventory query. Unknown compute devices are remembered
+// until the next periodic refresh, without copying large counter arrays.
+func (r *gpuReader) refreshGPUDiscovery(now time.Time, eng, ded []PDHInstanceValue, discover func() []gpuStatic) {
+	refresh := now.Sub(r.lastDiscovery) >= 30*time.Second
+	for _, values := range [][]PDHInstanceValue{ded, eng} {
+		for _, it := range values {
+			id := rawLUIDKey(it.Instance)
+			if id == "" || r.seen[id] {
+				continue
+			}
+			if r.seen[strings.ToUpper(id)] {
+				r.seen[id] = true
+			} else {
+				refresh = true
+			}
+		}
+	}
+	if !refresh {
+		return
+	}
+	r.static, r.lastDiscovery = discover(), now
+	r.seen = make(map[string]bool, 2*len(r.static))
+	for _, st := range r.static {
+		r.seen[st.id], r.seen[strings.ToLower(st.id)] = true, true
+	}
+	for _, values := range [][]PDHInstanceValue{ded, eng} {
+		for _, it := range values {
+			if id := rawLUIDKey(it.Instance); id != "" {
+				r.seen[id] = true
+			}
+		}
+	}
+}
+
 // build combines one PDH sample with static data and vendor sensors.
 func (r *gpuReader) build(eng, ded, shr, pded, pshr []PDHInstanceValue) []GPUAdapter {
 	if r == nil {
 		return nil
 	}
-	// A disappearing adapter need not leave a PDH instance behind. Periodic
-	// discovery handles unplug/disable/driver resets as well as new devices.
-	if time.Since(r.lastDiscovery) >= 30*time.Second {
-		r.static = enumerateGPUs()
-		r.lastDiscovery = time.Now()
-		r.seen = map[string]bool{}
-		for _, st := range r.static {
-			r.seen[st.id] = true
-		}
-	}
-	// a LUID we have no DXGI record for: rescan once (hot-plug, driver reset)
-	for _, it := range append(append([]PDHInstanceValue(nil), ded...), eng...) {
-		if id := luidKey(it.Instance); id != "" && !r.seen[id] {
-			r.static = enumerateGPUs()
-			for _, s := range r.static {
-				r.seen[s.id] = true
-			}
-			r.seen[id] = true
-			break
-		}
-	}
+	r.refreshGPUDiscovery(time.Now(), eng, ded, enumerateGPUs)
 	list := buildGPUs(r.static, eng, ded, shr, pded, pshr)
 	busOf := map[string]int{}
 	for _, st := range r.static {
@@ -830,10 +847,13 @@ func (r *gpuReader) build(eng, ded, shr, pded, pshr []PDHInstanceValue) []GPUAda
 			list[i].HasMemClock = list[i].MemClockMHz > 0
 		}
 	}
-	nvLocal := vendorGPUIdentities(r.static, 0x10de)
+	var nvLocal []vendorGPUIdentity
 	var nvRemote []vendorGPUIdentity
-	for _, d := range r.nvDevs {
-		nvRemote = append(nvRemote, vendorGPUIdentity{d.bus, d.name})
+	if wanted && len(nvIdx) > 0 {
+		nvLocal = vendorGPUIdentities(r.static, 0x10de)
+		for _, d := range r.nvDevs {
+			nvRemote = append(nvRemote, vendorGPUIdentity{d.bus, d.name})
+		}
 	}
 	for _, i := range nvIdx {
 		if !wanted {

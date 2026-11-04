@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -38,6 +39,7 @@ type pageDef struct {
 	pro                        bool
 	impl                       page
 	root                       *walk.Composite
+	initialized                bool
 }
 
 // App owns the main window and everything hanging off it.
@@ -67,7 +69,7 @@ type App struct {
 	procs    *procsTab
 	settings *settingsTab
 
-	scheduled  chan struct{}
+	updates    snapshotMailbox
 	alertText  string
 	alertSince map[int]int64
 	alertShown map[int]time.Time
@@ -129,15 +131,19 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	stallPhase("theme applied")
 	a := &App{
 		version: version, store: store, cfg: store.Get(), sampler: sampler,
-		host: metrics.ReadHostInfo(), alertSince: map[int]int64{}, alertShown: map[int]time.Time{},
-		scheduled: make(chan struct{}, 1), sensors: metrics.NewSensorHub(),
-		localIP: firstLocalIP(),
+		host: metrics.HostInfo{NumCPU: sampler.NumCPU(), Elevated: metrics.IsElevated(), Self: os.Getpid()}, alertSince: map[int]int64{}, alertShown: map[int]time.Time{},
+		sensors: metrics.NewSensorHubDeferred(),
 	}
 	a.rec = metrics.NewRecorder(3*time.Hour, 2*time.Second, store.File("recorder"))
 	a.ryzenOn = metrics.RyzenSDKEnabled()
-	if acct, other := metrics.ElevatedAs(); other {
-		a.elevatedAs = acct
-	}
+	startup := startStartup(metrics.ReadHostInfo, a.sensors.Initialize, func() (string, string) {
+		ip := firstLocalIP()
+		account, other := metrics.ElevatedAs()
+		if !other {
+			account = ""
+		}
+		return ip, account
+	})
 	a.setRyzenSDK(a.ryzenOn && a.host.Elevated)
 
 	a.procs = newProcsTab(a)
@@ -194,20 +200,10 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 			start = n
 		}
 	}
-	// Every page starts hidden except the first one shown. Hidden pages take no
-	// space, so the window is sized for one page rather than all eleven.
+	// Only the selected page creates native controls at startup. Other page
+	// models remain available to settings, recording and snapshot accounting.
 	a.wraps = make([]*walk.Composite, pgCount)
-	var contents []decl.Widget
-	for i, p := range a.pages {
-		contents = append(contents, decl.Composite{
-			AssignTo:      &a.wraps[i],
-			Visible:       i == start,
-			StretchFactor: bodyStretch,
-			Background:    decl.SolidColorBrush{Color: T.Bg},
-			Layout:        decl.VBox{MarginsZero: true, SpacingZero: true},
-			Children:      []decl.Widget{p.impl.build()},
-		})
-	}
+	contents := []decl.Widget{a.pageWidget(start)}
 
 	enableDarkMode() // dark context menus and list-view headers (before any window exists)
 	icon := appIcon()
@@ -236,14 +232,6 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	if err != nil {
 		return err
 	}
-	// Declarative Visible is not honoured at creation, so every page was shown
-	// and the layout sized the window for all of them. Hide the others now and
-	// give the window its real size explicitly.
-	for k, w := range a.wraps {
-		if k != start {
-			w.SetVisible(false)
-		}
-	}
 	a.mw.SetSize(walk.Size{Width: a.initialSize().Width, Height: a.initialSize().Height})
 	if tb := a.mw.ToolBar(); tb != nil {
 		tb.SetVisible(false)
@@ -255,9 +243,11 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	titleBar(win.HWND(a.mw.Handle()))
 
 	a.side.attachWheel()
-	for _, p := range a.pages {
-		p.impl.init()
+	if err := a.ensurePage(start); err != nil {
+		a.mw.Dispose()
+		return err
 	}
+	a.pages[pgRecorder].impl.(*recorderPage).startBackground()
 	stallPhase("pages initialized")
 	a.setupShortcuts()
 	a.setupTray(icon)
@@ -265,6 +255,8 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	a.mw.SetSize(walk.Size{Width: a.initialSize().Width, Height: a.initialSize().Height})
 
 	a.watchSystem() // sign-out/shutdown save the window state; colour changes re-theme
+	stallWindow.Store(uintptr(a.mw.Handle()))
+	defer stallWindow.Store(0)
 	a.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
 		a.saveWindowState()
 		a.setRyzenSDK(false) // releases the AMD SDK before the process exits
@@ -280,7 +272,7 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	a.navigate(start)
 	stallPhase("first page shown; entering message loop")
 	a.pumpDone = make(chan struct{})
-	go a.pump()
+	go a.pump(startup, a.host)
 	walk.App().Run()
 	close(a.pumpDone) // pump unsubscribes and exits instead of blocking forever
 	return nil
@@ -315,9 +307,43 @@ func firstLocalIP() string {
 	return ""
 }
 
+func (a *App) pageWidget(i int) decl.Composite {
+	return decl.Composite{
+		AssignTo: &a.wraps[i], StretchFactor: bodyStretch,
+		Background: decl.SolidColorBrush{Color: T.Bg},
+		Layout:     decl.VBox{MarginsZero: true, SpacingZero: true},
+		Children:   []decl.Widget{a.pages[i].impl.build()},
+	}
+}
+
+// ensurePage creates and initializes a page once, on the UI thread. Subsequent
+// visits reuse its controls, model, selection and scroll state.
+func (a *App) ensurePage(i int) error {
+	p := a.pages[i]
+	if p.initialized {
+		return nil
+	}
+	if a.wraps[i] == nil {
+		a.mw.SetSuspended(true)
+		defer a.mw.SetSuspended(false)
+		if err := a.pageWidget(i).Create(decl.NewBuilder(a.right)); err != nil {
+			a.wraps[i] = nil
+			return err
+		}
+		a.wraps[i].SetVisible(false)
+	}
+	p.impl.init()
+	p.initialized = true
+	return nil
+}
+
 // navigate shows page i and hides the others.
 func (a *App) navigate(i int) {
 	if i < 0 || i >= len(a.pages) {
+		return
+	}
+	if err := a.ensurePage(i); err != nil {
+		a.errBox("Open page", err)
 		return
 	}
 	a.cur = i
@@ -356,39 +382,126 @@ func (a *App) onSideClick(id string) {
 
 // pump forwards each sampler tick to the UI thread, coalescing bursts so a
 // busy UI never builds up a backlog. It returns when the window closes.
-func (a *App) pump() {
+type startupInfo struct {
+	host                metrics.HostInfo
+	localIP, elevatedAs string
+}
+
+// One bounded startup worker publishes CPU/host details before potentially slow
+// network/account lookups. Both sends are buffered even if the window closes.
+func startStartup(readHost func() metrics.HostInfo, initialize func(), extra func() (string, string)) <-chan startupInfo {
+	out := make(chan startupInfo, 2)
+	go func() {
+		defer close(out)
+		info := startupInfo{host: readHost()}
+		initialize()
+		out <- info
+		info.localIP, info.elevatedAs = extra()
+		out <- info
+	}()
+	return out
+}
+
+type snapshotUpdate struct {
+	snap *metrics.Snapshot
+	rows []metrics.SensorRow
+}
+
+// snapshotMailbox retains only the newest immutable UI payload while the UI is
+// busy. Recording and sensor min/max run before this presentation-only gate.
+type snapshotMailbox struct {
+	mu      sync.Mutex
+	pending *snapshotUpdate
+	queued  bool
+}
+
+func (m *snapshotMailbox) offer(v *snapshotUpdate) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = v
+	if m.queued {
+		return false
+	}
+	m.queued = true
+	return true
+}
+func (m *snapshotMailbox) take() *snapshotUpdate {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := m.pending
+	m.pending = nil
+	m.queued = false
+	return v
+}
+
+func (a *App) pump(startup <-chan startupInfo, initialHost metrics.HostInfo) {
 	ch, cancel := a.sampler.Subscribe()
 	defer cancel()
-	for {
-		var snap *metrics.Snapshot
-		select {
-		case <-a.pumpDone:
+	pumpSnapshots(ch, startup, a.pumpDone, initialHost, a.publishStartup, func(snap *metrics.Snapshot, host metrics.HostInfo) {
+		// Record and account for extrema even when a previous UI update is queued.
+		update := a.prepareSnapshot(snap, host)
+		if !a.updates.offer(update) {
 			return
-		case s, ok := <-ch:
+		}
+		a.mw.Synchronize(func() {
+			select {
+			case <-a.pumpDone:
+				return
+			default:
+			}
+			if update := a.updates.take(); update != nil {
+				a.onSnapshot(update.snap, update.rows)
+			}
+		})
+	})
+}
+
+// Startup discovery must never gate live samples. The initial host is copied
+// on the UI thread; this worker only reads its own copy while discovery runs.
+func pumpSnapshots(samples <-chan *metrics.Snapshot, startup <-chan startupInfo, done <-chan struct{}, host metrics.HostInfo,
+	publishStartup func(startupInfo), consume func(*metrics.Snapshot, metrics.HostInfo)) {
+	for {
+		select {
+		case <-done:
+			return
+		case info, ok := <-startup:
+			if !ok {
+				startup = nil
+				continue
+			}
+			host = info.host
+			publishStartup(info)
+		case snap, ok := <-samples:
 			if !ok {
 				return
 			}
-			snap = s
-			// Recording happens here, on this background goroutine: the
-			// ring update and any on-disk write never block a paint.
-			a.rec.Add(snap)
+			consume(snap, host)
 		}
-		select {
-		case a.scheduled <- struct{}{}:
-		default:
-			continue // a UI update is already queued
-		}
-		a.mw.Synchronize(func() {
-			<-a.scheduled
-			a.onSnapshot(snap)
-		})
 	}
 }
 
-func (a *App) onSnapshot(s *metrics.Snapshot) {
+func (a *App) prepareSnapshot(s *metrics.Snapshot, host metrics.HostInfo) *snapshotUpdate {
+	a.rec.Add(s)
+	return &snapshotUpdate{snap: s, rows: a.sensors.Update(s, host)}
+}
+
+func (a *App) publishStartup(info startupInfo) {
+	a.mw.Synchronize(func() {
+		select {
+		case <-a.pumpDone:
+			return
+		default:
+		}
+		a.host, a.localIP, a.elevatedAs = info.host, info.localIP, info.elevatedAs
+		_ = a.mw.SetTitle(a.windowTitle())
+		a.invalidateChrome()
+	})
+}
+
+func (a *App) onSnapshot(s *metrics.Snapshot, rows []metrics.SensorRow) {
 	a.snap = s
 	if p, ok := a.pages[pgPower].impl.(*powerPage); ok {
-		p.rows = a.sensors.Update(s, a.host)
+		p.rows = rows
 	}
 	a.updateTray(s)
 	a.checkAlerts(s)
@@ -399,7 +512,10 @@ func (a *App) onSnapshot(s *metrics.Snapshot) {
 // ---- admin ---------------------------------------------------------------------
 
 func (a *App) windowTitle() string {
-	t := fmt.Sprintf("gotm — %s", a.host.Hostname)
+	t := "gotm"
+	if a.host.Hostname != "" {
+		t += " — " + a.host.Hostname
+	}
 	if a.host.Elevated {
 		t += " [Administrator]"
 	}

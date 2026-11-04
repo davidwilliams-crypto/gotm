@@ -425,6 +425,9 @@ func (t *procsTab) syncToggles() {
 
 // applyColumns shows exactly the columns chosen in Settings (Name is always on).
 func (t *procsTab) applyColumns() {
+	if t.tv == nil {
+		return
+	} // Settings can change columns before the first visit.
 	want := map[string]bool{"name": true}
 	for _, k := range t.app.cfg.Columns {
 		want[k] = true

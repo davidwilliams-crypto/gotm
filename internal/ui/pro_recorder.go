@@ -18,12 +18,13 @@ import (
 // recorderPage is the flight recorder: a timeline of recent history. Click or
 // drag on it to pick a moment and see which processes were busiest then.
 type recorderPage struct {
-	app       *App
-	root      *walk.Composite
-	view      *canvasView
-	rangeSecs int
-	selT      int64 // selected time (unix ms); 0 = follow live
-	live      bool
+	app               *App
+	root              *walk.Composite
+	view              *canvasView
+	rangeSecs         int
+	selT              int64 // selected time (unix ms); 0 = follow live
+	live              bool
+	backgroundStarted bool
 
 	bRec, bMark, bExport, bDisk, bClear *button
 	bRange                              [4]*button
@@ -120,9 +121,17 @@ func (p *recorderPage) build() decl.Widget {
 
 func (p *recorderPage) init() {
 	p.app.registerRoot(pgRecorder, p.root)
+	p.sync()
+}
+
+// Persistence and retention belong to the application session, even if the
+// recorder's native controls have not been created yet.
+func (p *recorderPage) startBackground() {
+	if p.backgroundStarted {
+		return
+	}
+	p.backgroundStarted = true
 	p.app.rec.SetPersist(p.app.cfg.RecorderDisk)
-	// Old files are pruned first (even with persistence now off), and reading
-	// the rest happens off the UI thread.
 	load := p.app.cfg.RecorderDisk
 	go func() {
 		p.app.rec.PruneDisk(72 * time.Hour)

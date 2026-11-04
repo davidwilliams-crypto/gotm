@@ -342,6 +342,7 @@ func (s *Sampler) tick(publish bool) {
 	// If the clock stepped backwards (NTP, manual change), drop points that now
 	// lie in the future, or they would stay in the graphs until time caught up.
 	for len(s.hist) > 0 && s.hist[len(s.hist)-1].T > snap.T {
+		s.hist[len(s.hist)-1] = HistPoint{}
 		s.hist = s.hist[:len(s.hist)-1]
 	}
 	s.hist = append(s.hist, hp)
@@ -352,7 +353,13 @@ func (s *Sampler) tick(publish bool) {
 		i++
 	}
 	if i > 0 {
-		s.hist = append([]HistPoint(nil), s.hist[i:]...)
+		n := copy(s.hist, s.hist[i:])
+		clear(s.hist[n:])
+		s.hist = s.hist[:n]
+		// Release excess capacity after a large history-window reduction.
+		if cap(s.hist) > 4*len(s.hist) {
+			s.hist = append([]HistPoint(nil), s.hist...)
+		}
 	}
 	for ch := range s.subs {
 		select {

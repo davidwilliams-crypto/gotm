@@ -5,6 +5,7 @@ package ui
 import (
 	"math"
 	"strings"
+	"unsafe"
 
 	"github.com/tailscale/walk"
 	"github.com/tailscale/win"
@@ -185,31 +186,50 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 		ss-- // cap the off-screen bitmap at about 24 MB
 	}
 	W, H := r.W*ss, r.H*ss
-	bmp, err := walk.NewBitmapForDPI(walk.Size{Width: W, Height: H}, 96)
-	if err != nil {
+	// The graph is opaque and is copied with SRCCOPY. A native temporary
+	// bitmap avoids Walk's alpha postprocessing (a full read/scan/write of
+	// every supersampled pixel on Canvas.Dispose), which is unused here.
+	hdc := win.CreateCompatibleDC(dst.HDC())
+	if hdc == 0 {
 		return maxV
 	}
-	defer bmp.Dispose()
-	cv, err := walk.NewCanvasFromImage(bmp)
-	if err != nil {
+	defer win.DeleteDC(hdc)
+	header := win.BITMAPINFOHEADER{BiSize: uint32(unsafe.Sizeof(win.BITMAPINFOHEADER{})), BiWidth: int32(W), BiHeight: int32(H), BiPlanes: 1, BiBitCount: 32, BiCompression: win.BI_RGB}
+	var bits unsafe.Pointer
+	bitmap := win.CreateDIBSection(hdc, &header, win.DIB_RGB_COLORS, &bits, 0, 0)
+	if bitmap == 0 || bitmap == win.ERROR_INVALID_PARAMETER {
 		return maxV
 	}
-	defer cv.Dispose()
-
-	fillRect(cv, rect{0, 0, W, H}, st.bg)
+	defer win.DeleteObject(win.HGDIOBJ(bitmap))
+	oldBitmap := win.SelectObject(hdc, win.HGDIOBJ(bitmap))
+	if oldBitmap == 0 {
+		return maxV
+	}
+	defer win.SelectObject(hdc, oldBitmap)
+	brush := win.CreateBrushIndirect(&win.LOGBRUSH{LbStyle: win.BS_SOLID, LbColor: win.COLORREF(st.bg)})
+	if brush == 0 {
+		return maxV
+	}
+	win.FillRect(hdc, &win.RECT{Right: int32(W), Bottom: int32(H)}, brush)
+	win.DeleteObject(win.HGDIOBJ(brush))
 	if st.grid {
-		gp, _ := walk.NewCosmeticPen(walk.PenSolid, T.Grid)
-		for i := 1; i < 4; i++ {
-			y := H * i / 4
-			_ = cv.DrawLinePixels(gp, walk.Point{X: 0, Y: y}, walk.Point{X: W, Y: y})
+		pen := win.ExtCreatePen(win.PS_COSMETIC|win.PS_SOLID, 1, &win.LOGBRUSH{LbStyle: win.BS_SOLID, LbColor: win.COLORREF(T.Grid)}, 0, nil)
+		if pen != 0 {
+			oldPen := win.SelectObject(hdc, win.HGDIOBJ(pen))
+			for i := 1; i < 4; i++ {
+				y := H * i / 4
+				win.MoveToEx(hdc, 0, y, nil)
+				win.LineTo(hdc, int32(W), int32(y))
+			}
+			for i := 1; i < 6; i++ {
+				x := W * i / 6
+				win.MoveToEx(hdc, x, 0, nil)
+				win.LineTo(hdc, int32(x), int32(H))
+			}
+			win.SelectObject(hdc, oldPen)
+			win.DeleteObject(win.HGDIOBJ(pen))
 		}
-		for i := 1; i < 6; i++ {
-			x := W * i / 6
-			_ = cv.DrawLinePixels(gp, walk.Point{X: x, Y: 0}, walk.Point{X: x, Y: H})
-		}
-		gp.Dispose()
 	}
-
 	lw := st.lineW
 	if lw < 1 {
 		lw = 2
@@ -240,45 +260,30 @@ func plotSeries(dst *walk.Canvas, r rect, ser []series, st graphStyle) float64 {
 			pts[i] = walk.Point{X: int(x), Y: int(y)}
 		}
 		if s.fill {
-			// area under the curve, as 1px (supersampled) vertical strokes,
-			// clamped to the chart: whatever the x positions, only columns
-			// between the segment's left and right edge inside [0, W) are drawn
-			fillC := blend(s.color, st.bg, 0.22)
-			fp, _ := walk.NewCosmeticPen(walk.PenSolid, fillC)
-			for i := 1; i < n; i++ {
-				if !finiteValue(s.vals[i-1]) || !finiteValue(s.vals[i]) {
-					continue
-				}
-				a, b := pts[i-1], pts[i]
-				left, right := min(a.X, b.X), max(a.X, b.X)
-				for x := max(left, 0); x <= min(right, W-1); x++ {
-					y := b.Y
-					if b.X != a.X {
-						y = a.Y + (b.Y-a.Y)*(x-a.X)/(b.X-a.X)
-					}
-					_ = cv.DrawLinePixels(fp, walk.Point{X: x, Y: H}, walk.Point{X: x, Y: y})
-				}
-			}
-			fp.Dispose()
+			fillGraphArea(hdc, pts, s.vals, W, H, blend(s.color, st.bg, 0.22))
 		}
-		br := solid(s.color)
-		gp, err := walk.NewGeometricPen(walk.PenSolid|walk.PenCapRound|walk.PenJoinRound, lw*ss, br)
-		if err == nil {
+		pen := win.ExtCreatePen(win.PS_GEOMETRIC|win.PS_SOLID|win.PS_ENDCAP_ROUND|win.PS_JOIN_ROUND, uint32(lw*ss), &win.LOGBRUSH{LbStyle: win.BS_SOLID, LbColor: win.COLORREF(s.color)}, 0, nil)
+		if pen != 0 {
+			oldPen := win.SelectObject(hdc, win.HGDIOBJ(pen))
+			nativePoints := make([]win.POINT, len(pts))
+			for i, p := range pts {
+				nativePoints[i] = win.POINT{X: int32(p.X), Y: int32(p.Y)}
+			}
 			for _, span := range finiteSpans(s.vals) {
 				if span[1]-span[0] >= 2 {
-					_ = cv.DrawPolylinePixels(gp, pts[span[0]:span[1]])
+					win.Polyline(hdc, unsafe.Pointer(&nativePoints[span[0]]), int32(span[1]-span[0]))
 				}
 			}
-			gp.Dispose()
+			win.SelectObject(hdc, oldPen)
+			win.DeleteObject(win.HGDIOBJ(pen))
 		}
-		br.Dispose()
 	}
 
 	// halftone downsample onto the destination
 	win.SetStretchBltMode(dst.HDC(), win.HALFTONE)
 	win.SetBrushOrgEx(dst.HDC(), 0, 0, nil)
 	win.StretchBlt(dst.HDC(), int32(r.X), int32(r.Y), int32(r.W), int32(r.H),
-		cv.HDC(), 0, 0, int32(W), int32(H), win.SRCCOPY)
+		hdc, 0, 0, int32(W), int32(H), win.SRCCOPY)
 	return maxV
 }
 
@@ -308,4 +313,62 @@ func finiteSpans(values []float64) [][2]int {
 		spans = append(spans, [2]int{start, i})
 	}
 	return spans
+}
+
+var (
+	procGraphPolyPolygon     = gdi32.NewProc("PolyPolygon")
+	procGraphSetPolyFillMode = gdi32.NewProc("SetPolyFillMode")
+)
+
+// graphFillPolygons describes the same union of clipped vertical areas as the
+// old per-column strokes. Separate trapezoids retain missing-data gaps and
+// also handle repeated or reversed timestamps without self-intersection.
+func graphFillPolygons(pts []walk.Point, vals []float64, width, height int) ([]win.POINT, []int32) {
+	if len(pts) < 2 || len(vals) != len(pts) || width <= 0 || height <= 0 {
+		return nil, nil
+	}
+	polygons := make([]win.POINT, 0, 4*(len(pts)-1))
+	counts := make([]int32, 0, len(pts)-1)
+	for i := 1; i < len(pts); i++ {
+		if !finiteValue(vals[i-1]) || !finiteValue(vals[i]) {
+			continue
+		}
+		a, b := pts[i-1], pts[i]
+		left, right := max(min(a.X, b.X), 0), min(max(a.X, b.X), width-1)
+		if left > right {
+			continue
+		}
+		yAt := func(x int) int32 {
+			y := float64(b.Y)
+			if b.X != a.X {
+				y = float64(a.Y) + (float64(b.Y)-float64(a.Y))*(float64(x)-float64(a.X))/(float64(b.X)-float64(a.X))
+			}
+			return int32(math.Max(0, math.Min(float64(height), y)))
+		}
+		polygons = append(polygons, win.POINT{X: int32(left), Y: int32(height)}, win.POINT{X: int32(left), Y: yAt(left)}, win.POINT{X: int32(right + 1), Y: yAt(right + 1)}, win.POINT{X: int32(right + 1), Y: int32(height)})
+		counts = append(counts, 4)
+	}
+	return polygons, counts
+}
+
+func fillGraphArea(hdc win.HDC, pts []walk.Point, vals []float64, width, height int, color walk.Color) {
+	polygons, counts := graphFillPolygons(pts, vals, width, height)
+	if len(counts) == 0 {
+		return
+	}
+	brush := win.CreateBrushIndirect(&win.LOGBRUSH{LbStyle: win.BS_SOLID, LbColor: win.COLORREF(color)})
+	if brush == 0 {
+		return
+	}
+	defer win.DeleteObject(win.HGDIOBJ(brush))
+	saved := win.SaveDC(hdc)
+	if saved == 0 {
+		return
+	}
+	defer win.RestoreDC(hdc, saved)
+	win.SelectObject(hdc, win.HGDIOBJ(brush))
+	win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN))
+	// Winding fills overlapping trapezoids as a union, not alternating holes.
+	procGraphSetPolyFillMode.Call(uintptr(hdc), 2)
+	procGraphPolyPolygon.Call(uintptr(hdc), uintptr(unsafe.Pointer(&polygons[0])), uintptr(unsafe.Pointer(&counts[0])), uintptr(len(counts)))
 }

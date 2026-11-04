@@ -4,9 +4,11 @@ package ui
 
 import (
 	"fmt"
+	"github.com/tailscale/win"
 	"os"
 	"path/filepath"
 	"runtime/pprof"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -19,16 +21,17 @@ import (
 // launch (capped, never grows unbounded).
 
 var (
-	stallBeat  atomic.Int64 // unix ms of the last UI-thread activity
-	stallStart = time.Now()
-	stallPath  string
-	stallDumps atomic.Int32
+	stallWindow atomic.Uintptr
+	stallBeat   atomic.Int64 // unix ms of the last UI-thread activity
+	stallStart  = time.Now()
+	stallLog    stallLogConfig
+	stallDumps  atomic.Int32
 )
 
 // stallPhase marks a start-up phase boundary (also counts as UI activity).
 func stallPhase(name string) {
 	stallBeat.Store(time.Now().UnixMilli())
-	if stallPath == "" {
+	if stallLog.path == "" {
 		return
 	}
 	stallLine(fmt.Sprintf("phase %-22s +%6d ms", name, msSinceStart()))
@@ -36,17 +39,25 @@ func stallPhase(name string) {
 
 // stallWatch runs on its own goroutine for the life of the process.
 func stallWatch(logPath string) {
-	stallPath = logPath
-	f, err := os.OpenFile(stallPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err == nil {
 		fmt.Fprintf(f, "gotm stall log, started %s\n", stallStart.Format("2006-01-02 15:04:05"))
 		f.Close()
 	}
 	stallPhase("instrumentation ready")
+	var probeBeat int64
 	for {
 		time.Sleep(200 * time.Millisecond)
-		gap := time.Since(time.UnixMilli(stallBeat.Load()))
+		beat := stallBeat.Load()
+		gap := time.Since(time.UnixMilli(beat))
 		if gap < 1500*time.Millisecond {
+			continue
+		}
+		// A quiet GetMessage loop is healthy. Probe it once before treating
+		// silence as a stall; a genuinely blocked UI cannot dispatch WM_NULL.
+		if hwnd := stallWindow.Load(); hwnd != 0 && probeBeat != beat {
+			probeBeat = beat
+			win.PostMessage(win.HWND(hwnd), win.WM_NULL, 0, 0)
 			continue
 		}
 		if stallDumps.Load() >= 8 {
@@ -60,10 +71,10 @@ func stallWatch(logPath string) {
 }
 
 func dumpStall(gap time.Duration) {
-	if stallPath == "" {
+	if stallLog.path == "" {
 		return
 	}
-	f, err := os.OpenFile(stallPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(stallLog.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
@@ -77,10 +88,10 @@ func dumpStall(gap time.Duration) {
 }
 
 func stallLine(s string) {
-	if stallPath == "" {
+	if stallLog.path == "" {
 		return
 	}
-	f, err := os.OpenFile(stallPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(stallLog.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
@@ -91,9 +102,20 @@ func stallLine(s string) {
 func msSinceStart() int { return int(time.Since(stallStart).Milliseconds()) }
 
 // InitStallLog starts recording to dir\stall.log; dir "" disables.
-func InitStallLog(dir string) {
+type stallLogConfig struct {
+	once sync.Once
+	path string
+}
+
+func (c *stallLogConfig) initialize(dir string, launch func(string)) {
 	if dir == "" {
 		return
 	}
-	go stallWatch(filepath.Join(dir, "stall.log"))
+	c.once.Do(func() {
+		c.path = filepath.Join(dir, "stall.log")
+		launch(c.path)
+	})
+}
+func InitStallLog(dir string) {
+	stallLog.initialize(dir, func(path string) { go stallWatch(path) })
 }
