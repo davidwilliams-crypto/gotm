@@ -50,7 +50,8 @@ type DriveHealth struct {
 	Unsafe      float64 `json:"unsafeShutdowns"`
 	MediaErrors float64 `json:"mediaErrors"`
 
-	stalled bool // the drive did not answer within driveReadTimeout
+	stalled bool   // the drive did not answer within driveReadTimeout
+	size    uint64 // disk size in bytes (0: unknown); identifies a cached descriptor's drive
 }
 
 // storagePropertyQuery is STORAGE_PROPERTY_QUERY followed by room for
@@ -207,9 +208,11 @@ func readDrivesWith(indices []int, full bool, timeout time.Duration, read func(i
 			driveCache.Lock()
 			if e := driveCache.m[j.idx]; e != nil {
 				e.busy = false
-				// Only a descriptor the drive actually returned (it names a bus) is cached.
-				if ok && d.Bus != "" && (j.desc == nil || d.Model != j.desc.Model || d.Bus != j.desc.Bus) {
-					e.desc, e.at = DriveHealth{Index: j.idx, Model: d.Model, Bus: d.Bus}, time.Now()
+				// Only a descriptor the drive actually returned (it names a bus) is
+				// cached. A different size means another drive took this index (the
+				// reader then queried the descriptor again): cache that one.
+				if ok && d.Bus != "" && (j.desc == nil || d.Model != j.desc.Model || d.Bus != j.desc.Bus || d.size != j.desc.size) {
+					e.desc, e.at = DriveHealth{Index: j.idx, Model: d.Model, Bus: d.Bus, size: d.size}, time.Now()
 				}
 			}
 			driveCache.Unlock()
@@ -267,9 +270,38 @@ func readOneDrive(idx int, full bool, desc *DriveHealth) (DriveHealth, bool) {
 		return DriveHealth{}, false
 	}
 	defer windows.CloseHandle(h)
-	return readDriveHealthWith(idx, func(id uint32, extra []byte, outSize int) ([]byte, error) {
-		return storageQuery(h, id, extra, outSize)
-	}, desc, full), true
+	return readDriveWith(idx, full, desc, func() uint64 { return diskSize(h) },
+		func(id uint32, extra []byte, outSize int) ([]byte, error) {
+			return storageQuery(h, id, extra, outSize)
+		}), true
+}
+
+// readDriveWith checks that a cached descriptor still belongs to the drive at
+// this index before using it: hot-swap can put another drive at the same
+// PhysicalDriveN within the cache's lifetime. The disk size (one cheap IOCTL
+// that needs no access rights) tells the drives apart; when it differs the
+// descriptor is read again.
+func readDriveWith(idx int, full bool, desc *DriveHealth, size func() uint64, query func(uint32, []byte, int) ([]byte, error)) DriveHealth {
+	n := size()
+	if desc != nil && desc.size != n {
+		desc = nil
+	}
+	d := readDriveHealthWith(idx, query, desc, full)
+	d.size = n
+	return d
+}
+
+const ioctlDiskGetDriveGeometryEx = 0x000700A0 // FILE_ANY_ACCESS
+
+// diskSize returns the disk's size in bytes (DISK_GEOMETRY_EX.DiskSize), or
+// 0 when the drive does not report one (no media, unsupported).
+func diskSize(h windows.Handle) uint64 {
+	var out [256]byte // DISK_GEOMETRY_EX plus partition and detection info
+	var ret uint32
+	if err := windows.DeviceIoControl(h, ioctlDiskGetDriveGeometryEx, nil, 0, &out[0], uint32(len(out)), &ret, nil); err != nil || ret < 32 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(out[24:])
 }
 
 func readDriveHealth(idx int, query func(uint32, []byte, int) ([]byte, error)) DriveHealth {

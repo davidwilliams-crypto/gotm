@@ -25,6 +25,7 @@ type gpuReader struct {
 	invGen    uint64            // last inventory generation applied
 	readSeq   uint64            // last worker reading sequence merged
 	pending   map[string]uint64 // unseen LUID -> discovery request that covers it
+	excluded  map[string]bool   // LUIDs a discovery covered but did not list (compute-only, Basic Render)
 	reqSeq    uint64
 	waited    bool
 	lastBuild time.Time
@@ -164,20 +165,48 @@ func (r *gpuReader) syncInventory(now time.Time) {
 	}
 	r.invGen = gen
 	r.applyInventory(inv, now)
-	// Devices the inventory still does not list (compute-only, excluded) were
-	// covered by this discovery: stop asking until the next periodic refresh.
+	// Devices a discovery covered without listing them (compute-only, Basic
+	// Render Driver) stay accounted for across inventory installs: every
+	// later discovery, periodic or requested, enumerates all adapters again,
+	// so one that becomes displayable appears in the inventory by itself.
+	// Asking again would only double each periodic discovery. Entries that the
+	// inventory now lists, or that PDH no longer reports, are forgotten.
+	for id := range r.excluded {
+		if _, reported := r.scratch.unknown[id]; r.seen[id] || !reported {
+			delete(r.excluded, id)
+			continue
+		}
+		r.seen[id] = true
+	}
 	for id, req := range r.pending {
 		if req <= served {
-			r.seen[id] = true
+			if !r.seen[id] {
+				if r.excluded == nil {
+					r.excluded = map[string]bool{}
+				}
+				r.excluded[id] = true
+				r.seen[id] = true
+			}
 			delete(r.pending, id)
 		}
 	}
+	// Readings of adapters the inventory no longer lists are dropped (the
+	// worker prunes its own copy when it installs the inventory).
 	for id := range r.lastAt {
-		if !r.seen[id] {
+		if !inventoryHas(inv, id) {
 			delete(r.lastAt, id)
 			delete(r.last, id)
 		}
 	}
+}
+
+func inventoryHas(inv []gpuStatic, id string) bool {
+	for i := range inv {
+		if inv[i].id == id {
+			return true
+		}
+	}
+	return false
 }
 
 // requestUnknown asks the worker for one discovery covering LUIDs that PDH
@@ -311,6 +340,13 @@ func (w *gpuWorker) run(notify bool) {
 	}
 	w.rediscover(true)
 	close(w.ready)
+	if w.startupPollWanted() {
+		// An APU's sensors (shown on the CPU card on every page) or a GPU view
+		// opened at start-up: read at once rather than at the first sample's
+		// request, so a sample taken a moment after start already has them.
+		// The sample itself never waits for this read.
+		w.poll()
+	}
 	timer := time.NewTimer(periodic)
 	defer timer.Stop()
 	var settle *time.Timer
@@ -357,10 +393,34 @@ func (w *gpuWorker) rediscover(first bool) {
 	changed := first || !sameGPUInventory(w.inv, inv)
 	w.inv, w.served = inv, served
 	w.invGen++
+	// A removed adapter's last reading must not come back through
+	// readingsSince after the reader dropped it with this inventory.
+	for id := range w.readings {
+		if !inventoryHas(inv, id) {
+			delete(w.readings, id)
+		}
+	}
 	w.mu.Unlock()
 	if changed {
 		w.poller.reset(inv)
 	}
+}
+
+// startupPollWanted reports whether the first inventory has an adapter whose
+// sensors are read without a GPU view (an AMD adapter may be an APU), or a
+// GPU view already wants sensors.
+func (w *gpuWorker) startupPollWanted() bool {
+	if gpuSensorsWanted.Load() {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, st := range w.inv {
+		if st.vendorID == 0x1002 && !st.software {
+			return true
+		}
+	}
+	return false
 }
 
 func sameGPUInventory(a, b []gpuStatic) bool {
@@ -475,17 +535,34 @@ type vendorGPUPoller struct {
 	adlTried bool
 	adlIndex map[string]adlLookup
 	native   map[string]*nativeNodeCache
+	// unwantedSince is when GPU sensors stopped being wanted; held native
+	// adapter handles are closed once that lasts nativeHandleIdle.
+	unwantedSince time.Time
 }
+
+// nativeHandleIdle is how long native adapter handles stay open after the
+// last GPU view closed, so switching pages does not reopen every adapter.
+const nativeHandleIdle = 30 * time.Second
 
 func (p *vendorGPUPoller) reset(inv []gpuStatic) {
 	p.nv.close()
 	p.adl.close()
+	p.closeNative()
 	*p = vendorGPUPoller{}
 }
 
 func (p *vendorGPUPoller) close() {
 	p.nv.close()
 	p.adl.close()
+	p.closeNative()
+}
+
+// closeNative closes every held native adapter handle; the per-adapter
+// knowledge (3D nodes, unsupported queries) is kept.
+func (p *vendorGPUPoller) closeNative() {
+	for _, c := range p.native {
+		c.closeHandle()
+	}
 }
 
 func (p *vendorGPUPoller) amd() *adlLib {
@@ -540,6 +617,19 @@ func (p *vendorGPUPoller) nvFor(st gpuStatic) int {
 	return d
 }
 
+// idleNative closes held native handles once sensors have not been wanted
+// for nativeHandleIdle.
+func (p *vendorGPUPoller) idleNative(wanted bool, now time.Time) {
+	switch {
+	case wanted:
+		p.unwantedSince = time.Time{}
+	case p.unwantedSince.IsZero():
+		p.unwantedSince = now
+	case now.Sub(p.unwantedSince) >= nativeHandleIdle:
+		p.closeNative()
+	}
+}
+
 func (p *vendorGPUPoller) nativeFor(id string) *nativeNodeCache {
 	c := p.native[id]
 	if c == nil {
@@ -553,6 +643,7 @@ func (p *vendorGPUPoller) nativeFor(id string) *nativeNodeCache {
 }
 
 func (p *vendorGPUPoller) poll(inv []gpuStatic, wanted bool, emit func(string, GPUAdapter)) {
+	p.idleNative(wanted, time.Now())
 	for _, st := range inv {
 		if st.software {
 			continue

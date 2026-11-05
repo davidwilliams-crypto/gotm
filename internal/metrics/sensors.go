@@ -203,7 +203,10 @@ func (h *SensorHub) refreshSlowWith(readDrives func(full bool) []DriveHealth, re
 	h.mu.Unlock()
 	if powerDue {
 		if needMax {
-			h.clockSnapshot(readClocks)
+			// Bypass the fallback throttle: Update's clock read may have run
+			// just before (and failed to supply the maximum), and the next
+			// chance would be the next power refresh, 15 s away.
+			h.clockSnapshotForce(readClocks, true)
 		}
 		go func() {
 			p := readPower()
@@ -228,10 +231,16 @@ func (h *SensorHub) refreshSlowWith(readDrives func(full bool) []DriveHealth, re
 // a single in-flight request bounds work even when a driver stops responding,
 // and requests closer together than cpuClockFallbackEvery reuse the cache.
 func (h *SensorHub) clockSnapshot(read func() ([]uint32, []uint32)) []float64 {
+	return h.clockSnapshotForce(read, false)
+}
+
+// clockSnapshotForce is clockSnapshot; force skips the time throttle (never
+// the single in-flight bound: a running read supplies the maximum too).
+func (h *SensorHub) clockSnapshotForce(read func() ([]uint32, []uint32), force bool) []float64 {
 	h.mu.Lock()
 	current := h.currentMHz
 	now := time.Now()
-	launch := !h.clocking && (h.clockAt.IsZero() || now.Sub(h.clockAt) >= cpuClockFallbackEvery)
+	launch := !h.clocking && (force || h.clockAt.IsZero() || now.Sub(h.clockAt) >= cpuClockFallbackEvery)
 	if launch {
 		h.clocking, h.clockAt = true, now
 	}

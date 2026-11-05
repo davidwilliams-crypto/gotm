@@ -569,6 +569,9 @@ func TestNativeGPUNodeCache(t *testing.T) {
 		if !g.HasClock || g.ClockMHz != 1500 {
 			t.Fatalf("sample %d: clock %v %v", i, g.HasClock, g.ClockMHz)
 		}
+		if i < 4 {
+			now = now.Add(nativeGPUBackoff) // failed queries are retried after a short pause
+		}
 	}
 	if meta != 5 { // ordinals 0..3 plus the failing 4, once
 		t.Fatalf("node metadata queried %d times; want one scan", meta)
