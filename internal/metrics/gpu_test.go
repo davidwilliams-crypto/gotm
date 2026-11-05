@@ -3,6 +3,7 @@
 package metrics
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,28 +115,71 @@ func TestLiveGPUsOnThisMachine(t *testing.T) {
 	if len(ps.GPUs) == 0 {
 		t.Skip("no GPUs reported")
 	}
+	physical := 0
 	for _, g := range ps.GPUs {
 		t.Logf("%s [%s] id=%s ded %d/%d shr %d/%d pct %.1f engines=%d procs=%d drv=%q loc=%q temp=%v/%v power=%v clock=%v",
 			g.Name, g.Vendor, g.ID, g.DedicatedUsed, g.DedicatedTotal, g.SharedUsed, g.SharedTotal, g.Pct,
 			len(g.Engines), len(g.Procs), g.Driver, g.Location, g.HasTemp, g.TempC, g.HasPower, g.HasClock)
-		if g.Name == "" || g.DedicatedTotal+g.SharedTotal == 0 {
-			t.Errorf("adapter missing identity/memory: %+v", g)
+		if g.Name == "" {
+			t.Errorf("adapter missing identity: %+v", g)
+		}
+		if virtualDisplayAdapter(g.ID, g.Vendor == "Microsoft") {
+			continue // Hyper-V video / remote display: no memory sizes by design
+		}
+		physical++
+		if g.DedicatedTotal+g.SharedTotal == 0 {
+			t.Errorf("adapter missing memory: %+v", g)
 		}
 	}
+	if physical == 0 {
+		t.Skip("only virtual or remote display adapters on this machine")
+	}
+}
+
+// virtualDisplayAdapter recognises adapters that are not PCI hardware: VM
+// synthetic video (VMBus), remote/indirect displays (SWD, ROOT) and
+// Microsoft's own display transports. They have no PCI address or memory size.
+func virtualDisplayAdapter(id string, microsoft bool) bool {
+	u := strings.ToUpper(id)
+	return microsoft || strings.HasPrefix(u, `PNP:VMBUS\`) || strings.HasPrefix(u, `PNP:SWD\`) || strings.HasPrefix(u, `PNP:ROOT\`)
 }
 
 // The kernel's PCI address must agree with the registry's for each adapter.
 func TestAdapterAddressMatchesRegistry(t *testing.T) {
+	physical := 0
 	for _, st := range enumerateGPUs() {
-		if st.software {
+		if st.software || virtualDisplayAdapter(st.id, st.vendorID == 0x1414) {
+			t.Logf("%s (%s): virtual or remote display adapter, no PCI address", st.name, st.id)
 			continue
 		}
+		physical++
 		reg := pciLocation(st.vendorID, st.deviceID)
 		t.Logf("%s: kernel %s (bus %d), registry %s", st.name, st.location, st.bus, reg)
 		if st.bus < 0 {
 			t.Errorf("%s: no PCI address from D3DKMT", st.name)
 		} else if reg != "" && reg != st.location {
 			t.Errorf("%s: kernel says %s, registry %s", st.name, st.location, reg)
+		}
+	}
+	if physical == 0 {
+		t.Skip("only virtual or remote display adapters on this machine")
+	}
+}
+
+func TestVirtualDisplayAdapterClassification(t *testing.T) {
+	for _, tc := range []struct {
+		id        string
+		microsoft bool
+		want      bool
+	}{
+		{`PNP:VMBUS\{DA0A7802-E377-4AAC-8E77-0558EB1073F8}\{5620E0C7}`, false, true},
+		{`PNP:SWD\REMOTEDISPLAYENUM\RDPIDD_INDIRECTDISPLAY&SESSIONID_0002`, false, true},
+		{"0X00000000_0X0000D1E2", true, true},
+		{"0X00000000_0X0000D1E2", false, false},
+		{`PNP:PCI\VEN_102B&DEV_0534\4&1`, false, false}, // a real PCI device without a LUID is still checked
+	} {
+		if got := virtualDisplayAdapter(tc.id, tc.microsoft); got != tc.want {
+			t.Errorf("%s microsoft=%v: %v, want %v", tc.id, tc.microsoft, got, tc.want)
 		}
 	}
 }

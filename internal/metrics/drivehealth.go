@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -47,6 +49,8 @@ type DriveHealth struct {
 	PowerOnHrs  float64 `json:"powerOnHours"`
 	Unsafe      float64 `json:"unsafeShutdowns"`
 	MediaErrors float64 `json:"mediaErrors"`
+
+	stalled bool // the drive did not answer within driveReadTimeout
 }
 
 // storagePropertyQuery is STORAGE_PROPERTY_QUERY followed by room for
@@ -118,35 +122,170 @@ func busName(b uint32) string {
 // ReadDriveHealth queries physical drives enumerated by Windows and returns
 // what it could read. RAID controllers may expose only logical drives; member
 // sensors hidden by their firmware cannot be queried through this interface.
-func ReadDriveHealth() []DriveHealth {
-	var out []DriveHealth
+func ReadDriveHealth() []DriveHealth { return readDriveInventory(true) }
+
+const (
+	// driveReadTimeout bounds one inventory: a drive whose IOCTL hangs (a
+	// failing disk, a stuck RAID or USB bridge) is reported without readings
+	// instead of holding back every other drive.
+	driveReadTimeout = 4 * time.Second
+	// driveDescriptorTTL: model and bus are static for a drive, but an index
+	// can be reused after hot-plug, so cached descriptors expire.
+	driveDescriptorTTL = 5 * time.Minute
+)
+
+type driveCacheEntry struct {
+	desc DriveHealth // Index, Model, Bus only
+	at   time.Time
+	busy bool // a read of this drive is still blocked in the driver
+}
+
+var driveCache = struct {
+	sync.Mutex
+	m map[int]*driveCacheEntry
+}{m: map[int]*driveCacheEntry{}}
+
+// readDriveInventory reads every physical drive concurrently: full health
+// (temperature, NVMe SMART), or with full false only the model and bus. A
+// drive still blocked from an earlier read is not queried again until it
+// returns; meanwhile it is listed with its cached descriptor and no readings.
+func readDriveInventory(full bool) []DriveHealth {
 	indices, err := discoverPhysicalDrives()
 	if err != nil {
-		return out
+		return nil
 	}
-	for _, i := range indices {
-		h, err := openPhysical(i)
-		if err != nil {
+	return readDrivesWith(indices, full, driveReadTimeout, readOneDrive)
+}
+
+type driveResult struct {
+	i  int
+	d  DriveHealth
+	ok bool
+}
+
+func readDrivesWith(indices []int, full bool, timeout time.Duration, read func(idx int, full bool, desc *DriveHealth) (DriveHealth, bool)) []DriveHealth {
+	now := time.Now()
+	type job struct {
+		i, idx int
+		desc   *DriveHealth
+	}
+	var jobs []job
+	results := make([]DriveHealth, len(indices))
+	state := make([]int8, len(indices)) // 0 pending, 1 done, -1 skip (could not open)
+	driveCache.Lock()
+	live := make(map[int]bool, len(indices))
+	for i, idx := range indices {
+		live[idx] = true
+		e := driveCache.m[idx]
+		if e == nil {
+			e = &driveCacheEntry{}
+			driveCache.m[idx] = e
+		}
+		if e.busy {
+			results[i], state[i] = stalledDrive(e, idx), 1
 			continue
 		}
-		out = append(out, readOneDrive(h, i))
-		windows.CloseHandle(h)
+		e.busy = true
+		var desc *DriveHealth
+		if !e.at.IsZero() && now.Sub(e.at) < driveDescriptorTTL {
+			d := e.desc
+			desc = &d
+		}
+		jobs = append(jobs, job{i, idx, desc})
 	}
+	for idx, e := range driveCache.m {
+		if !live[idx] && !e.busy {
+			delete(driveCache.m, idx) // removed drive: forget its descriptor
+		}
+	}
+	driveCache.Unlock()
+
+	done := make(chan driveResult, len(jobs)) // buffered: a late reader never blocks
+	for _, j := range jobs {
+		go func(j job) {
+			d, ok := read(j.idx, full, j.desc)
+			driveCache.Lock()
+			if e := driveCache.m[j.idx]; e != nil {
+				e.busy = false
+				// Only a descriptor the drive actually returned (it names a bus) is cached.
+				if ok && d.Bus != "" && (j.desc == nil || d.Model != j.desc.Model || d.Bus != j.desc.Bus) {
+					e.desc, e.at = DriveHealth{Index: j.idx, Model: d.Model, Bus: d.Bus}, time.Now()
+				}
+			}
+			driveCache.Unlock()
+			done <- driveResult{j.i, d, ok}
+		}(j)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+wait:
+	for range jobs {
+		select {
+		case r := <-done:
+			if r.ok {
+				results[r.i], state[r.i] = r.d, 1
+			} else {
+				state[r.i] = -1
+			}
+		case <-timer.C:
+			break wait
+		}
+	}
+	out := make([]DriveHealth, 0, len(indices))
+	driveCache.Lock()
+	for i, idx := range indices {
+		switch state[i] {
+		case 1:
+			out = append(out, results[i])
+		case 0: // still blocked in the driver
+			e := driveCache.m[idx]
+			if e == nil {
+				e = &driveCacheEntry{}
+			}
+			out = append(out, stalledDrive(e, idx))
+		}
+	}
+	driveCache.Unlock()
 	return out
 }
 
-func readOneDrive(h windows.Handle, idx int) DriveHealth {
-	return readDriveHealth(idx, func(id uint32, extra []byte, outSize int) ([]byte, error) {
+// stalledDrive lists a drive that is not answering, without readings.
+func stalledDrive(e *driveCacheEntry, idx int) DriveHealth {
+	d := e.desc
+	d.Index = idx
+	if d.Model == "" {
+		d.Model = fmt.Sprintf("Physical drive %d", idx)
+	}
+	d.stalled = true
+	return d
+}
+
+// readOneDrive opens and reads one drive; false when it cannot be opened.
+func readOneDrive(idx int, full bool, desc *DriveHealth) (DriveHealth, bool) {
+	h, err := openPhysical(idx)
+	if err != nil {
+		return DriveHealth{}, false
+	}
+	defer windows.CloseHandle(h)
+	return readDriveHealthWith(idx, func(id uint32, extra []byte, outSize int) ([]byte, error) {
 		return storageQuery(h, id, extra, outSize)
-	})
+	}, desc, full), true
 }
 
 func readDriveHealth(idx int, query func(uint32, []byte, int) ([]byte, error)) DriveHealth {
+	return readDriveHealthWith(idx, query, nil, true)
+}
+
+// readDriveHealthWith takes model and bus from desc when given (instead of
+// querying the descriptor again) and stops after them unless full.
+func readDriveHealthWith(idx int, query func(uint32, []byte, int) ([]byte, error), desc *DriveHealth, full bool) DriveHealth {
 	d := DriveHealth{Index: idx}
 	le := binary.LittleEndian
 
 	// model + bus: STORAGE_DEVICE_DESCRIPTOR
-	if b, err := query(propStorageDevice, nil, 1024); err == nil && len(b) >= 36 {
+	if desc != nil {
+		d.Model, d.Bus = desc.Model, desc.Bus
+	} else if b, err := query(propStorageDevice, nil, 1024); err == nil && len(b) >= 36 {
 		str := func(off uint32) string {
 			if off == 0 || int(off) >= len(b) {
 				return ""
@@ -163,6 +302,9 @@ func readDriveHealth(idx int, query func(uint32, []byte, int) ([]byte, error)) D
 	}
 	if d.Model == "" {
 		d.Model = fmt.Sprintf("Physical drive %d", idx)
+	}
+	if !full {
+		return d
 	}
 
 	// temperature: DEVICE_TEMPERATURE_DATA_DESCRIPTOR (works for NVMe and many SATA)

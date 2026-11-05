@@ -3,8 +3,9 @@
 package metrics
 
 import (
+	"cmp"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -50,6 +51,15 @@ type perfCounters struct {
 	thermal, powerMeter     *pdhCounter
 	energy                  *pdhCounter
 	pdTime, pdRead, pdWrite *pdhCounter
+	byPID                   map[uint32]float64 // reused GPUByPID
+	rd, wr                  map[string]float64 // reused per-disk scratch
+	fqs                     []cpuFreqEntry
+	perfBy                  map[int]float64
+}
+
+type cpuFreqEntry struct {
+	order int
+	mhz   float64
 }
 
 func newPerfCounters() *perfCounters {
@@ -128,44 +138,23 @@ func (pc *perfCounters) read() perfSample {
 	//   pid_<pid>_luid_<hi>_<lo>_phys_<n>_eng_<n>_engtype_<type>
 	// A process's utilisation is the busiest engine type (summed within a type);
 	// the system figure is the busiest single engine across all processes.
-	engVals := pc.gpu.values()
-	dedVals := pc.gpuMem.values()
-	out.GPUs = pc.gpuRead.build(engVals, dedVals, pc.gpuShared.values(), pc.gpuPDed.values(), pc.gpuPShr.values())
+	// The process table's GPU column comes out of the same pass, over the same
+	// display-adapter set as the cards and recorder: unrelated PDH devices must
+	// not inflate just one view. The map is reused; the sampler consumes it
+	// within the tick.
+	if pc.byPID == nil {
+		pc.byPID = map[uint32]float64{}
+	}
+	out.GPUs = pc.gpuRead.buildInto(pc.gpu.values(), pc.gpuMem.values(), pc.gpuShared.values(), pc.gpuPDed.values(), pc.gpuPShr.values(), pc.byPID)
 	out.GPU = summarizeGPUs(out.GPUs)
-	visible := make(map[string]bool, len(out.GPUs))
-	for _, g := range out.GPUs {
-		visible[g.ID] = true
-	}
-	byPID := map[uint32]map[string]float64{}
-	for _, it := range engVals {
-		// Use the same display-adapter set for the process table, cards and
-		// recorder; unrelated PDH devices must not inflate just one view.
-		pid, _, typ, ok := parseGPUInstance(it.Instance)
-		if !ok || !visible[luidKey(it.Instance)] || !validGPUCounter(it.Value) {
-			continue
-		}
-		if byPID[pid] == nil {
-			byPID[pid] = map[string]float64{}
-		}
-		byPID[pid][typ] += it.Value
-	}
-	out.GPUByPID = make(map[uint32]float64, len(byPID))
-	for pid, types := range byPID {
-		var best float64
-		for _, v := range types {
-			if v > best {
-				best = v
-			}
-		}
-		out.GPUByPID[pid] = math.Min(best, 100)
-	}
+	out.GPUByPID = pc.byPID
 
 	// per-logical-processor clock: instances are "<group>,<index>" plus totals
-	type fq struct {
-		order int
-		mhz   float64
+	if pc.perfBy == nil {
+		pc.perfBy = map[int]float64{}
 	}
-	perfBy := map[int]float64{}
+	perfBy := pc.perfBy
+	clear(perfBy)
 	var perfTotal float64
 	var haveTotal bool
 	for _, it := range pc.cpuPerf.values() {
@@ -177,7 +166,7 @@ func (pc *perfCounters) read() perfSample {
 			perfBy[g*1024+i] = it.Value
 		}
 	}
-	var fqs []fq
+	fqs := pc.fqs[:0]
 	for _, it := range pc.cpuFreq.values() {
 		g, i, ok := parseCPUInstance(it.Instance)
 		if !ok {
@@ -187,9 +176,13 @@ func (pc *perfCounters) read() perfSample {
 		if p, ok := perfBy[g*1024+i]; ok && p > 0 {
 			mhz = it.Value * p / 100
 		}
-		fqs = append(fqs, fq{g*1024 + i, mhz})
+		fqs = append(fqs, cpuFreqEntry{g*1024 + i, mhz})
 	}
-	sort.Slice(fqs, func(i, j int) bool { return fqs[i].order < fqs[j].order })
+	slices.SortFunc(fqs, func(a, b cpuFreqEntry) int { return cmp.Compare(a.order, b.order) })
+	pc.fqs = fqs
+	if len(fqs) > 0 {
+		out.CPUFreq = make([]float64, 0, len(fqs))
+	}
 	for _, f := range fqs {
 		out.CPUFreq = append(out.CPUFreq, math.Round(f.mhz))
 	}
@@ -216,8 +209,13 @@ func (pc *perfCounters) read() perfSample {
 		out.PerDisk = append(out.PerDisk, DiskStat{Name: it.Instance, Percent: active})
 		out.Disk.Percent = math.Max(out.Disk.Percent, active) // the busiest disk, as Task Manager's summary
 	}
-	sort.Slice(out.PerDisk, func(i, j int) bool { return out.PerDisk[i].Name < out.PerDisk[j].Name })
-	rd, wr := map[string]float64{}, map[string]float64{}
+	slices.SortFunc(out.PerDisk, func(a, b DiskStat) int { return strings.Compare(a.Name, b.Name) })
+	if pc.rd == nil {
+		pc.rd, pc.wr = map[string]float64{}, map[string]float64{}
+	}
+	rd, wr := pc.rd, pc.wr
+	clear(rd)
+	clear(wr)
 	for _, it := range pc.pdRead.values() {
 		rd[it.Instance] = it.Value
 	}
@@ -272,25 +270,4 @@ func skipNIC(name string) bool {
 		}
 	}
 	return false
-}
-
-func parseGPUInstance(s string) (pid uint32, engine, engType string, ok bool) {
-	if !strings.HasPrefix(s, "pid_") {
-		return
-	}
-	rest := s[4:]
-	i := strings.IndexByte(rest, '_')
-	if i <= 0 {
-		return
-	}
-	p, err := strconv.ParseUint(rest[:i], 10, 32)
-	if err != nil {
-		return
-	}
-	engine = rest[i+1:]
-	j := strings.LastIndex(s, "engtype_")
-	if j < 0 {
-		return
-	}
-	return uint32(p), engine, s[j+len("engtype_"):], true
 }

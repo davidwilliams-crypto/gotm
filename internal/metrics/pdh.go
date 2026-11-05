@@ -4,7 +4,6 @@ package metrics
 
 import (
 	"fmt"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -34,7 +33,26 @@ const (
 // "no data" values; callers treat that as zero.
 type pdhQuery struct{ h uintptr }
 
-type pdhCounter struct{ h uintptr }
+// pdhCounter keeps its formatted-array buffer, its result slice and its
+// instance names between collections: the instance set barely changes from
+// one tick to the next, so steady-state reads allocate nothing.
+type pdhCounter struct {
+	h     uintptr
+	buf   []byte                // grow-only PdhGetFormattedCounterArray buffer
+	out   []PDHInstanceValue    // reused result: valid until the next values call
+	names map[string]*pdhIntern // keyed by the raw UTF-16LE name bytes
+	calls uint32
+}
+
+// pdhIntern is one decoded instance name and the collection it was last seen in.
+type pdhIntern struct {
+	s    string
+	seen uint32
+}
+
+// pdhInternSweepEvery bounds the interning table: names absent from the most
+// recent collection are dropped every this many collections.
+const pdhInternSweepEvery = 64
 
 type PDHInstanceValue struct {
 	Instance string
@@ -93,43 +111,49 @@ func (c *pdhCounter) value() (float64, bool) {
 }
 
 // values reads a wildcard counter (e.g. "\GPU Engine(*)\Utilization Percentage").
-// The instance set can grow between the sizing call and the fill call (a new
-// GPU-engine process, a new NIC), so the pair is retried a bounded number of
-// times instead of dropping the whole collection for one poll.
+// The counter's previous buffer is tried first; PDH_MORE_DATA (the instance
+// set grew, or this is the first read) resizes it and retries a bounded
+// number of times instead of dropping the whole collection for one poll.
+//
+// The returned slice is reused by the next call on the same counter: callers
+// consume it within the sample and never retain it. Instance strings are
+// interned and immutable, so retaining those is fine.
 func (c *pdhCounter) values() []PDHInstanceValue {
 	if c == nil {
 		return nil
 	}
-	var buf []byte
 	var size, count uint32
 	filled := false
 	for attempt := 0; attempt < 4; attempt++ {
-		var r1, r2 uintptr
-		r1, _, _ = procPdhGetFormattedArray.Call(c.h, pdhFmtDouble,
-			uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)), 0)
-		if uint32(r1) != pdhMoreData || size == 0 {
-			return nil
+		size = uint32(len(c.buf))
+		var p uintptr
+		if size > 0 {
+			p = uintptr(unsafe.Pointer(&c.buf[0]))
 		}
-		buf = make([]byte, size)
-		r2, _, _ = procPdhGetFormattedArray.Call(c.h, pdhFmtDouble,
-			uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)),
-			uintptr(unsafe.Pointer(&buf[0])))
-		if r2 == 0 {
+		r, _, _ := procPdhGetFormattedArray.Call(c.h, pdhFmtDouble,
+			uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)), p)
+		if r == 0 {
 			filled = true
 			break
 		}
-		if uint32(r2) != pdhMoreData {
+		if uint32(r) != pdhMoreData || size == 0 {
 			return nil
 		}
-		// PDH_MORE_DATA again: instances appeared between the two calls; the
-		// partially written buffer is not trusted, size again and refill.
-		buf = nil
+		// A partially written buffer is not trusted: grow (with headroom, so a
+		// process starting on the GPU does not force a second round trip next
+		// tick) and fill again.
+		c.buf = make([]byte, int(size)+int(size)/4+512)
 	}
-	if !filled {
+	if !filled || len(c.buf) == 0 {
 		return nil
 	}
+	buf := c.buf // names point inside it; the item array is bounded by count
+	c.calls++
+	if c.names == nil {
+		c.names = make(map[string]*pdhIntern, count)
+	}
 	base := uintptr(unsafe.Pointer(&buf[0]))
-	out := make([]PDHInstanceValue, 0, count)
+	out := c.out[:0]
 	for i := uint32(0); i < count; i++ {
 		if int(i)*pdhItemSize+pdhItemSize > len(buf) {
 			break // more instances reported than the buffer holds: stop at the end
@@ -144,12 +168,45 @@ func (c *pdhCounter) values() []PDHInstanceValue {
 		// The name string is stored inside buf, after the item array.
 		var name string
 		if namePtr >= base && namePtr < base+uintptr(len(buf)) {
-			off := int(namePtr - base)
-			name = utf16At(buf, off)
+			name = c.intern(buf, int(namePtr-base))
 		}
 		out = append(out, PDHInstanceValue{Instance: name, Value: val})
 	}
+	c.out = out
+	c.sweep()
 	return out
+}
+
+// sweep forgets, every pdhInternSweepEvery collections, the names that were
+// not part of the latest one (exited processes, removed devices).
+func (c *pdhCounter) sweep() {
+	if c.calls%pdhInternSweepEvery != 0 {
+		return
+	}
+	for k, e := range c.names {
+		if e.seen != c.calls {
+			delete(c.names, k)
+		}
+	}
+}
+
+// intern returns the decoded NUL-terminated UTF-16LE name at off. The lookup
+// by raw bytes does not allocate; only a name not seen before is decoded.
+func (c *pdhCounter) intern(b []byte, off int) string {
+	if off < 0 || off >= len(b) {
+		return ""
+	}
+	end := off
+	for end+1 < len(b) && (b[end] != 0 || b[end+1] != 0) {
+		end += 2
+	}
+	if e := c.names[string(b[off:end])]; e != nil {
+		e.seen = c.calls
+		return e.s
+	}
+	s := utf16At(b, off)
+	c.names[string(b[off:end])] = &pdhIntern{s: s, seen: c.calls}
+	return s
 }
 
 // utf16At decodes a NUL-terminated UTF-16LE string starting at off in b.
@@ -167,12 +224,11 @@ func utf16At(b []byte, off int) string {
 		end += 2
 	}
 	if ascii {
-		var out strings.Builder
-		out.Grow((end - off) / 2)
-		for i := off; i < end; i += 2 {
-			out.WriteByte(b[i])
+		out := make([]byte, (end-off)/2)
+		for i := range out {
+			out[i] = b[off+2*i]
 		}
-		return out.String()
+		return unsafe.String(unsafe.SliceData(out), len(out)) // out is never written again
 	}
 	u := make([]uint16, (end-off)/2)
 	for i := off; i < end; i += 2 {
