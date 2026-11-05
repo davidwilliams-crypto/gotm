@@ -22,6 +22,7 @@ type powerPage struct {
 	collapsed map[string]bool
 	rows      []metrics.SensorRow
 	kinds     map[string]string // id -> kind, for colouring
+	labels    map[string]sensorLabel
 	bExpand   *button
 	bFold     *button
 }
@@ -31,7 +32,7 @@ func newPowerPage(a *App) *powerPage {
 		col("Sensor", 460), colR("Value", 130), colR("Min", 130), colR("Max", 130),
 	})
 	// per-thread utilisation is long and also on the Performance page: start folded
-	p := &powerPage{gridPage: g, collapsed: map[string]bool{"cpu.load": true}, kinds: map[string]string{}}
+	p := &powerPage{gridPage: g, collapsed: map[string]bool{"cpu.load": true}, kinds: map[string]string{}, labels: map[string]sensorLabel{}}
 	g.noSort = true
 	g.filterPlaceholder = "Search sensors"
 	g.onFilter = func() { p.render() }
@@ -82,6 +83,7 @@ func sensorColor(kind string) walk.Color {
 func (p *powerPage) build() decl.Widget { return p.gridPage.build() }
 func (p *powerPage) init()              { p.gridPage.init() }
 func (p *powerPage) shown()             { p.render() }
+func (p *powerPage) prefill()           { p.render() }
 func (p *powerPage) reload()            { p.render() }
 func (p *powerPage) tick(s *metrics.Snapshot) {
 	p.render()
@@ -114,10 +116,12 @@ func (p *powerPage) render() {
 		return
 	}
 	q := p.filterText()
-	var out [][]string
-	hiddenBelow := -1 // depth of the collapsed group currently being skipped
-	matchDepth := -1  // a matching group keeps its whole subtree while searching
-	for _, r := range p.rows {
+	out := make([][]string, 0, len(p.rows))
+	cells := make([]string, 0, 7*len(p.rows)) // one backing array for every row
+	hiddenBelow := -1                         // depth of the collapsed group currently being skipped
+	matchDepth := -1                          // a matching group keeps its whole subtree while searching
+	for i := range p.rows {
+		r := &p.rows[i]
 		if q == "" && hiddenBelow >= 0 && r.Depth > hiddenBelow {
 			continue
 		}
@@ -133,20 +137,21 @@ func (p *powerPage) render() {
 				continue
 			}
 		}
-		name := strings.Repeat("    ", r.Depth) + r.Name
 		g := ""
+		folded := false
 		if r.Group {
 			g = "g"
-			caret := "▼ "
 			if q == "" && p.collapsed[r.ID] {
-				caret = "▶ "
+				folded = true
 				hiddenBelow = r.Depth
 			}
-			name = strings.Repeat("    ", r.Depth) + caret + r.Name
-		} else {
-			name = strings.Repeat("    ", r.Depth) + "   " + r.Name
 		}
-		out = append(out, []string{name, r.Value, r.Min, r.Max, r.ID, r.Kind, g})
+		at := len(cells)
+		cells = append(cells, p.label(r, folded), r.Value, r.Min, r.Max, r.ID, r.Kind, g)
+		out = append(out, cells[at:at+7:at+7])
+	}
+	if len(p.labels) > 2*len(p.rows)+64 {
+		clear(p.labels) // sensors that disappeared
 	}
 	if q != "" { // while filtering, drop group headers that ended up empty
 		out = pruneEmptyGroups(out)
@@ -155,6 +160,34 @@ func (p *powerPage) render() {
 		p.model.set(out)
 	}
 	p.setResultStatus(fmt.Sprintf("%d rows · double-click a group to fold or unfold it · Min/Max are since gotm started", len(out)))
+}
+
+// sensorLabel is a cached indented sensor name.
+type sensorLabel struct {
+	depth  int
+	name   string
+	group  bool
+	folded bool
+	text   string
+}
+
+// label returns r's indented name (with the fold caret for groups), reusing
+// the string built on an earlier tick while nothing about it changed.
+func (p *powerPage) label(r *metrics.SensorRow, folded bool) string {
+	if l, ok := p.labels[r.ID]; ok && l.depth == r.Depth && l.name == r.Name && l.group == r.Group && l.folded == folded {
+		return l.text
+	}
+	indent := strings.Repeat("    ", r.Depth)
+	text := indent + "   " + r.Name
+	if r.Group {
+		caret := "▼ "
+		if folded {
+			caret = "▶ "
+		}
+		text = indent + caret + r.Name
+	}
+	p.labels[r.ID] = sensorLabel{depth: r.Depth, name: r.Name, group: r.Group, folded: folded, text: text}
+	return text
 }
 
 func pruneEmptyGroups(rows [][]string) [][]string {
@@ -199,6 +232,7 @@ type connsPage struct {
 	loading    bool
 	last       time.Time
 	names      map[uint32]string
+	namesOf    *metrics.Snapshot // snapshot names was built from
 	all        []metrics.Connection
 }
 
@@ -237,10 +271,7 @@ func (p *connsPage) build() decl.Widget { return p.gridPage.build() }
 func (p *connsPage) init()              { p.gridPage.init() }
 func (p *connsPage) shown()             { p.load() }
 func (p *connsPage) tick(s *metrics.Snapshot) {
-	p.names = make(map[uint32]string, len(s.Procs))
-	for _, pr := range s.Procs {
-		p.names[pr.PID] = pr.Name
-	}
+	// The PID -> name map is built by apply, only when connections are shown.
 	if time.Since(p.last) > 2*time.Second {
 		p.load()
 	}
@@ -270,6 +301,15 @@ func (p *connsPage) load() {
 func (p *connsPage) apply() {
 	if p.loading && len(p.all) == 0 {
 		return
+	}
+	if s := p.app.snap; s != p.namesOf {
+		p.namesOf = s
+		clear(p.names)
+		if s != nil {
+			for i := range s.Procs {
+				p.names[s.Procs[i].PID] = s.Procs[i].Name
+			}
+		}
 	}
 	q := p.filterText()
 	listen, noLoop := p.listenOnly.active, p.hideLocal.active

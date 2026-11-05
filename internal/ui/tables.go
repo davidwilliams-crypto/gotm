@@ -128,6 +128,9 @@ func colorTable(tv *walk.TableView) {
 		win.SendMessage(lv, win.LVM_SETBKCOLOR, 0, colorref(T.TableBG))
 		win.SendMessage(lv, win.LVM_SETTEXTBKCOLOR, 0, colorref(T.TableBG))
 		win.SendMessage(lv, win.LVM_SETTEXTCOLOR, 0, colorref(T.Text))
+		// Rows repaint only when their content changes, so a new palette must
+		// repaint the whole list once.
+		win.InvalidateRect(lv, nil, true)
 	}
 }
 
@@ -158,12 +161,26 @@ var (
 	tvHookCB   uintptr
 	tvPrev     = map[win.HWND]uintptr{}
 	tvIndent   = map[win.HWND]func(row int) int{}
+	tvImage    = map[win.HWND]func(row int) int32{}
+	tvImageLVs = map[win.HWND][]win.HWND{}
 )
 
 // indentRows makes the first column of tv indent each row by depth(row) icon widths.
 func indentRows(tv *walk.TableView, depth func(row int) int) {
 	hookTable(tv)
 	tvIndent[tv.Handle()] = depth
+}
+
+// iconRows shows the shared process icon list in tv's first column; slot
+// gives each row's image-list index. Walk's own image handling is bypassed
+// (the model has no Image method) so icon slots can be reused safely.
+func iconRows(tv *walk.TableView, post func(func()) bool, resolved func(), slot func(row int) int32) {
+	hookTable(tv)
+	lvs := listViews(tv)
+	procIcons.attach(lvs, post, resolved)
+	h := win.HWND(tv.Handle())
+	tvImage[h] = slot
+	tvImageLVs[h] = lvs
 }
 
 func hookTable(tv *walk.TableView) {
@@ -183,10 +200,17 @@ func tvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 		// past WM_NCDESTROY the hook is unregistered; call nothing's wndproc
 		return win.DefWindowProc(h, uint32(msg), wp, lp)
 	}
+	if msg == win.WM_DESTROY {
+		for _, lv := range tvImageLVs[h] { // children still exist here
+			procIcons.release(lv)
+		}
+	}
 	r := win.CallWindowProc(prev, h, uint32(msg), wp, lp)
 	if msg == win.WM_NCDESTROY {
 		delete(tvPrev, h)
 		delete(tvIndent, h)
+		delete(tvImage, h)
+		delete(tvImageLVs, h)
 		return r
 	}
 	if msg == win.WM_NOTIFY && lp != 0 {
@@ -207,6 +231,9 @@ func tvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 				if f := tvIndent[h]; f != nil {
 					di.Item.IIndent = int32(f(int(di.Item.IItem)))
 					di.Item.Mask |= win.LVIF_INDENT
+				}
+				if f := tvImage[h]; f != nil && di.Item.Mask&win.LVIF_IMAGE != 0 {
+					di.Item.IImage = f(int(di.Item.IItem))
 				}
 			}
 		}

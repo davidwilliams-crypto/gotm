@@ -3,6 +3,8 @@
 package ui
 
 import (
+	"fmt"
+
 	"github.com/tailscale/walk"
 	decl "github.com/tailscale/walk/declarative"
 	"github.com/tailscale/win"
@@ -131,9 +133,41 @@ func TestNativeTableNavigationYieldsToMessages(t *testing.T) {
 		if during == 0 {
 			t.Fatal("native window messages were not dispatched between table creation stages")
 		}
-		t.Logf("staged Processes total=%s longest callback=%s dispatched probes=%d", time.Since(start), build.maxSlice, during)
+		t.Logf("staged Processes total=%s longest callback=%s callbacks=%d dispatched probes=%d", time.Since(start), build.maxSlice, build.slices, during)
+		checkStepIsolation(t, build)
+		if len(a.procs.model.rows) != 2000 {
+			t.Errorf("first rows not built: %d", len(a.procs.model.rows))
+		}
 	})
 }
+
+// checkStepIsolation verifies that the large construction steps each ran in a
+// timer callback of their own, in order, and logs every step's duration.
+func checkStepIsolation(t *testing.T, b *pageConstruction) {
+	t.Helper()
+	perSlice := map[int]int{}
+	for _, s := range b.timings {
+		perSlice[s.slice]++
+	}
+	var order []string
+	for _, s := range b.timings {
+		if s.took > time.Millisecond {
+			t.Logf("  step %-28s %8s (callback %d)", s.name, s.took, s.slice)
+		}
+		switch s.name {
+		case "declarative.TableView", "init", "rows", "show", "focus":
+			order = append(order, s.name)
+			if perSlice[s.slice] != 1 {
+				t.Errorf("step %s shared callback %d with %d other steps", s.name, s.slice, perSlice[s.slice]-1)
+			}
+		}
+	}
+	want := []string{"declarative.TableView", "init", "rows", "show", "focus"}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Errorf("isolated steps ran as %v, want %v", order, want)
+	}
+}
+
 func TestNativeNavigationCancelsPartialTable(t *testing.T) {
 	runNativeTest(t, func() {
 		mw, e := walk.NewMainWindow()

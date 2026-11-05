@@ -3,7 +3,7 @@
 package ui
 
 import (
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -30,6 +30,26 @@ type gridModel struct {
 	setCheck  func(row int, v bool) error
 	// tint returns an optional foreground colour for a cell.
 	tint func(row, col int, text string) (walk.Color, bool)
+
+	paint paintDiff // what the visible rows show
+	// sort scratch, reused between refreshes
+	keys []gridKey
+	perm []int32
+	// the slice update last sorted, so a following set need not sort again
+	sorted gridSorted
+}
+
+type gridKey struct {
+	num  float64
+	ok   bool   // num is valid (numeric columns)
+	text string // lower-cased cell text otherwise
+}
+
+type gridSorted struct {
+	first *[]string
+	n     int
+	col   int
+	desc  bool
 }
 
 func (m *gridModel) RowCount() int { return len(m.rows) }
@@ -64,46 +84,91 @@ func (m *gridModel) Sort(col int, order walk.SortOrder) error {
 	return m.SorterBase.Sort(col, order)
 }
 
-func (m *gridModel) resort() {
-	if m.sortCol < 0 {
+func (m *gridModel) resort() { m.sortRows(m.rows) }
+
+// sortRows orders rows by the sorted column in place: numbers (with units)
+// numerically, unavailable values last in either direction, text without
+// regard to case; equal rows keep their order. Each row's key is computed
+// once (decorate-sort) rather than in every comparison.
+func (m *gridModel) sortRows(rows [][]string) {
+	m.sorted = gridSorted{}
+	if m.sortCol < 0 || len(rows) < 2 {
 		return
 	}
-	c, desc := m.sortCol, m.sortDesc
-	sort.SliceStable(m.rows, func(i, j int) bool {
-		a, b := cell(m.rows[i], c), cell(m.rows[j], c)
-		var less bool
-		if m.numeric[c] {
-			av, aok := sortValue(a)
-			bv, bok := sortValue(b)
-			if aok != bok {
-				return aok
-			} // unavailable values stay at the bottom
-			if aok && bok {
-				if av == bv {
-					return false
-				}
-				less = av < bv
-			} else {
-				la, lb := strings.ToLower(a), strings.ToLower(b)
-				if la == lb {
-					return false
-				}
-				less = la < lb
+	c, desc, numeric := m.sortCol, m.sortDesc, m.numeric[m.sortCol]
+	keys := m.keys[:0]
+	for _, r := range rows {
+		s := cell(r, c)
+		var k gridKey
+		if numeric {
+			k.num, k.ok = sortValue(s)
+		}
+		if !k.ok {
+			k.text = strings.ToLower(s)
+		}
+		keys = append(keys, k)
+	}
+	perm := m.perm[:0]
+	for i := range rows {
+		perm = append(perm, int32(i))
+	}
+	slices.SortFunc(perm, func(i, j int32) int {
+		a, b := &keys[i], &keys[j]
+		if a.ok != b.ok { // only numeric columns parse; unavailable stays at the bottom
+			if a.ok {
+				return -1
 			}
+			return 1
+		}
+		var v int
+		if a.ok {
+			v = cmpFloat(a.num, b.num)
 		} else {
-			la, lb := strings.ToLower(a), strings.ToLower(b)
-			if la == lb {
-				return false
-			}
-			less = la < lb
+			v = strings.Compare(a.text, b.text)
 		}
 		if desc {
-			return !less
+			v = -v
 		}
-		return less
+		if v != 0 {
+			return v
+		}
+		return int(i - j)
 	})
+	permute(rows, perm)
+	clear(keys) // do not pin the previous rows' text
+	m.keys, m.perm = keys, perm
+	m.sorted = gridSorted{first: &rows[0], n: len(rows), col: c, desc: desc}
 }
 
+// permute reorders s so that s'[k] = s[perm[k]], in place; perm is consumed.
+func permute[T any](s []T, perm []int32) {
+	for k := range perm {
+		if perm[k] < 0 || int(perm[k]) == k {
+			continue
+		}
+		tmp := s[k]
+		j := k
+		for {
+			src := int(perm[j])
+			perm[j] = -1
+			if src == k {
+				s[j] = tmp
+				break
+			}
+			s[j] = s[src]
+			j = src
+		}
+	}
+}
+
+// presorted reports whether rows is exactly the slice sortRows last ordered
+// under the current sort.
+func (m *gridModel) presorted(rows [][]string) bool {
+	if m.sortCol < 0 || len(rows) < 2 {
+		return true
+	}
+	return m.sorted.first == &rows[0] && m.sorted.n == len(rows) && m.sorted.col == m.sortCol && m.sorted.desc == m.sortDesc
+}
 func cell(r []string, c int) string {
 	if c >= 0 && c < len(r) {
 		return r[c]
@@ -154,16 +219,55 @@ func (m *gridModel) StyleCell(st *walk.CellStyle) {
 	if m.tv != nil {
 		sel = m.tv.CurrentIndex()
 	}
-	bg, fg := rowStyle(row, sel)
+	st.BackgroundColor, st.TextColor = m.cellColors(row, col, sel)
+}
+
+func (m *gridModel) cellColors(row, col, sel int) (bg, fg walk.Color) {
+	bg, fg = rowStyle(row, sel)
 	if m.tint != nil && row != sel {
 		if c, ok := m.tint(row, col, cell(m.rows[row], col)); ok {
 			fg = c
 		}
 	}
-	st.BackgroundColor, st.TextColor = bg, fg
+	return bg, fg
 }
 
-// set replaces the rows, keeping the sort order and (when visible) the selection.
+// rowSigs describes a visible row for paintDiff.
+func (m *gridModel) rowSigs(row int, vis []int, out []uint64) {
+	sel := m.tv.CurrentIndex()
+	own := uint64(2)
+	if row == sel {
+		own |= 1
+	}
+	if m.isChecked != nil && m.isChecked(row) {
+		own |= 4
+	}
+	out[0] = own * 0x9E3779B97F4A7C15
+	r := m.rows[row]
+	for k, c := range vis {
+		bg, fg := m.cellColors(row, c, sel)
+		out[k+1] = cellSig(cell(r, c), bg, fg)
+	}
+}
+
+// repaintAsync is repaint from inside a list-view notification.
+func (m *gridModel) repaintAsync() {
+	if m.tv != nil {
+		m.paint.repaintAsync(m.tv, len(m.rows), m)
+	}
+}
+
+// repaint redraws the visible rows whose content changed.
+func (m *gridModel) repaint() {
+	if m.tv != nil {
+		m.paint.repaint(m.tv, len(m.rows), m)
+	}
+}
+
+// set replaces the rows, keeping the sort order and the selection. The list
+// view is not reset: a changed row count is published as rows added or
+// removed at the end, only changed cells repaint, and the selected row is
+// re-selected at its new position without scrolling.
 func (m *gridModel) set(rows [][]string) {
 	var selKey string
 	if m.tv != nil {
@@ -171,36 +275,52 @@ func (m *gridModel) set(rows [][]string) {
 			selKey = cell(m.rows[i], m.keyCol)
 		}
 	}
+	if !m.presorted(rows) {
+		m.sortRows(rows)
+	}
+	m.sorted = gridSorted{}
+	oldCount := len(m.rows)
 	m.rows = rows
-	m.resort()
-	m.PublishRowsReset()
 	if m.tv == nil {
+		m.PublishRowsReset()
 		return
 	}
-	redrawVisible(m.tv)
+	switch {
+	case len(rows) > oldCount:
+		m.PublishRowsInserted(oldCount, len(rows)-1)
+	case len(rows) < oldCount:
+		m.PublishRowsRemoved(len(rows), oldCount-1)
+	}
+	want := -1
 	if selKey != "" {
-		for i := range m.rows {
-			if cell(m.rows[i], m.keyCol) == selKey {
-				// re-select without scrolling: SetCurrentIndex would bring the row
-				// into view on every refresh, yanking the list back while scrolling
-				selectQuietly(m.tv, i)
-				return
+		for i := range rows {
+			if cell(rows[i], m.keyCol) == selKey {
+				want = i
+				break
 			}
 		}
 	}
-	_ = m.tv.SetCurrentIndex(-1)
+	if want != m.tv.CurrentIndex() {
+		if want >= 0 {
+			// re-select without scrolling: SetCurrentIndex would bring the row
+			// into view on every refresh, yanking the list back while scrolling
+			selectQuietly(m.tv, want)
+		} else {
+			_ = m.tv.SetCurrentIndex(-1)
+		}
+	}
+	m.repaint()
 }
 
 // update copies new cell text over the existing rows when the row identities
-// (key column) are unchanged, so only values repaint. It reports whether it did.
+// (key column) are unchanged, so only changed values repaint. It reports
+// whether it did; otherwise the rows are left sorted for set.
 func (m *gridModel) update(rows [][]string) bool {
 	if m.keyCol < 0 {
 		return false
 	}
 	// Compare identities in the displayed sort order, rather than API order.
-	tmp := *m
-	tmp.rows = rows
-	tmp.resort()
+	m.sortRows(rows)
 	if len(rows) != len(m.rows) {
 		return false
 	}
@@ -209,10 +329,9 @@ func (m *gridModel) update(rows [][]string) bool {
 			return false
 		}
 	}
+	m.sorted = gridSorted{}
 	m.rows = rows
-	if m.tv != nil {
-		redrawVisible(m.tv)
-	}
+	m.repaint()
 	return true
 }
 
@@ -295,9 +414,7 @@ func (g *gridPage) build() decl.Widget {
 				if g.onSelect != nil {
 					g.onSelect()
 				}
-				if g.tv != nil {
-					redrawVisible(g.tv)
-				}
+				g.model.repaintAsync() // the previous and the new selected row
 			},
 		},
 		decl.Label{AssignTo: &g.status, TextColor: T.Muted, EllipsisMode: decl.EllipsisEnd},
