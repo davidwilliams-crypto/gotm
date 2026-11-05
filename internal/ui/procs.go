@@ -5,6 +5,7 @@ package ui
 import (
 	"cmp"
 	"fmt"
+	"hash/maphash"
 	"strconv"
 	"strings"
 	"time"
@@ -196,7 +197,9 @@ func (m *procModel) Sort(col int, order walk.SortOrder) error {
 	m.sortCol, m.sortOrder = col, order
 	m.tab.app.cfg.SortKey = m.cols[col].key
 	m.tab.app.cfg.SortDesc = order == walk.SortDescending
-	m.tab.refresh()
+	// A header click arrives as a list-view notification (LVN_COLUMNCLICK):
+	// the repaint must not flush bands with UpdateWindow from inside it.
+	inListMessage(m.tab.refresh)
 	return m.SorterBase.Sort(col, order)
 }
 
@@ -273,6 +276,15 @@ func (m *procModel) rowSigs(row int, vis []int, out []uint64) {
 		bg, fg := m.cellColors(row, c, sel)
 		out[k+1] = cellSig(m.text(row, c), bg, fg)
 	}
+}
+
+// rowID identifies a row by its process (or group) key, for paintDiff's
+// reorder announcements.
+func (m *procModel) rowID(row int) uint64 {
+	if row < 0 || row >= len(m.rows) {
+		return 0
+	}
+	return maphash.String(sigSeed, m.rows[row].Key)
 }
 
 // ---- tab -------------------------------------------------------------------
@@ -443,6 +455,7 @@ func (t *procsTab) init() {
 	}, t.model.iconSlot)
 	t.model.ready = true
 	_ = t.model.SorterBase.Sort(t.model.sortCol, t.model.sortOrder) // shows the sort arrow
+	onFullRepaint(tv, t.syncPaint)
 	t.syncToggles()
 }
 
@@ -450,8 +463,20 @@ func (t *procsTab) searchBox() *walk.LineEdit { return t.filter }
 func (t *procsTab) focusTarget() walk.Window  { return t.tv }
 func (t *procsTab) reload()                   { t.refresh() }
 
-func (t *procsTab) shown()                 {} // showPage immediately delivers the latest snapshot through tick.
+// shown records the rows the page's exposure paints; showPage then delivers
+// the latest snapshot through tick, which repaints only what changed.
+func (t *procsTab) shown()                 { t.syncPaint() }
 func (t *procsTab) tick(*metrics.Snapshot) { t.refresh() }
+
+// syncPaint records the visible rows as painted after the whole list was
+// invalidated or exposed (paintDiff.markPainted).
+func (t *procsTab) syncPaint() {
+	if t.tv == nil || !t.model.ready {
+		return
+	}
+	procIcons.touchGeneration()
+	t.paint.markPainted(t.tv, len(t.model.rows), t.model)
+}
 
 func (t *procsTab) syncToggles() {
 	t.bTreeView.set(true, t.app.cfg.TreeView)
@@ -493,6 +518,10 @@ func (t *procsTab) refresh() {
 		return
 	}
 	m := t.model
+	// Rows that scrolled or were laid out into view since the last repaint
+	// show the model as it is now: record them before it changes.
+	procIcons.touchGeneration()
+	t.paint.observe(t.tv, len(m.rows), m)
 	m.layout = t.layout()
 	m.totalMem = t.app.host.TotalMem
 	rows := t.builder.Build(s.Procs, metrics.View{
@@ -676,6 +705,8 @@ func (t *procsTab) collapseAll() {
 	t.refresh()
 }
 
+// onKeyDown runs inside the list view's own WM_KEYDOWN: rows refreshed from
+// here repaint without flushing bands (no re-entrant UpdateWindow).
 func (t *procsTab) onKeyDown(key walk.Key) {
 	r := t.selected()
 	switch key {
@@ -683,14 +714,14 @@ func (t *procsTab) onKeyDown(key walk.Key) {
 		t.endTask()
 	case walk.KeyLeft:
 		if r != nil && t.app.cfg.TreeView && r.HasKids && !r.Collapsed {
-			t.toggleSelected()
+			inListMessage(t.toggleSelected)
 		}
 	case walk.KeyRight:
 		if r != nil && t.app.cfg.TreeView && r.HasKids && r.Collapsed {
-			t.toggleSelected()
+			inListMessage(t.toggleSelected)
 		}
 	case walk.KeyF5:
-		t.refresh()
+		inListMessage(t.refresh)
 	}
 }
 

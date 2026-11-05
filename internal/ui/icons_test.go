@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/tailscale/walk"
 	"github.com/tailscale/win"
 	"golang.org/x/sys/windows"
 )
@@ -76,6 +77,77 @@ func TestIconCacheEvictsLeastRecentlyShownAndReusesSlots(t *testing.T) {
 		c.mu.Unlock()
 		if retried {
 			t.Error("failed path re-queued on every lookup")
+		}
+	})
+}
+
+// iconAlive reports whether h is still a valid icon handle.
+func iconAlive(h win.HICON) bool {
+	var info win.ICONINFO
+	if !win.GetIconInfo(h, &info) {
+		return false
+	}
+	win.DeleteObject(win.HGDIOBJ(info.HbmColor))
+	win.DeleteObject(win.HGDIOBJ(info.HbmMask))
+	return true
+}
+
+// Results that arrive after the window (or its last process table) is gone
+// must not keep their HICONs until the process exits.
+func TestIconResultsAfterWindowCloseAreDestroyed(t *testing.T) {
+	runNativeTest(t, func() {
+		exe, _ := os.Executable()
+		icon := func() win.HICON {
+			h := shellSmallIcon(exe)
+			if h == 0 {
+				panic("no test icon")
+			}
+			return h
+		}
+		mw, err := walk.NewMainWindow()
+		if err != nil {
+			panic(err)
+		}
+		defer mw.Dispose()
+
+		// The window is gone: posting the flush fails.
+		c := newProcIconCache(8)
+		defer win.ImageList_Destroy(c.imageList())
+		c.attach(nil, func(func()) bool { return false }, func() {})
+		c.pend["gone"] = true
+		h1 := icon()
+		c.deliver(iconResult{path: "gone", icon: h1})
+		if len(c.done) != 0 || c.queued || c.pend["gone"] {
+			t.Errorf("undeliverable result kept: done=%d queued=%v pend=%v", len(c.done), c.queued, c.pend["gone"])
+		}
+		if iconAlive(h1) {
+			t.Error("undeliverable icon was not destroyed")
+		}
+
+		// A flush was posted but the window closed before it ran: the last
+		// table's list view is released on WM_DESTROY.
+		c2 := newProcIconCache(8)
+		defer win.ImageList_Destroy(c2.imageList())
+		var posted []func()
+		c2.attach(nil, func(f func()) bool { posted = append(posted, f); return true }, func() {})
+		c2.views = append(c2.views, win.HWND(mw.Handle())) // stands in for the list view
+		h2, h3 := icon(), icon()
+		c2.deliver(iconResult{path: "queued", icon: h2})
+		if len(posted) != 1 {
+			t.Errorf("%d flushes posted", len(posted))
+			return
+		}
+		c2.release(win.HWND(mw.Handle()))
+		if iconAlive(h2) || len(c2.done) != 0 {
+			t.Error("result waiting for a flush that never runs kept its icon")
+		}
+		c2.deliver(iconResult{path: "late", icon: h3})
+		if iconAlive(h3) || len(c2.done) != 0 || len(posted) != 1 {
+			t.Errorf("result after the last table was released kept its icon (done=%d posts=%d)", len(c2.done), len(posted))
+		}
+		posted[0]() // a stale flush that still runs is harmless
+		if _, ok := c2.slots["queued"]; ok {
+			t.Error("dropped result was stored")
 		}
 	})
 }

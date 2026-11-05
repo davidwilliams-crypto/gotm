@@ -82,7 +82,7 @@ func sensorColor(kind string) walk.Color {
 
 func (p *powerPage) build() decl.Widget { return p.gridPage.build() }
 func (p *powerPage) init()              { p.gridPage.init() }
-func (p *powerPage) shown()             { p.render() }
+func (p *powerPage) shown()             { p.syncPaint(); p.render() }
 func (p *powerPage) prefill()           { p.render() }
 func (p *powerPage) reload()            { p.render() }
 func (p *powerPage) tick(s *metrics.Snapshot) {
@@ -269,7 +269,7 @@ func newConnsPage(a *App) *connsPage {
 
 func (p *connsPage) build() decl.Widget { return p.gridPage.build() }
 func (p *connsPage) init()              { p.gridPage.init() }
-func (p *connsPage) shown()             { p.load() }
+func (p *connsPage) shown()             { p.syncPaint(); p.load() }
 func (p *connsPage) tick(s *metrics.Snapshot) {
 	// The PID -> name map is built by apply, only when connections are shown.
 	if time.Since(p.last) > 2*time.Second {
@@ -385,7 +385,7 @@ func (p *appsPage) init() {
 	p.gridPage.init()
 	p.updateButtons()
 }
-func (p *appsPage) shown()                 { p.load() }
+func (p *appsPage) shown()                 { p.syncPaint(); p.load() }
 func (p *appsPage) tick(*metrics.Snapshot) {}
 
 func (p *appsPage) load() {
@@ -537,7 +537,7 @@ func newDriversPage(a *App) *driversPage {
 
 func (p *driversPage) build() decl.Widget     { return p.gridPage.build() }
 func (p *driversPage) init()                  { p.gridPage.init() }
-func (p *driversPage) shown()                 { p.load() }
+func (p *driversPage) shown()                 { p.syncPaint(); p.load() }
 func (p *driversPage) tick(*metrics.Snapshot) {}
 
 func (p *driversPage) load() {

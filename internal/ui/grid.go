@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"hash/maphash"
 	"slices"
 	"strconv"
 	"strings"
@@ -80,7 +81,9 @@ func (m *gridModel) Sort(col int, order walk.SortOrder) error {
 		return nil
 	}
 	m.sortCol, m.sortDesc = col, order == walk.SortDescending
-	m.set(m.rows)
+	// A header click arrives as a list-view notification: repaint without
+	// flushing bands (no UpdateWindow) from inside it.
+	inListMessage(func() { m.set(m.rows) })
 	return m.SorterBase.Sort(col, order)
 }
 
@@ -250,6 +253,29 @@ func (m *gridModel) rowSigs(row int, vis []int, out []uint64) {
 	}
 }
 
+// rowID identifies a row by its key column (paintDiff reorder announcements).
+func (m *gridModel) rowID(row int) uint64 {
+	if m.keyCol < 0 || row < 0 || row >= len(m.rows) {
+		return uint64(row)
+	}
+	return maphash.String(sigSeed, cell(m.rows[row], m.keyCol))
+}
+
+// observe records rows that came into view since the last repaint, before
+// the model changes (paintDiff.observe).
+func (m *gridModel) observe() {
+	if m.tv != nil {
+		m.paint.observe(m.tv, len(m.rows), m)
+	}
+}
+
+// markPainted records the visible rows as painted after a full invalidate.
+func (m *gridModel) markPainted() {
+	if m.tv != nil {
+		m.paint.markPainted(m.tv, len(m.rows), m)
+	}
+}
+
 // repaintAsync is repaint from inside a list-view notification.
 func (m *gridModel) repaintAsync() {
 	if m.tv != nil {
@@ -269,6 +295,7 @@ func (m *gridModel) repaint() {
 // removed at the end, only changed cells repaint, and the selected row is
 // re-selected at its new position without scrolling.
 func (m *gridModel) set(rows [][]string) {
+	m.observe() // before sorting: rows may be m.rows itself (Sort)
 	var selKey string
 	if m.tv != nil {
 		if i := m.tv.CurrentIndex(); i >= 0 && i < len(m.rows) {
@@ -319,6 +346,7 @@ func (m *gridModel) update(rows [][]string) bool {
 	if m.keyCol < 0 {
 		return false
 	}
+	m.observe()
 	// Compare identities in the displayed sort order, rather than API order.
 	m.sortRows(rows)
 	if len(rows) != len(m.rows) {
@@ -445,8 +473,13 @@ func (g *gridPage) init() {
 	styleTable(g.tv)
 	nameTable(g.tv, g.app.pages[g.id].title+" table")
 	g.model.ready = true
+	onFullRepaint(g.tv, g.model.markPainted)
 	searchCue(g.filter, g.filterPlaceholder+"  (Ctrl+F)", g.tv)
 }
+
+// syncPaint records the table's visible rows as painted when its page is
+// revealed: the exposure repaints the whole list (paintDiff.markPainted).
+func (g *gridPage) syncPaint() { g.model.markPainted() }
 
 func commandRow(children []decl.Widget) decl.Composite {
 	return decl.Composite{

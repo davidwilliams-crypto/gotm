@@ -146,7 +146,24 @@ func tableControlTheme(hwnd win.HWND, class string) {
 func recolorTables() {
 	for _, tv := range styledTables {
 		colorTable(tv)
+		// colorTable invalidated the whole list: what it shows from now on is
+		// the new palette, so the next tick need not repaint every row again.
+		if f := paintSyncs[tv]; f != nil {
+			f()
+		}
 	}
+}
+
+// paintSyncs holds, per table, the function that records its visible rows as
+// painted after the whole list was invalidated (see paintDiff.markPainted).
+var paintSyncs = map[*walk.TableView]func(){}
+
+// onFullRepaint registers sync as tv's markPainted; it is dropped with tv.
+func onFullRepaint(tv *walk.TableView, sync func()) {
+	if _, ok := paintSyncs[tv]; !ok {
+		tv.Disposing().Attach(func() { delete(paintSyncs, tv) })
+	}
+	paintSyncs[tv] = sync
 }
 
 // ---- tree indentation ---------------------------------------------------------
@@ -204,6 +221,13 @@ func tvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 		for _, lv := range tvImageLVs[h] { // children still exist here
 			procIcons.release(lv)
 		}
+	}
+	if msg == win.WM_NOTIFY {
+		// Walk handles its list views' notifications here (column click and
+		// sort, item activation, selection): repaints they cause must not
+		// paint re-entrantly (paintDiff.refresh).
+		listNotifyDepth++
+		defer func() { listNotifyDepth-- }()
 	}
 	r := win.CallWindowProc(prev, h, uint32(msg), wp, lp)
 	if msg == win.WM_NCDESTROY {

@@ -12,6 +12,8 @@ import (
 	"github.com/tailscale/walk"
 	decl "github.com/tailscale/walk/declarative"
 	"github.com/tailscale/win"
+
+	"gotm/internal/metrics"
 )
 
 const pageBuildTimer = 0x474f544d
@@ -50,6 +52,10 @@ type pageConstruction struct {
 
 // prefiller is a page that can build its first rows while still hidden.
 type prefiller interface{ prefill() }
+
+// paintSyncer is a table page that can record its visible rows as painted
+// once they were exposed (paintDiff.markPainted).
+type paintSyncer interface{ syncPaint() }
 
 // sliceBudget is how long one timer callback keeps running small steps.
 const sliceBudget = 4 * time.Millisecond
@@ -122,7 +128,9 @@ func (b *pageConstruction) widget(parent walk.Container, widget decl.Widget) bui
 }
 
 func (a *App) startPageBuild(i int) {
-	a.cancelPageBuild()
+	if old := a.abortPageBuild(); old != nil {
+		a.settleCancelled(old)
+	}
 	b := &pageConstruction{id: i, palette: T}
 	a.opening = b
 	b.steps = []buildStep{b.widget(a.right, a.pageWidget(i)), {name: "init", alone: true, run: func() error {
@@ -147,7 +155,17 @@ func (a *App) startPageBuild(i int) {
 		}})
 	}
 	b.steps = append(b.steps,
-		buildStep{name: "show", alone: true, run: func() error { b.revealed = true; a.revealPage(i); return nil }},
+		buildStep{name: "show", alone: true, run: func() error {
+			b.revealed = true
+			a.revealPage(i)
+			// Its tables' rows were built while hidden; the exposure paint that
+			// is now pending draws them all, so record them as painted rather
+			// than repainting every visible row again on the next tick.
+			if p, ok := a.pages[i].impl.(paintSyncer); ok {
+				p.syncPaint()
+			}
+			return nil
+		}},
 		buildStep{name: "focus", alone: true, run: func() error { a.showPage(i); return nil }},
 	)
 	if !a.pageBuildHooked {
@@ -172,11 +190,20 @@ func (a *App) revealPage(i int) {
 	}
 	a.cur = i
 	for k, w := range a.wraps {
-		if w != nil && w.Visible() != (k == i) {
+		// Compare the page's own visibility: Walk's Visible is false for every
+		// page while the main window itself is hidden (tray, start-up), which
+		// would leave the previous page shown alongside this one.
+		if w != nil && windowShown(w) != (k == i) {
 			w.SetVisible(k == i)
 		}
 	}
 	a.mw.RequestImmediateLayout()
+}
+
+// windowShown reports whether w itself is shown (WS_VISIBLE), whether or not
+// its ancestors are.
+func windowShown(w walk.Window) bool {
+	return win.GetWindowLong(win.HWND(w.Handle()), win.GWL_STYLE)&win.WS_VISIBLE != 0
 }
 
 func (a *App) schedulePageBuild() {
@@ -264,13 +291,38 @@ func (a *App) continuePageBuild() {
 	a.side.invalidate()
 	a.invalidateChrome()
 }
-func (a *App) cancelPageBuild() {
+func (a *App) cancelPageBuild() { a.abortPageBuild() }
+
+// settleCancelled finishes the state a cancelled build left behind when
+// another page's build replaces it. A build cancelled after its "show" step
+// already made its page visible and current (a.cur), and that page stays on
+// screen until the next page reveals itself (or for good, if that build
+// fails) — exactly as an already-built page stays while another one builds.
+// Only its "focus" step did not run, so activate it the way showPage does:
+// sensors for that page, shown() and the current snapshot. Keyboard focus is
+// left alone: the reader has just chosen another page.
+func (a *App) settleCancelled(b *pageConstruction) {
+	i := b.id
+	if !b.revealed || a.cur != i || !a.pages[i].initialized || a.wraps[i] == nil || a.mw.IsDisposed() {
+		return
+	}
+	metrics.SetGPUSensorsWanted(a.gpuSensorsWanted())
+	a.sensors.SetDetailWanted(i == pgPower)
+	a.pages[i].impl.shown()
+	if a.snap != nil {
+		a.pages[i].impl.tick(a.snap)
+	}
+}
+
+// abortPageBuild stops the pending build, if any, and returns it.
+func (a *App) abortPageBuild() *pageConstruction {
 	if a.mw != nil {
 		h := win.HWND(a.mw.Handle())
 		win.KillTimer(h, pageBuildTimer)
 		delete(pageBuilders, h)
 	}
-	if b := a.opening; b != nil {
+	b := a.opening
+	if b != nil {
 		a.opening = nil
 		a.side.invalidate()
 		a.invalidateChrome()
@@ -289,6 +341,7 @@ func (a *App) cancelPageBuild() {
 			}
 		}
 	}
+	return b
 }
 
 // initialPageWidget keeps even direct Processes/Task Manager launches responsive:
