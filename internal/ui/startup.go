@@ -87,7 +87,7 @@ func newStartupTab(a *App) *startupTab {
 
 func (t *startupTab) build() decl.Widget     { return t.gridPage.build() }
 func (t *startupTab) init()                  { t.gridPage.init() }
-func (t *startupTab) shown()                 { t.load() }
+func (t *startupTab) shown()                 { t.syncPaint(); t.load() }
 func (t *startupTab) tick(*metrics.Snapshot) {}
 
 // load gathers startup entries off the UI thread (scheduled tasks take a moment).

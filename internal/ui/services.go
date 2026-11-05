@@ -61,7 +61,7 @@ func (t *servicesTab) init() {
 	t.gridPage.init()
 	t.updateButtons()
 }
-func (t *servicesTab) shown() { t.load() }
+func (t *servicesTab) shown() { t.syncPaint(); t.load() }
 
 // tick refreshes the list every few seconds while the page is open.
 func (t *servicesTab) tick(*metrics.Snapshot) {

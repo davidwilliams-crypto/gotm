@@ -36,6 +36,7 @@ type settingsTab struct {
 
 	taskManager taskManagerSetting
 	tmQuerying  bool   // a background routing query is running
+	tmKnown     bool   // a routing state has been read (in the background or on a click)
 	tmGen       int    // bumped by synchronous reads; older results are dropped
 	lastRyzen   string // AMD SDK status shown by the last paint
 }
@@ -314,7 +315,19 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 	top = y
 	y = t.section(cv, y, w, "Windows Task Manager", 152)
 	label, note := t.taskManagerText()
-	t.chip(cv, 44, top+48, 300, label, t.taskManager.state.Owned, "taskmanager", "")
+	if t.taskManagerChecking() {
+		// Neither state is known yet: show a neutral, inactive chip rather than
+		// "Replace Task Manager / Off", which would flip once the query answers.
+		r := rect{44, top + 48, 300, 30}
+		if r.Y+r.H > 0 && r.Y < t.viewH {
+			fillRound(cv, r, 5, T.Card)
+			strokeRound(cv, r, 5, T.Stroke)
+			drawText(cv, label, uiFont(9), T.Faint, r, taCenter)
+		}
+		t.v.addText(r, "Windows Task Manager replacement: "+label)
+	} else {
+		t.chip(cv, 44, top+48, 300, label, t.taskManager.state.Owned, "taskmanager", "")
+	}
 	t.note(cv, note, uiFont(9), T.Muted, rect{44, top + 82, w - 88, 26})
 	scope := "Applies to every user. Turn it off here to restore Windows Task Manager."
 	if !t.app.host.Elevated {
@@ -477,6 +490,9 @@ func (t *settingsTab) onClick(id string, _ walk.MouseButton) {
 	case id == "recdisk":
 		a.saveConfig(func(c *configT) { c.RecorderDisk = !c.RecorderDisk })
 	case id == "taskmanager":
+		if t.taskManagerChecking() {
+			return // the action is not offered until the state is known
+		}
 		t.changeTaskManager()
 	case id == "ryzensdk":
 		if !a.host.Elevated {

@@ -114,8 +114,10 @@ func (t *settingsTab) refreshTaskManager(force bool) {
 			if t.taskManager.busy || gen != t.tmGen { // a change started meanwhile; it re-reads when done
 				return
 			}
-			changed := !sameTaskManagerSetting(t.taskManager, s)
-			t.taskManager = s
+			// The first answer always repaints: until then Settings shows
+			// "Checking…", even when the answer equals the zero state.
+			changed := !t.tmKnown || !sameTaskManagerSetting(t.taskManager, s)
+			t.taskManager, t.tmKnown = s, true
 			if changed && t.v.cw != nil {
 				t.v.invalidate()
 			}
@@ -128,6 +130,14 @@ func (t *settingsTab) refreshTaskManager(force bool) {
 func (t *settingsTab) refreshTaskManagerNow() {
 	t.tmGen++ // results of queries already running are older
 	t.taskManager = queryTaskManager()
+	t.tmKnown = true
+}
+
+// taskManagerChecking reports whether the routing state is still unknown: the
+// first background query has not answered yet. Settings then shows a neutral
+// "Checking…" state and offers no action.
+func (t *settingsTab) taskManagerChecking() bool {
+	return !t.tmKnown && t.tmQuerying && !t.taskManager.busy
 }
 
 func sameTaskManagerSetting(a, b taskManagerSetting) bool {
@@ -142,6 +152,9 @@ func sameTaskManagerSetting(a, b taskManagerSetting) bool {
 
 func (t *settingsTab) taskManagerText() (label, note string) {
 	s := t.taskManager
+	if t.taskManagerChecking() {
+		return "Checking…", "Reading how Windows Task Manager launches on this PC…"
+	}
 	label = "Replace Task Manager"
 	note = "Off. Windows Task Manager opens normally."
 	if s.state.Owned {

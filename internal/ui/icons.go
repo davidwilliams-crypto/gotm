@@ -181,19 +181,50 @@ func (c *procIconCache) worker() {
 	}
 }
 
+// deliver hands a worker result to the UI thread. When no table can receive
+// it (none attached, or the window is gone and the flush cannot be posted),
+// the result is dropped and its HICON destroyed at once rather than held
+// until the process exits; a later lookup simply asks again.
 func (c *procIconCache) deliver(r iconResult) {
 	c.mu.Lock()
-	c.done = append(c.done, r)
 	post := c.post
-	schedule := !c.queued && post != nil
+	if post == nil {
+		delete(c.pend, r.path)
+		c.mu.Unlock()
+		destroyResults([]iconResult{r})
+		return
+	}
+	c.done = append(c.done, r)
+	schedule := !c.queued
 	if schedule {
 		c.queued = true
 	}
 	c.mu.Unlock()
 	if schedule && !post(c.flush) {
-		c.mu.Lock()
-		c.queued = false
-		c.mu.Unlock()
+		destroyResults(c.drop())
+	}
+}
+
+// drop takes every result waiting for a flush and forgets that a flush is
+// posted, under mu. The caller destroys their icons.
+func (c *procIconCache) drop() []iconResult {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	done := c.done
+	c.done = nil
+	c.queued = false
+	for _, r := range done {
+		delete(c.pend, r.path)
+	}
+	return done
+}
+
+// destroyResults releases the HICONs of results that will never be stored.
+func destroyResults(rs []iconResult) {
+	for _, r := range rs {
+		if r.icon != 0 {
+			win.DestroyIcon(r.icon)
+		}
 	}
 }
 
@@ -281,11 +312,21 @@ func (c *procIconCache) evict() {
 }
 
 // release detaches the image list from a list view about to be destroyed.
+// When the last one goes (the window is closing), the cache also stops
+// accepting results: a flush posted to the closing window may never run, so
+// the results waiting for it, and any that arrive later, have their HICONs
+// destroyed instead of being held until the process exits.
 func (c *procIconCache) release(lv win.HWND) {
 	for i, v := range c.views {
 		if v == lv {
 			win.SendMessage(lv, win.LVM_SETIMAGELIST, win.LVSIL_SMALL, 0)
 			c.views = append(c.views[:i], c.views[i+1:]...)
+			if len(c.views) == 0 {
+				c.mu.Lock()
+				c.post, c.resolved = nil, nil
+				c.mu.Unlock()
+				destroyResults(c.drop())
+			}
 			return
 		}
 	}
