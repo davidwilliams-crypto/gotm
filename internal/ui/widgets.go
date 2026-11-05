@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"time"
 	"unsafe"
 
 	"github.com/tailscale/walk"
@@ -47,6 +48,22 @@ type canvasView struct {
 	items     []accItem
 	uia       *uiaRoot
 	announced string
+
+	// graphs holds this canvas's finished graphs between paints (gfx.go).
+	// onHide runs when the canvas is found hidden with graphs cached, so a
+	// page can release its own derived data too.
+	graphs graphCache
+	onHide func()
+
+	invalidations int // requested repaints, for tests
+}
+
+// releaseGraphs frees the cached graph images once the canvas is hidden.
+func (v *canvasView) releaseGraphs() {
+	v.graphs.reset()
+	if v.onHide != nil {
+		v.onHide()
+	}
 }
 
 func newCanvasView(paint func(cv *walk.Canvas, w, h int)) *canvasView {
@@ -89,7 +106,17 @@ func (v *canvasView) paint(cv *walk.Canvas, _ walk.Rectangle) error {
 	v.hits = v.hits[:0]
 	v.items = v.items[:0]
 	fillRect(cv, rect{0, 0, v.w + 2, v.h + 2}, v.background())
+	saved := activeGraphs
+	defer func() { activeGraphs = saved }()
+	activeGraphs = &v.graphs
+	v.graphs.begin()
 	v.paintFn(cv, v.w, v.h)
+	v.graphs.end()
+	activeGraphs = saved
+	if v.graphs.len() > 0 {
+		registerGraphOwner(v)
+	}
+	sweepGraphCaches(time.Now())
 	if v.keyboard && v.cw.Focused() && len(v.hits) > 0 {
 		focused := v.hits[0]
 		for _, item := range v.hits {
@@ -179,6 +206,7 @@ func (v *canvasView) hitAt(x, y int) string {
 }
 
 func (v *canvasView) invalidate() {
+	v.invalidations++
 	if v.cw != nil {
 		_ = v.cw.Invalidate()
 	}
@@ -205,8 +233,12 @@ func (v *canvasView) declare(minW, minH, maxW, maxH, stretch int) decl.CustomWid
 		StretchFactor:       stretch,
 		Paint:               v.paint,
 		OnMouseMove: func(x, y int, b walk.MouseButton) {
+			wasLeft := v.left
 			v.mx, v.my, v.left = x, y, b&walk.LeftButton != 0
 			id := v.hitAt(x, y)
+			if v.left != wasLeft && v.down != "" {
+				v.invalidate() // a held item is drawn pressed only while the button is down
+			}
 			if v.focusHook && !v.tracking && (id != "" || v.onMove != nil) {
 				event := win.TRACKMOUSEEVENT{DwFlags: win.TME_LEAVE, HwndTrack: v.cw.Handle()}
 				event.CbSize = uint32(unsafe.Sizeof(event))
@@ -228,32 +260,48 @@ func (v *canvasView) declare(minW, minH, maxW, maxH, stretch int) decl.CustomWid
 				v.onMove(x, y)
 			}
 		},
-		OnMouseDown: func(x, y int, b walk.MouseButton) {
-			v.mx, v.my, v.left = x, y, b == walk.LeftButton
-			if !v.left {
-				v.down = ""
-				return
-			}
-			v.down = v.hitAt(x, y)
-			v.hover = v.down
-			if v.keyboard && v.cw != nil {
-				_ = v.cw.SetFocus()
-				if v.down != "" {
-					v.keyHit = v.down
-				}
-			}
-			v.invalidate()
-		},
-		OnMouseUp: func(x, y int, b walk.MouseButton) {
-			v.mx, v.my, v.left = x, y, false
-			id := v.hitAt(x, y)
-			was := v.down
+		OnMouseDown: v.mouseDown,
+		OnMouseUp:   v.mouseUp,
+	}
+}
+
+// Pressing and releasing repaint only when they change what is drawn: the
+// pressed item, the hovered item or the keyboard item. A click on empty space
+// (or on a graph) costs nothing; focus changes repaint through
+// FocusedChanged, and click handlers invalidate what they change.
+func (v *canvasView) mouseDown(x, y int, b walk.MouseButton) {
+	v.mx, v.my, v.left = x, y, b == walk.LeftButton
+	if !v.left {
+		if v.down != "" {
 			v.down = ""
 			v.invalidate()
-			if id != "" && id == was && v.onClick != nil {
-				v.onClick(id, b)
-			}
-		},
+		}
+		return
+	}
+	down, hover, keyHit := v.down, v.hover, v.keyHit
+	v.down = v.hitAt(x, y)
+	v.hover = v.down
+	if v.keyboard && v.cw != nil {
+		_ = v.cw.SetFocus()
+	}
+	if v.keyboard && v.down != "" {
+		v.keyHit = v.down
+	}
+	if v.down != down || v.hover != hover || v.keyHit != keyHit {
+		v.invalidate()
+	}
+}
+
+func (v *canvasView) mouseUp(x, y int, b walk.MouseButton) {
+	v.mx, v.my, v.left = x, y, false
+	id := v.hitAt(x, y)
+	was := v.down
+	v.down = ""
+	if was != "" {
+		v.invalidate()
+	}
+	if id != "" && id == was && v.onClick != nil {
+		v.onClick(id, b)
 	}
 }
 
@@ -262,11 +310,14 @@ func (v *canvasView) declare(minW, minH, maxW, maxH, stretch int) decl.CustomWid
 func (v *canvasView) OnPreTranslate(msg *win.MSG) bool {
 	if msg.Message == win.WM_MOUSELEAVE && v.cw != nil && msg.HWnd == v.cw.Handle() {
 		v.stopTracking()
+		hovered := v.hover != ""
 		v.mx, v.my, v.hover = -1, -1, ""
 		if v.onMove != nil && !v.left {
-			v.onMove(-1, -1)
+			v.onMove(-1, -1) // invalidates if the page draws something under the mouse
 		}
-		v.invalidate()
+		if hovered {
+			v.invalidate()
+		}
 	}
 	return false
 }

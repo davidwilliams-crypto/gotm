@@ -25,7 +25,12 @@ type perfPage struct {
 	sel     int
 	perCore bool
 	gpuOver bool // GPU detail: one overall graph instead of one per engine
-	hist    []metrics.HistPoint
+	// hist is the history the graphs show: the mirror's live points, synced
+	// incrementally each tick (perf_series.go). Treat it as read-only.
+	hist   []metrics.HistPoint
+	mirror histMirror
+	curves map[seriesKey]*derivedSeries
+	paints uint64
 
 	// GPU process list scrolling (design units for the area, rows for the offset)
 	gpuScroll int
@@ -102,6 +107,7 @@ func newPerfPage(a *App) *perfPage {
 		fmt.Sscanf(v, "%d", &p.sel)
 	}
 	p.v = newCanvasView(p.paint)
+	p.v.onHide = p.releaseDerived
 	p.v.keyboard, p.v.keyName = true, "Performance. Up and Down select a resource, Space or Enter changes its graph view. Page Up and Page Down scroll through details."
 	p.v.acc, p.v.accName, p.v.accCtl = true, "Performance", ctlPane
 	p.v.onClick = func(id string, _ walk.MouseButton) {
@@ -213,7 +219,7 @@ func (p *perfPage) scrollGPUProcesses(rows int) bool {
 
 func (p *perfPage) shown()                   { p.v.invalidate() }
 func (p *perfPage) focusTarget() walk.Window { return p.v.cw }
-func (p *perfPage) reload()                  { p.hist = p.app.sampler.History(); p.v.invalidate() }
+func (p *perfPage) reload()                  { p.syncHistory(); p.v.invalidate() }
 func (p *perfPage) pageKey(key walk.Key, mods walk.Modifiers) bool {
 	if mods != 0 {
 		return false
@@ -258,7 +264,7 @@ func (p *perfPage) pageKey(key walk.Key, mods walk.Modifiers) bool {
 	return true
 }
 func (p *perfPage) tick(*metrics.Snapshot) {
-	p.hist = p.app.sampler.History()
+	p.syncHistory()
 	p.v.invalidate()
 }
 
@@ -270,42 +276,43 @@ func (p *perfPage) capacity() int {
 	return c
 }
 
+func histCPU(h *metrics.HistPoint) float64   { return h.CPU }
+func histMem(h *metrics.HistPoint) float64   { return h.Mem }
+func histDiskR(h *metrics.HistPoint) float64 { return h.DiskR }
+func histDiskW(h *metrics.HistPoint) float64 { return h.DiskW }
+func histNetRx(h *metrics.HistPoint) float64 { return h.NetRx }
+func histNetTx(h *metrics.HistPoint) float64 { return h.NetTx }
+func histGPU(h *metrics.HistPoint) float64 {
+	if !h.GPUOK {
+		return math.NaN()
+	}
+	return h.GPU
+}
+
+// plotted is one derived curve ready to draw.
+func (p *perfPage) plotted(kind int, f func(*metrics.HistPoint) float64, c walk.Color, fill bool) series {
+	vals, ver := p.curve(seriesKey{kind: kind}, f)
+	return series{vals: vals, ver: ver, color: c, fill: fill}
+}
+
 // seriesFor extracts the curves of one card from the history.
 func (p *perfPage) seriesFor(it resItem) []series {
-	r := it.kind
-	col := resColor(r)
-	pick := func(f func(h *metrics.HistPoint) float64) []float64 {
-		out := make([]float64, len(p.hist))
-		for i := range p.hist {
-			out[i] = f(&p.hist[i])
-		}
-		return out
-	}
-	switch r {
+	col := resColor(it.kind)
+	switch it.kind {
 	case resCPU:
-		return []series{{vals: pick(func(h *metrics.HistPoint) float64 { return h.CPU }), color: col, fill: true}}
+		return []series{p.plotted(serCPU, histCPU, col, true)}
 	case resMem:
-		return []series{{vals: pick(func(h *metrics.HistPoint) float64 { return h.Mem }), color: col, fill: true}}
+		return []series{p.plotted(serMem, histMem, col, true)}
 	case resGPU:
 		if it.gpu >= 0 && p.app.snap != nil && it.gpu < len(p.app.snap.GPUs) {
-			return []series{{vals: p.gpuSeries(p.app.snap.GPUs[it.gpu].ID, gpuPointUtil), color: col, fill: true}}
+			vals, ver := p.gpuCurve(serGPUAdp, p.app.snap.GPUs[it.gpu].ID, "", gpuPointUtil)
+			return []series{{vals: vals, ver: ver, color: col, fill: true}}
 		}
-		return []series{{vals: pick(func(h *metrics.HistPoint) float64 {
-			if !h.GPUOK {
-				return math.NaN()
-			}
-			return h.GPU
-		}), color: col, fill: true}}
+		return []series{p.plotted(serGPU, histGPU, col, true)}
 	case resDisk:
-		return []series{
-			{vals: pick(func(h *metrics.HistPoint) float64 { return h.DiskR }), color: T.Disk, fill: true},
-			{vals: pick(func(h *metrics.HistPoint) float64 { return h.DiskW }), color: T.Warn},
-		}
+		return []series{p.plotted(serDiskR, histDiskR, T.Disk, true), p.plotted(serDiskW, histDiskW, T.Warn, false)}
 	}
-	return []series{
-		{vals: pick(func(h *metrics.HistPoint) float64 { return h.NetRx }), color: T.Net, fill: true},
-		{vals: pick(func(h *metrics.HistPoint) float64 { return h.NetTx }), color: T.CPU},
-	}
+	return []series{p.plotted(serNetRx, histNetRx, T.Net, true), p.plotted(serNetTx, histNetTx, T.CPU, false)}
 }
 
 func (p *perfPage) fixedMax(r int) float64 {
@@ -354,6 +361,10 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	s := p.app.snap
 	p.gpuRows = 0 // set again by the GPU detail when it draws a process list
 	p.hoverGraphOn = false
+	p.paints++
+	if p.paints%64 == 0 {
+		p.pruneCurves()
+	}
 	if s == nil {
 		drawText(cv, "Collecting the first sample…", uiFont(12), T.Muted, rect{24, 24, w - 48, 30}, taLeft)
 		return
@@ -375,7 +386,9 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	dw := w - x0 - margin
 	cur := items[p.sel]
 	kind := cur.kind
-	metrics.SetGPUSensorsWanted(p.app.gpuSensorsWanted())
+	// The same demand as App.gpuSensorsWanted, from the item already chosen
+	// above instead of rebuilding the card list during every paint.
+	metrics.SetGPUSensorsWanted(p.app.cur == pgPower || (p.app.cur == pgPerformance && kind == resGPU))
 	title := resTitle(kind)
 	var device string
 	switch kind {
@@ -455,7 +468,8 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 			cr := rect{cx, cy, cw, cellH}
 			fillRound(cv, cr, 8, T.Card)
 			strokeRound(cv, cr, 8, T.Stroke)
-			ser := []series{{vals: p.coreSeries(i), color: heatColor(c), fill: true}}
+			vals, ver := p.coreSeries(i)
+			ser := []series{{vals: vals, ver: ver, color: heatColor(c), fill: true}}
 			plotSeries(cv, rect{cr.X + 4, cr.Y + 4, cr.W - 8, cr.H - 8}, ser,
 				graphStyle{bg: T.Card, max: 100, capacity: p.capacity(), lineW: 2})
 			label := fmt.Sprintf("CPU %d", i)
@@ -679,10 +693,7 @@ func (p *perfPage) paintHistory(cv *walk.Canvas, gr rect, cur resItem) {
 	if i := p.hoverIdx; i >= 0 && i < len(p.hist) && len(p.hist) >= 2 {
 		hp := &p.hist[i]
 		x := inner.X + int(float64(inner.W)*float64(i)/float64(len(p.hist)-1))
-		if pen, err := walk.NewCosmeticPen(walk.PenSolid, blend(T.Text, T.Card, 0.45)); err == nil {
-			_ = cv.DrawLinePixels(pen, walk.Point{X: sc(x), Y: sc(inner.Y)}, walk.Point{X: sc(x), Y: sc(inner.Y + inner.H)})
-			pen.Dispose()
-		}
+		linePixels(cv.HDC(), sc(x), sc(inner.Y), sc(x), sc(inner.Y+inner.H), blend(T.Text, T.Card, 0.45))
 		label := p.hoverLabel(cur, hp)
 		if age := time.Now().UnixMilli() - hp.T; age > 750 {
 			label += "  ·  " + humanDur(time.Duration(age)*time.Millisecond) + " ago"
@@ -756,14 +767,15 @@ func (p *perfPage) hoverLabel(cur resItem, h *metrics.HistPoint) string {
 	return fmt.Sprintf("↓ %s · ↑ %s", fmtRate(h.NetRx), fmtRate(h.NetTx))
 }
 
-func (p *perfPage) coreSeries(i int) []float64 {
-	out := make([]float64, 0, len(p.hist))
-	for k := range p.hist {
-		if i < len(p.hist[k].Cores) {
-			out = append(out, p.hist[k].Cores[i])
+// coreSeries is one logical processor's curve. A point without that core's
+// reading (the CPU query failed that tick) is a gap.
+func (p *perfPage) coreSeries(i int) ([]float64, uint64) {
+	return p.curve(seriesKey{kind: serCore, idx: i}, func(h *metrics.HistPoint) float64 {
+		if i < len(h.Cores) {
+			return h.Cores[i]
 		}
-	}
-	return out
+		return math.NaN()
+	})
 }
 
 // statsFor returns the label/value pairs shown under the graph.
