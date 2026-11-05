@@ -40,20 +40,44 @@ func gpuPointUtil(g *metrics.GPUHist) float64 {
 	return g.Pct
 }
 
-// gpuSeries pulls one adapter's curve out of the history.
+// gpuSeries pulls one adapter's curve out of the history; a point without
+// that adapter is a gap.
 func (p *perfPage) gpuSeries(id string, f func(*metrics.GPUHist) float64) []float64 {
 	out := make([]float64, 0, len(p.hist))
 	for i := range p.hist {
-		v := math.NaN()
-		for k := range p.hist[i].GPUs {
-			if p.hist[i].GPUs[k].ID == id {
-				v = f(&p.hist[i].GPUs[k])
-				break
-			}
-		}
-		out = append(out, v)
+		out = append(out, gpuValue(&p.hist[i], id, f))
 	}
 	return out
+}
+
+func gpuValue(h *metrics.HistPoint, id string, f func(*metrics.GPUHist) float64) float64 {
+	if g := gpuPoint(h, id); g != nil {
+		return f(g)
+	}
+	return math.NaN()
+}
+
+// gpuCurve is gpuSeries as a derived curve of the mirrored history: only the
+// points new since the last paint are looked up (perf_series.go). name tells
+// apart curves of the same kind, such as engines.
+func (p *perfPage) gpuCurve(kind int, id, name string, f func(*metrics.GPUHist) float64) ([]float64, uint64) {
+	return p.curve(seriesKey{kind: kind, id: id, name: name}, func(h *metrics.HistPoint) float64 {
+		return gpuValue(h, id, f)
+	})
+}
+
+func gpuDedicated(x *metrics.GPUHist) float64 {
+	if !x.HasDedicatedUsage {
+		return math.NaN()
+	}
+	return x.Ded
+}
+
+func gpuShared(x *metrics.GPUHist) float64 {
+	if !x.HasSharedUsage {
+		return math.NaN()
+	}
+	return x.Shr
 }
 
 func gpuFacts(g *metrics.GPUAdapter) [][2]string {
@@ -206,7 +230,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 			cr := rect{cx, cy, cw, cellH}
 			fillRound(cv, cr, 8, T.Card)
 			name := e.Name
-			vals := p.gpuSeries(g.ID, func(h *metrics.GPUHist) float64 {
+			vals, ver := p.gpuCurve(serGPUEng, g.ID, name, func(h *metrics.GPUHist) float64 {
 				v, ok := h.Eng[name]
 				if !ok {
 					return math.NaN()
@@ -214,7 +238,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 				return v
 			})
 			plotSeries(cv, rect{cr.X + 4, cr.Y + 4, cr.W - 8, cr.H - 8},
-				[]series{{vals: vals, color: heatColorGPU(e.Pct), fill: true}},
+				[]series{{vals: vals, ver: ver, color: heatColorGPU(e.Pct), fill: true}},
 				graphStyle{bg: T.Card, max: 100, capacity: p.capacity(), lineW: 2})
 			strokeRound(cv, cr, 8, T.Stroke)
 			drawText(cv, name, uiFont(8), T.Muted, rect{cr.X + 8, cr.Y + 3, cr.W - 50, 16}, taLeft)
@@ -233,22 +257,13 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 	for i, m := range []struct {
 		title      string
 		used, tot  uint64
+		kind       int
 		pick       func(*metrics.GPUHist) float64
 		colorIsMem bool
 		available  bool
 	}{
-		{"Dedicated GPU memory", g.DedicatedUsed, g.DedicatedTotal, func(x *metrics.GPUHist) float64 {
-			if !x.HasDedicatedUsage {
-				return math.NaN()
-			}
-			return x.Ded
-		}, false, g.HasDedicatedUsage},
-		{"Shared GPU memory", g.SharedUsed, g.SharedTotal, func(x *metrics.GPUHist) float64 {
-			if !x.HasSharedUsage {
-				return math.NaN()
-			}
-			return x.Shr
-		}, true, g.HasSharedUsage},
+		{"Dedicated GPU memory", g.DedicatedUsed, g.DedicatedTotal, serGPUDed, gpuDedicated, false, g.HasDedicatedUsage},
+		{"Shared GPU memory", g.SharedUsed, g.SharedTotal, serGPUShr, gpuShared, true, g.HasSharedUsage},
 	} {
 		cr := rect{x0 + i*(half+gap), y, half, memH}
 		if cr.Y+cr.H <= visibleTop || cr.Y >= h {
@@ -274,8 +289,9 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 			align = taLeft
 			plotY += 16
 		}
+		vals, ver := p.gpuCurve(m.kind, g.ID, "", m.pick)
 		plotSeries(cv, rect{cr.X + 4, plotY, cr.W - 8, cr.Y + cr.H - plotY - 4},
-			[]series{{vals: p.gpuSeries(g.ID, m.pick), color: col, fill: true}},
+			[]series{{vals: vals, ver: ver, color: col, fill: true}},
 			graphStyle{bg: T.Card, max: float64(m.tot), capacity: p.capacity(), grid: true, lineW: 2})
 		strokeRound(cv, cr, 8, T.Stroke)
 		drawText(cv, m.title, uiFont(8), T.Muted, label, taLeft)

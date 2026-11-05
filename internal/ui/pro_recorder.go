@@ -30,12 +30,44 @@ type recorderPage struct {
 	bRec, bMark, bExport, bDisk, bClear *button
 	bRange                              [4]*button
 	rangeChoices                        [4]int
+
+	// shownState is what the last invalidation showed; sync repaints only
+	// when it changes (a paused recording draws the same image every tick).
+	shownState recorderState
+	// The plotted curves of the current window, rebuilt only when the
+	// window's samples change, and their data version for the graph cache.
+	plotWin                  recorderWindow
+	plotVer                  uint64
+	samples                  []metrics.RecSample
+	times                    []int64
+	cpuVals, memVals, gpuVal []float64
+}
+
+// recorderState is everything sync can change on the recorder canvas.
+type recorderState struct {
+	window                     recorderWindow
+	held                       int
+	newest, oldest             int64
+	marks, rangeSecs           int
+	selT                       int64
+	live, on, persist, exports bool
+	diskErr                    string
+}
+
+// recorderWindow identifies the samples plotted for one time span: samples
+// are only ever appended, evicted from the front, cleared or merged in, and
+// each of these changes the count or the end points.
+type recorderWindow struct {
+	from, to    int64
+	n           int
+	first, last int64
 }
 
 func newRecorderPage(a *App) *recorderPage {
 	p := &recorderPage{app: a, rangeSecs: 900, live: true,
 		rangeChoices: [4]int{300, 900, 3600, 10800}}
 	p.view = newCanvasView(p.paint)
+	p.view.onHide = p.releasePlot
 	p.view.keyboard, p.view.keyName = true, "Flight recording. Left or Right selects a sample, Home the oldest, End returns to live, Space starts or pauses recording."
 	p.view.acc, p.view.accName, p.view.accCtl = true, "Flight recording", ctlPane
 	p.view.onClick = p.onClick
@@ -150,15 +182,14 @@ func (p *recorderPage) startBackground() {
 	p.sync()
 }
 
-func (p *recorderPage) shown()                   { p.sync() }
+func (p *recorderPage) shown()                   { p.sync(); p.view.invalidate() }
 func (p *recorderPage) tick(*metrics.Snapshot)   { p.sync() }
 func (p *recorderPage) focusTarget() walk.Window { return p.view.cw }
-func (p *recorderPage) reload()                  { p.sync() }
+func (p *recorderPage) reload()                  { p.sync(); p.view.invalidate() }
 func (p *recorderPage) pageKey(key walk.Key, mods walk.Modifiers) bool {
 	if mods != 0 {
 		return false
 	}
-	samples := p.app.rec.Samples(0, 0)
 	switch key {
 	case walk.KeySpace:
 		p.bRec.onClick()
@@ -166,28 +197,26 @@ func (p *recorderPage) pageKey(key walk.Key, mods walk.Modifiers) bool {
 	case walk.KeyEnd, walk.KeyReturn:
 		p.live, p.selT = true, 0
 	case walk.KeyLeft, walk.KeyRight, walk.KeyHome:
-		if len(samples) == 0 {
-			return true
-		}
-		i := len(samples) - 1
+		// Step from the displayed sample (the newest while live) with a
+		// binary search rather than copying the whole recording per key.
+		from := int64(math.MaxInt64)
 		if !p.live {
-			displayed, _ := p.app.rec.Nearest(p.selT)
-			for j, s := range samples {
-				if s.T == displayed.T {
-					i = j
-					break
-				}
-			}
+			from = p.selT
 		}
+		offset := 0
 		switch key {
 		case walk.KeyHome:
-			i = 0
+			from = math.MinInt64
 		case walk.KeyLeft:
-			i = max(0, i-1)
+			offset = -1
 		case walk.KeyRight:
-			i = min(len(samples)-1, i+1)
+			offset = 1
 		}
-		p.selT, p.live = samples[i].T, false
+		s, ok := p.app.rec.Step(from, offset)
+		if !ok {
+			return true
+		}
+		p.selT, p.live = s.T, false
 	default:
 		return false
 	}
@@ -224,7 +253,78 @@ func (p *recorderPage) sync() {
 	for i, b := range p.bRange {
 		b.set(true, p.rangeSecs == p.rangeChoices[i])
 	}
-	p.view.invalidate()
+	// The buttons above repaint themselves when they change. Repaint the
+	// timeline only when something it draws has changed: while recording
+	// the window moves every tick; while paused or off it stays put.
+	if st := p.state(on, persist, exporting); st != p.shownState {
+		p.shownState = st
+		p.view.invalidate()
+	}
+}
+
+// state summarizes what the timeline shows.
+func (p *recorderPage) state(on, persist, exporting bool) recorderState {
+	rec := p.app.rec
+	st := recorderState{held: rec.Len(), marks: rec.MarkCount(), rangeSecs: p.rangeSecs,
+		selT: p.selT, live: p.live, on: on, persist: persist, exports: exporting}
+	st.newest, _ = rec.Newest()
+	st.oldest, _ = rec.Oldest()
+	from, to := p.window()
+	st.window.from, st.window.to = from, to
+	st.window.n, st.window.first, st.window.last = rec.WindowInfo(from, to)
+	if persist {
+		if err := rec.DiskErr(); err != nil {
+			st.diskErr = err.Error()
+		}
+	}
+	return st
+}
+
+// releasePlot frees the plotted samples while the page is hidden.
+func (p *recorderPage) releasePlot() {
+	p.samples, p.times, p.cpuVals, p.memVals, p.gpuVal = nil, nil, nil, nil, nil
+	p.plotWin, p.plotVer = recorderWindow{}, 0
+}
+
+// curves returns the three timeline curves for [from, to], rebuilding
+// their values only when that window's samples changed. Colours come from the
+// current theme on every paint.
+func (p *recorderPage) curves(from, to int64) []series {
+	span := recorderWindow{from: from, to: to}
+	span.n, span.first, span.last = p.app.rec.WindowInfo(from, to)
+	if span != p.plotWin || p.plotVer == 0 {
+		p.samples = p.app.rec.AppendSamples(p.samples[:0], from, to)
+		n := len(p.samples)
+		p.times = growSlice(p.times, n)
+		p.cpuVals, p.memVals, p.gpuVal = growSlice(p.cpuVals, n), growSlice(p.memVals, n), growSlice(p.gpuVal, n)
+		for i, s := range p.samples {
+			p.times[i], p.cpuVals[i], p.memVals[i] = s.T, s.CPU, s.Mem
+			p.gpuVal[i] = s.GPU
+			if s.GPUUnavailable {
+				p.gpuVal[i] = math.NaN()
+			}
+		}
+		clear(p.samples) // keep only the values; drop the process lists
+		// Describe what was actually copied (a sample may have arrived since).
+		span.n, span.first, span.last = n, 0, 0
+		if n > 0 {
+			span.first, span.last = p.times[0], p.times[n-1]
+		}
+		p.plotWin = span
+		p.plotVer = hashWords(uint64(from), uint64(to), uint64(n), uint64(span.first), uint64(span.last), p.plotVer+1) | 1
+	}
+	return []series{
+		{vals: p.memVals, times: p.times, color: T.Mem, ver: hashWords(p.plotVer, 1)},
+		{vals: p.gpuVal, times: p.times, color: T.GPU, ver: hashWords(p.plotVer, 2)},
+		{vals: p.cpuVals, times: p.times, color: T.CPU, fill: true, ver: hashWords(p.plotVer, 3)},
+	}
+}
+
+func growSlice[E any](s []E, n int) []E {
+	if cap(s) < n {
+		return make([]E, n)
+	}
+	return s[:n]
 }
 
 func (p *recorderPage) export() {
@@ -319,7 +419,6 @@ func (p *recorderPage) onClick(id string, _ walk.MouseButton) {
 func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	rec := p.app.rec
 	from, to := p.window()
-	samples := rec.Samples(from, to)
 	on, hasSamples := rec.Enabled(), rec.Len() > 0
 	state, ink := "Recording off", T.Muted
 	switch {
@@ -392,28 +491,9 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	fillRound(cv, card, 10, T.Card)
 	strokeRound(cv, card, 10, T.Stroke)
 
-	times := make([]int64, len(samples))
-	for i, s := range samples {
-		times[i] = s.T
-	}
-	mk := func(get func(s metrics.RecSample) float64) []float64 {
-		out := make([]float64, len(samples))
-		for i, s := range samples {
-			out[i] = get(s)
-		}
-		return out
-	}
-	ser := []series{
-		{vals: mk(func(s metrics.RecSample) float64 { return s.Mem }), times: times, color: T.Mem},
-		{vals: mk(func(s metrics.RecSample) float64 {
-			if s.GPUUnavailable {
-				return math.NaN()
-			}
-			return s.GPU
-		}), times: times, color: T.GPU},
-		{vals: mk(func(s metrics.RecSample) float64 { return s.CPU }), times: times, color: T.CPU, fill: true},
-	}
-	plotSeries(cv, pr, ser, graphStyle{bg: T.Card, max: 100, timeFrom: from, timeTo: to, grid: true, lineW: 2})
+	// While scrubbing or after a paused tick the curves come from the graph
+	// cache; only the markers, cursor and details below are drawn anew.
+	plotSeries(cv, pr, p.curves(from, to), graphStyle{bg: T.Card, max: 100, timeFrom: from, timeTo: to, grid: true, lineW: 2})
 	drawText(cv, "100%", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + 2, 50, 14}, taLeft)
 	drawText(cv, "0", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + pr.H - 16, 30, 14}, taLeft)
 
