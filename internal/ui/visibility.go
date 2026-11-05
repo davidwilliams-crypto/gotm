@@ -4,8 +4,10 @@ package ui
 
 import (
 	"syscall"
+	"time"
 	"unsafe"
 
+	"github.com/tailscale/walk"
 	"github.com/tailscale/win"
 	"golang.org/x/sys/windows"
 )
@@ -60,11 +62,20 @@ func reasonIf(r hideReason, on bool) hideReason {
 
 // setHidden updates the visibility state and, when the window can be seen
 // again after skipped work, refreshes the current page on the UI thread.
+// When the window stops being visible, graph memory is released: paints stop
+// while hidden, so nothing else would free it.
 func (a *App) setHidden(mask, value hideReason) {
 	before := a.vis.hidden
 	refresh := a.vis.update(mask, value)
 	if a.vis.hidden != before {
 		debugf("visibility: hidden reasons %06b -> %06b", before, a.vis.hidden)
+		if a.vis.hidden&hideSession&^before != 0 {
+			a.sessionSince = time.Now() // polls wait for the switch to settle
+		}
+		if before == 0 {
+			releaseGraphMemory()
+		}
+		a.updateVisibilityTimer()
 	}
 	stallHidden.Store(!a.vis.visible())
 	if refresh {
@@ -98,10 +109,18 @@ func (a *App) queueVisibleRefresh() {
 }
 
 // refreshVisible brings the visible page and chrome up to date with the
-// newest snapshot after work was skipped while hidden.
+// newest snapshot after work was skipped while hidden. The cheap window
+// state is read again first: a refresh queued by an event can run after the
+// window was cloaked or minimized again without a notification.
 func (a *App) refreshVisible() {
 	if !a.vis.visible() || !a.vis.stale {
 		return
+	}
+	if a.mw != nil {
+		a.pollWindowVisibility(win.HWND(a.mw.Handle()))
+		if !a.vis.visible() || !a.vis.stale {
+			return
+		}
 	}
 	a.vis.stale = false
 	if a.side != nil {
@@ -119,8 +138,13 @@ func (a *App) refreshVisible() {
 // skipped: either nobody can see the window, or it has just become visible
 // and refreshVisible has already brought everything up to date.
 func (a *App) skipPresentation() bool {
+	wasStale := a.vis.stale
 	if a.mw != nil {
 		a.pollWindowVisibility(win.HWND(a.mw.Handle()))
+	}
+	a.recheckSession(time.Now(), sessionRecheckGap)
+	if wasStale && a.vis.visible() && !a.vis.stale {
+		return true // a re-check found the window visible and refreshed it
 	}
 	if !a.vis.visible() {
 		a.vis.stale = true
@@ -140,14 +164,229 @@ func (a *App) pollWindowVisibility(hwnd win.HWND) {
 	if hwnd == 0 {
 		return
 	}
-	value := reasonIf(hideMinimized, win.IsIconic(hwnd)) | reasonIf(hideCloaked, windowCloaked(hwnd))
-	a.setHidden(hideMinimized|hideCloaked, value)
+	minimized, cloaked := windowState(hwnd)
+	a.setHidden(hideMinimized|hideCloaked, reasonIf(hideMinimized, minimized)|reasonIf(hideCloaked, cloaked))
+}
+
+// windowState reads whether the window is minimized and whether the shell
+// has cloaked it (another virtual desktop). Replaceable for tests.
+var windowState = func(hwnd win.HWND) (minimized, cloaked bool) {
+	return win.IsIconic(hwnd), windowCloaked(hwnd)
 }
 
 // userPresent clears the session reasons: something the user just did (a
-// second launch, the tray icon, activating the window) proves they can see
-// the screen, even if a lock or display notification was missed.
+// second launch, the tray icon, activating the window, input to one of its
+// windows) proves they can see the screen, even if a lock or display
+// notification was missed.
 func (a *App) userPresent() { a.setHidden(hideSession, 0) }
+
+// userInput is input (a key, a click, the wheel) delivered to one of the
+// window's controls: someone is at the machine and the window is shown on
+// their desktop, so the session and show/hide reasons are cleared and the
+// window state is read again.
+func (a *App) userInput(hwnd win.HWND) {
+	a.setHidden(hideSession|hideHidden, 0)
+	a.pollWindowVisibility(hwnd)
+}
+
+// paintSeen is a WM_PAINT (or frame paint) for the window or one of its
+// controls while it is thought hidden. Windows paints a minimized or cloaked
+// window rarely, and gotm itself invalidates nothing while hidden, so this is
+// a cue that a notification may have been missed: the window state is read
+// again and the session state re-checked (rate limited).
+func (a *App) paintSeen(hwnd win.HWND) {
+	if a.vis.visible() {
+		return
+	}
+	a.pollWindowVisibility(hwnd)
+	a.recheckSession(time.Now(), time.Second)
+}
+
+// Session reasons cannot all be polled, and a missed unlock, reconnect or
+// display-on notification must not leave the page frozen while it is on
+// screen. While one of them is set, the state is re-checked on evidence
+// (paint, activation, input) and at least every sessionRecheckGap from the
+// sampler tick and the visibility timer: a lock or disconnect is cleared when
+// the session is found unlocked and connected again, and the display state
+// is asked for again (Windows answers a new registration with the current
+// state). Polls only ever clear reasons; setting them stays with the
+// notifications, so a probe that cannot tell never hides a visible window.
+// The first poll waits sessionRecheckGap after the notification, so a lock
+// is never undone by a probe that ran before the desktop had switched.
+const sessionRecheckGap = 5 * time.Second
+
+func (a *App) recheckSession(now time.Time, minGap time.Duration) {
+	if a.vis.hidden&hideSession == 0 || now.Sub(a.sessionChecked) < minGap || now.Sub(a.sessionSince) < sessionRecheckGap {
+		return
+	}
+	a.sessionChecked = now
+	var clear hideReason
+	if a.vis.hidden&hideLocked != 0 && sessionUnlocked() {
+		clear |= hideLocked
+	}
+	if a.vis.hidden&hideDisconnected != 0 && sessionConnected() {
+		clear |= hideDisconnected
+	}
+	if clear != 0 {
+		a.setHidden(clear, 0)
+	}
+	if a.vis.hidden&hideDisplayOff != 0 {
+		requeryDisplayState(a)
+	}
+}
+
+// visibility timer: while the window is cloaked or a session reason is set,
+// re-read the state every second, so switching back to gotm's virtual desktop
+// is noticed at once even when the cloak WinEvent does not arrive (and a
+// missed session notification within sessionRecheckGap).
+const (
+	visTimerID     = 0x6F74 // "ot"
+	visTimerPeriod = 1000   // ms
+)
+
+var (
+	procSetTimer  = windows.NewLazySystemDLL("user32.dll").NewProc("SetTimer")
+	procKillTimer = windows.NewLazySystemDLL("user32.dll").NewProc("KillTimer")
+)
+
+func (a *App) updateVisibilityTimer() {
+	want := a.vis.hidden&(hideCloaked|hideSession) != 0
+	if want == a.visTimer || a.mw == nil {
+		return
+	}
+	hwnd := a.mw.Handle()
+	if want {
+		if r, _, _ := procSetTimer.Call(uintptr(hwnd), visTimerID, visTimerPeriod, 0); r == 0 {
+			return
+		}
+	} else {
+		procKillTimer.Call(uintptr(hwnd), visTimerID)
+	}
+	a.visTimer = want
+}
+
+func (a *App) visibilityTimerTick(hwnd win.HWND) {
+	a.pollWindowVisibility(hwnd)
+	a.recheckSession(time.Now(), sessionRecheckGap)
+	a.updateVisibilityTimer()
+}
+
+const (
+	wmMouseHWheel      = 0x020E
+	desktopReadObjects = 0x0001
+	uoiName            = 2
+	wtsConnectState    = 8 // WTS_INFO_CLASS WTSConnectState
+	wtsActive          = 0 // WTS_CONNECTSTATE_CLASS WTSActive
+	wtsCurrentSession  = 0xFFFFFFFF
+)
+
+var (
+	procOpenInputDesktop          = windows.NewLazySystemDLL("user32.dll").NewProc("OpenInputDesktop")
+	procGetThreadDesktop          = windows.NewLazySystemDLL("user32.dll").NewProc("GetThreadDesktop")
+	procCloseDesktop              = windows.NewLazySystemDLL("user32.dll").NewProc("CloseDesktop")
+	procGetUserObjectInformation  = windows.NewLazySystemDLL("user32.dll").NewProc("GetUserObjectInformationW")
+	procWTSQuerySessionInfomation = windows.NewLazySystemDLL("wtsapi32.dll").NewProc("WTSQuerySessionInformationW")
+	procWTSFreeMemory             = windows.NewLazySystemDLL("wtsapi32.dll").NewProc("WTSFreeMemory")
+)
+
+// sessionUnlocked reports whether the desktop receiving input is this
+// thread's desktop: false while the lock screen (the Winlogon desktop) or a
+// secure prompt has it, or when that cannot be determined.
+var sessionUnlocked = func() bool {
+	if procOpenInputDesktop.Find() != nil || procGetUserObjectInformation.Find() != nil {
+		return false
+	}
+	input, _, _ := procOpenInputDesktop.Call(0, 0, desktopReadObjects)
+	if input == 0 {
+		return false // access to the input desktop denied: a secure desktop
+	}
+	defer procCloseDesktop.Call(input)
+	own, _, _ := procGetThreadDesktop.Call(uintptr(windows.GetCurrentThreadId()))
+	name := func(h uintptr) string {
+		var buf [64]uint16
+		var n uint32
+		if r, _, _ := procGetUserObjectInformation.Call(h, uoiName, uintptr(unsafe.Pointer(&buf[0])), unsafe.Sizeof(buf), uintptr(unsafe.Pointer(&n))); r == 0 {
+			return ""
+		}
+		return windows.UTF16ToString(buf[:])
+	}
+	in := name(input)
+	return own != 0 && in != "" && in == name(own)
+}
+
+// sessionConnected reports whether this session is attached to a console or
+// a remote client (WTSActive).
+var sessionConnected = func() bool {
+	if procWTSQuerySessionInfomation.Find() != nil {
+		return false
+	}
+	var buf uintptr
+	var n uint32
+	if r, _, _ := procWTSQuerySessionInfomation.Call(0, wtsCurrentSession, wtsConnectState, uintptr(unsafe.Pointer(&buf)), uintptr(unsafe.Pointer(&n))); r == 0 || buf == 0 {
+		return false
+	}
+	defer procWTSFreeMemory.Call(buf)
+	return n >= 4 && *(*int32)(ptrFrom(buf)) == wtsActive
+}
+
+// requeryDisplayState registers for the console display state again;
+// Windows answers a registration with the current state, which arrives as an
+// ordinary WM_POWERBROADCAST.
+var requeryDisplayState = func(a *App) {
+	if a.mw == nil || a.visNotify.power == 0 || procRegisterPowerSettingNotification.Find() != nil {
+		return
+	}
+	procUnregisterPowerSettingNotificaton.Call(a.visNotify.power)
+	a.visNotify.power, _, _ = procRegisterPowerSettingNotification.Call(uintptr(a.mw.Handle()),
+		uintptr(unsafe.Pointer(&guidConsoleDisplayState)), deviceNotifyWindow)
+}
+
+// visibilityWatcher sees every message gotm's message loop retrieves (Walk
+// runs global pre-translate handlers first) and turns those that prove the
+// window is in front of someone into visibility evidence.
+type visibilityWatcher struct{ a *App }
+
+func (w visibilityWatcher) OnPreTranslate(msg *win.MSG) bool {
+	a := w.a
+	// The common case, a visible window, costs one comparison per message:
+	// evidence only matters while the window is thought hidden.
+	if a.vis.visible() || a.mw == nil || msg.HWnd == 0 {
+		return false
+	}
+	if !isUserInput(msg.Message) && msg.Message != win.WM_PAINT && msg.Message != win.WM_NCPAINT {
+		return false
+	}
+	main := win.HWND(a.mw.Handle())
+	if msg.HWnd != main && win.GetAncestor(msg.HWnd, win.GA_ROOT) != main {
+		return false
+	}
+	a.observeLoopMessage(main, msg.Message)
+	return false
+}
+
+// observeLoopMessage handles a message retrieved for one of the main
+// window's windows (see visibilityWatcher).
+func (a *App) observeLoopMessage(main win.HWND, msg uint32) {
+	if isUserInput(msg) {
+		a.userInput(main)
+		return
+	}
+	a.paintSeen(main)
+}
+
+// isUserInput is keyboard, mouse button and wheel input. Mouse moves are not
+// counted: Windows synthesizes them when a window moves under a still cursor.
+func isUserInput(msg uint32) bool {
+	switch msg {
+	case win.WM_KEYDOWN, win.WM_SYSKEYDOWN, win.WM_CHAR,
+		win.WM_LBUTTONDOWN, win.WM_RBUTTONDOWN, win.WM_MBUTTONDOWN, win.WM_XBUTTONDOWN,
+		win.WM_LBUTTONDBLCLK, win.WM_RBUTTONDBLCLK,
+		win.WM_MOUSEWHEEL, wmMouseHWheel,
+		win.WM_NCLBUTTONDOWN, win.WM_NCRBUTTONDOWN:
+		return true
+	}
+	return false
+}
 
 const (
 	wmWTSSessionChange    = 0x02B1
@@ -207,6 +446,7 @@ type visibilityNotifications struct {
 	wts       bool
 	power     uintptr
 	cloakHook uintptr
+	watcher   bool // visibilityWatcher installed in the message loop
 }
 
 // registerVisibility subscribes the main window to session lock, display
@@ -237,6 +477,13 @@ func (a *App) registerVisibility(hwnd win.HWND) {
 		a.visNotify.cloakHook, _, _ = procSetWinEventHook.Call(eventObjectCloaked, eventObjectUncloaked, 0, cloakHookCB,
 			uintptr(windows.GetCurrentProcessId()), uintptr(windows.GetCurrentThreadId()), wineventOutOfContext)
 	}
+	if !a.visNotify.watcher {
+		// Input and paints reach the controls, not the main window: watch
+		// them in the message loop (registered for the life of the process).
+		walk.App().AddGlobalPreTranslateHandler(visibilityWatcher{a})
+		a.visNotify.watcher = true
+	}
+	graphOwnerShown = a.canvasShown
 	a.pollWindowVisibility(hwnd)
 }
 
@@ -257,12 +504,69 @@ func (a *App) unregisterVisibility(hwnd win.HWND) {
 	if cloakHookApp == a {
 		cloakHookApp = nil
 	}
+	if a.visTimer {
+		procKillTimer.Call(uintptr(hwnd), visTimerID)
+		a.visTimer = false
+	}
+	graphOwnerShown = canvasWindowShown
 	stallHidden.Store(false)
 }
 
+// canvasShown is the App's graphOwnerShown: a canvas is shown while the
+// window can be seen and the canvas sits, visible, on the current page (or
+// in the shell chrome outside every page). It reads gotm's own state rather
+// than IsWindowVisible on the canvas: Walk's layout suspend (WM_SETREDRAW
+// FALSE on the client area) clears WS_VISIBLE on an ancestor without hiding
+// anything, and must not throw away graph caches.
+func (a *App) canvasShown(v *canvasView) bool {
+	if !a.vis.visible() || v.cw == nil || v.cw.IsDisposed() {
+		return false
+	}
+	canvas := win.HWND(v.cw.Handle())
+	if !hasVisibleStyle(canvas) {
+		return false
+	}
+	// Windows between the canvas and its page wrap are the page's own panels
+	// (hidden by the page when not in use). Everything from the wrap up is
+	// decided by the App: the current page, and a.vis for the window.
+	hiddenBelow := false
+	for h := win.GetParent(canvas); h != 0; h = win.GetParent(h) {
+		for k, w := range a.wraps {
+			if w != nil && win.HWND(w.Handle()) == h {
+				return k == a.cur && !hiddenBelow
+			}
+		}
+		if !hasVisibleStyle(h) {
+			hiddenBelow = true
+		}
+	}
+	return true // shell chrome, outside every page
+}
+
+func hasVisibleStyle(h win.HWND) bool {
+	return uint32(win.GetWindowLong(h, win.GWL_STYLE))&win.WS_VISIBLE != 0
+}
+
 // observeVisibility is called from the main window hook for every message.
-func (a *App) observeVisibility(hwnd win.HWND, msg uint32, wp, lp uintptr) {
+// It reports true for a message it consumed (the visibility timer).
+func (a *App) observeVisibility(hwnd win.HWND, msg uint32, wp, lp uintptr) bool {
 	switch msg {
+	case win.WM_TIMER:
+		if wp == visTimerID {
+			a.visibilityTimerTick(hwnd)
+			return true
+		}
+	case win.WM_ACTIVATEAPP:
+		if wp != 0 { // gotm became the foreground application
+			a.userPresent()
+			a.pollWindowVisibility(hwnd)
+		}
+	case win.WM_NCPAINT, win.WM_PAINT, win.WM_ERASEBKGND:
+		a.paintSeen(hwnd)
+	case win.WM_SHOWWINDOW:
+		if wp != 0 {
+			a.paintSeen(hwnd)
+		}
 	case win.WM_SIZE:
 		switch wp {
 		case sizeMinimized:
@@ -272,7 +576,7 @@ func (a *App) observeVisibility(hwnd win.HWND, msg uint32, wp, lp uintptr) {
 		}
 	case win.WM_WINDOWPOSCHANGED:
 		if lp == 0 {
-			return
+			return false
 		}
 		flags := (*win.WINDOWPOS)(ptrFrom(lp)).Flags
 		switch {
@@ -284,6 +588,7 @@ func (a *App) observeVisibility(hwnd win.HWND, msg uint32, wp, lp uintptr) {
 	case win.WM_ACTIVATE:
 		if wp&0xFFFF != waInactive {
 			a.userPresent()
+			a.pollWindowVisibility(hwnd)
 		}
 	case wmWTSSessionChange:
 		if r, value, ok := sessionChange(wp); ok {
@@ -300,6 +605,7 @@ func (a *App) observeVisibility(hwnd win.HWND, msg uint32, wp, lp uintptr) {
 	case win.WM_DESTROY:
 		a.unregisterVisibility(hwnd)
 	}
+	return false
 }
 
 // sessionChange maps a WM_WTSSESSION_CHANGE code to the reason it sets or clears.

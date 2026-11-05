@@ -126,8 +126,8 @@ func TestHistoryMirrorTracksSamplerRing(t *testing.T) {
 	check("overtaken rollback", 3)
 }
 
-// Long series are reduced per output column, but the first and last points,
-// every peak and every gap survive, at their own positions.
+// Long series are reduced per supersampled column, but the first and last
+// points, every peak and every gap survive, at their own positions.
 func TestGraphDecimationKeepsPeaksGapsAndEnds(t *testing.T) {
 	const n, W, H, ss, outW = 14400, 1200, 300, 3, 400
 	vals := make([]float64, n)
@@ -139,8 +139,8 @@ func TestGraphDecimationKeepsPeaksGapsAndEnds(t *testing.T) {
 		vals[i] = math.NaN()
 	}
 	pts, out := graphVertices(nil, nil, series{vals: vals}, graphStyle{}, W, H, ss, outW, 100)
-	if len(pts) > 4*(outW+2)+2 {
-		t.Fatalf("%d vertices for a %d px graph", len(pts), outW)
+	if len(pts) > 4*(W+2)+2 {
+		t.Fatalf("%d vertices for a %d px (supersampled) graph", len(pts), W)
 	}
 	step := float64(W) / float64(n-1)
 	if pts[0].X != 0 || out[0] != vals[0] || pts[len(pts)-1].X < W-1 || out[len(out)-1] != vals[n-1] {

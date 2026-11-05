@@ -174,29 +174,84 @@ var (
 
 const textWidthCacheMax = 512
 
-// textWidth returns the natural width in design units. Walk also uses this
-// routine to count how many characters fit, so request a calculated rectangle
-// explicitly. Otherwise DrawTextEx leaves the supplied width unchanged.
+// measureFontKey names one font at one DPI.
+type measureFontKey struct {
+	f   *walk.Font
+	dpi int
+}
+
+// measureFonts holds a GDI font per face and DPI for measuring (guarded by
+// textWidthMu). Walk keeps the handles it draws with private; these are
+// created from the very same LOGFONT, so they measure identically. The set is
+// bounded by the interned fonts times the DPIs seen, and lives as long as
+// walk's own handles do.
+var measureFonts = map[measureFontKey]win.HFONT{}
+
+func measureFont(f *walk.Font, dpi int) win.HFONT {
+	k := measureFontKey{f, dpi}
+	if h, ok := measureFonts[k]; ok {
+		return h
+	}
+	lf := f.LOGFONTForDPI(dpi)
+	if lf == nil {
+		return 0
+	}
+	h := win.CreateFontIndirect(lf)
+	if h != 0 {
+		measureFonts[k] = h
+	}
+	return h
+}
+
+// textWidth returns the natural width in design units.
+//
+// It measures on the canvas's own DC with DrawTextEx(DT_CALCRECT), which
+// draws nothing. walk's Canvas.MeasureTextPixels must not be used on a paint
+// canvas: it creates an enhanced-metafile DC on first use that only
+// Canvas.Dispose releases, and the canvas walk hands a buffered CustomWidget
+// paint is never disposed. Every buffered paint that measured a new string (a
+// changing value) leaked one GDI object.
 func textWidth(cv *walk.Canvas, s string, f *walk.Font) int {
-	key := textWidthKey{s, f, cv.DPI(), gs}
+	dpi := cv.DPI()
+	key := textWidthKey{s, f, dpi, gs}
 	textWidthMu.Lock()
-	w, ok := textWidths[key]
-	textWidthMu.Unlock()
-	if ok {
+	defer textWidthMu.Unlock()
+	if w, ok := textWidths[key]; ok {
 		return w
 	}
-	b, _, err := cv.MeasureTextPixels(s, f, walk.Rectangle{Width: 10000, Height: 200}, walk.TextLeft|walk.TextSingleLine|walk.TextNoPrefix|win.DT_CALCRECT)
-	if err != nil {
+	px, ok := measureTextPixels(cv.HDC(), s, measureFont(f, dpi))
+	if !ok {
 		return len(s) * 8
 	}
-	w = int(math.Ceil(float64(b.Width) / gs))
-	textWidthMu.Lock()
+	w := int(math.Ceil(float64(px) / gs))
 	if len(textWidths) >= textWidthCacheMax {
 		clear(textWidths)
 	}
 	textWidths[key] = w
-	textWidthMu.Unlock()
 	return w
+}
+
+// measureTextPixels returns the single-line width of s in hfont on hdc, with
+// the flags walk's measurement used, leaving the DC as it was.
+func measureTextPixels(hdc win.HDC, s string, hfont win.HFONT) (int, bool) {
+	if hdc == 0 || hfont == 0 {
+		return 0, false
+	}
+	text, err := windows.UTF16PtrFromString(s)
+	if err != nil {
+		return 0, false
+	}
+	old := win.SelectObject(hdc, win.HGDIOBJ(hfont))
+	if old == 0 {
+		return 0, false
+	}
+	defer win.SelectObject(hdc, old)
+	rc := win.RECT{Right: 10000, Bottom: 200}
+	const flags = win.DT_LEFT | win.DT_SINGLELINE | win.DT_NOPREFIX | win.DT_CALCRECT | win.DT_EDITCONTROL
+	if win.DrawTextEx(hdc, text, -1, &rc, flags, nil) == 0 && s != "" {
+		return 0, false
+	}
+	return int(rc.Right - rc.Left), true
 }
 
 // ---- supersampled graphs ------------------------------------------------------
@@ -377,10 +432,17 @@ func renderGraph(pix []uint32, w, h int, ser []series, st graphStyle) (float64, 
 // strokeGraph paints each finite span of the curve (two points or more) as a
 // line of the given half width with round caps and joins, as GDI's geometric
 // round pen did: the set of pixels whose centre lies within radius of the
-// curve. For a curve that advances left to right that set is, in every
-// column, a single span, so it is computed from the curve's vertical extent
-// per column (lo..hi) dilated by a disk: O(width x line width) per span plus
-// the pixels painted, whatever the number of points.
+// curve. For a curve whose x only advances (or only retreats) that set is, in
+// every column, a single span, so it is computed from the curve's vertical
+// extent per column (lo..hi) dilated by a disk: O(width x line width) per
+// span plus the pixels painted, whatever the number of points.
+//
+// A timed series can run backwards (a repeated or reversed timestamp) and
+// pass through a column twice; one extent per column would then fill the
+// gap between the two passes. Each span is therefore split where x reverses
+// into monotonic runs, painted one by one (their union is the stroke, and the
+// shared turning vertex keeps the join round). Data that only advances is a
+// single run and paints exactly as before.
 func strokeGraph(img []uint32, W, H int, pts []walk.Point, vals []float64, radius float64, color uint32) {
 	R := int(math.Ceil(radius))
 	for i := 0; i < len(vals); {
@@ -393,9 +455,33 @@ func strokeGraph(img []uint32, W, H int, pts []walk.Point, vals []float64, radiu
 			i++
 		}
 		if i-start >= 2 {
-			strokeSpan(img, W, H, pts[start:i], radius, R, color)
+			strokeMonotonicRuns(img, W, H, pts[start:i], radius, R, color)
 		}
 	}
+}
+
+// strokeMonotonicRuns strokes pts as maximal runs in which x never changes
+// direction; consecutive runs share their turning vertex.
+func strokeMonotonicRuns(img []uint32, W, H int, pts []walk.Point, radius float64, R int, color uint32) {
+	start, dir := 0, 0
+	for k := 1; k < len(pts); k++ {
+		d := pts[k].X - pts[k-1].X
+		switch {
+		case d == 0:
+			continue
+		case d > 0:
+			d = 1
+		default:
+			d = -1
+		}
+		if dir == 0 {
+			dir = d
+		} else if d != dir {
+			strokeSpan(img, W, H, pts[start:k], radius, R, color)
+			start, dir = k-1, d
+		}
+	}
+	strokeSpan(img, W, H, pts[start:], radius, R, color)
 }
 
 func strokeSpan(img []uint32, W, H int, pts []walk.Point, radius float64, R int, color uint32) {
@@ -488,14 +574,20 @@ func growFloats(s []float64, n int) []float64 {
 	return s[:n]
 }
 
+// graphNoDecimation draws every point (tests compare against it).
+var graphNoDecimation bool
+
 // graphVertices converts one series to supersampled vertices, appending to
 // pts and vals (vals[i] is NaN where the curve has a gap). Up to two points per
-// output column are kept as drawn. A longer series is decimated per output
-// pixel column: of each finite run of points in a column only the first, the
-// lowest, the highest and the last remain, in their original order and at
-// their own positions, so peaks, end points and gaps survive while the work
-// stays proportional to the graph width. Timed series are bucketed by their
-// time position, so irregular sampling keeps every peak at its moment.
+// supersampled column are kept as drawn. A longer series is decimated per
+// supersampled pixel column, the resolution it is rasterized at: of each
+// finite run of points in a column only the first, the lowest, the highest
+// and the last remain, in their original order. Every point of a column lies
+// at the same x, so the column's vertical extent and its joins to the
+// neighbouring columns are exactly those of the full series: peaks, edges,
+// end points and gaps survive pixel for pixel, while the work stays
+// proportional to the graph width. Timed series are bucketed by their time
+// position, so irregular sampling keeps every peak at its moment.
 func graphVertices(pts []walk.Point, vals []float64, s series, st graphStyle, W, H, ss, outW int, maxV float64) ([]walk.Point, []float64) {
 	n := len(s.vals)
 	step := 0.0
@@ -523,7 +615,7 @@ func graphVertices(pts []walk.Point, vals []float64, s series, st graphStyle, W,
 		}
 		return walk.Point{X: xAt(i), Y: int(hf - f*span)}
 	}
-	if n <= 2*outW {
+	if n <= 2*W || graphNoDecimation {
 		for i, v := range s.vals {
 			if !finiteValue(v) {
 				pts, vals = append(pts, walk.Point{}), append(vals, math.NaN())
@@ -533,8 +625,8 @@ func graphVertices(pts []walk.Point, vals []float64, s series, st graphStyle, W,
 		}
 		return pts, vals
 	}
-	// Bucket by output column; everything left of the chart shares bucket -1
-	// and everything right of it bucket outW. Only x is needed per point.
+	// Bucket by supersampled column; everything left of the chart shares
+	// bucket -1 and everything right of it bucket W. Only x is needed per point.
 	var (
 		active              bool
 		col                 int
@@ -576,9 +668,7 @@ func graphVertices(pts []walk.Point, vals []float64, s series, st graphStyle, W,
 		case c < 0:
 			c = -1
 		case c >= W:
-			c = outW
-		default:
-			c /= ss
+			c = W
 		}
 		if !active || c != col {
 			flush()
@@ -988,13 +1078,48 @@ func hashWords(words ...uint64) uint64 {
 }
 
 // Canvases with cached graphs, so the caches (and the shared surface) can be
-// released once their page is hidden. Checked at most twice a second, from
-// the end of any canvas paint (the footer repaints every tick).
+// released once their page is no longer shown. Checked at most twice a
+// second from the end of any canvas paint (the footer repaints every tick
+// while the window can be seen), and everything is released at once when
+// the window stops being visible (releaseGraphMemory), since nothing paints
+// then.
 var (
 	graphOwners    []*canvasView
 	graphSweptAt   time.Time
 	graphSweepRate = 500 * time.Millisecond
+
+	// graphOwnerShown reports whether a canvas is on screen as far as the
+	// app is concerned. The App installs one based on its own state (window
+	// visibility and the current page); see canvasWindowShown for the
+	// default.
+	graphOwnerShown = canvasWindowShown
 )
+
+// canvasWindowShown is the fallback test of whether a canvas can be seen:
+// its window and every ancestor have WS_VISIBLE, except windows Walk has
+// suspended (WM_SETREDRAW FALSE clears WS_VISIBLE too, but a layout suspend
+// does not hide anything, so it must not drop caches).
+func canvasWindowShown(v *canvasView) bool {
+	if v.cw == nil || v.cw.IsDisposed() {
+		return false
+	}
+	var w walk.Window = v.cw
+	for w != nil {
+		if !hasVisibleStyle(win.HWND(w.Handle())) && !w.Suspended() {
+			return false
+		}
+		widget, ok := w.(walk.Widget)
+		if !ok {
+			break
+		}
+		parent := widget.Parent()
+		if parent == nil {
+			break
+		}
+		w = parent
+	}
+	return true
+}
 
 func registerGraphOwner(v *canvasView) {
 	for _, o := range graphOwners {
@@ -1012,7 +1137,7 @@ func sweepGraphCaches(now time.Time) {
 	graphSweptAt = now
 	kept := graphOwners[:0]
 	for _, v := range graphOwners {
-		if v.cw != nil && !v.cw.IsDisposed() && win.IsWindowVisible(v.cw.Handle()) {
+		if graphOwnerShown(v) {
 			kept = append(kept, v)
 			continue
 		}
@@ -1021,6 +1146,26 @@ func sweepGraphCaches(now time.Time) {
 	clear(graphOwners[len(kept):])
 	graphOwners = kept
 	if graphSS != nil && now.Sub(graphSSUsed) > graphScratchIdle {
-		graphSS, graphOut = nil, nil
+		releaseGraphScratch()
 	}
+}
+
+// releaseGraphScratch frees the shared rendering surfaces (the supersampled
+// image, up to about 24 MB, and the uncached output buffer).
+func releaseGraphScratch() {
+	graphSS, graphOut = nil, nil
+	graphPts, graphVals, graphPoly, graphCount, graphTops, graphLo, graphHi = nil, nil, nil, nil, nil, nil, nil
+}
+
+// releaseGraphMemory drops every cached graph, the pages' derived curves and
+// the shared surfaces. It runs when the window stops being visible: paints
+// stop then, so neither the end-of-paint sweep nor the idle release would.
+// The next paint after the window is shown renders the graphs again.
+func releaseGraphMemory() {
+	for _, v := range graphOwners {
+		v.releaseGraphs()
+	}
+	clear(graphOwners)
+	graphOwners = graphOwners[:0]
+	releaseGraphScratch()
 }
