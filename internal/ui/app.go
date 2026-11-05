@@ -274,10 +274,14 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	a.watchSystem() // sign-out/shutdown save the window state; colour changes re-theme
 	stallWindow.Store(uintptr(a.mw.Handle()))
 	defer stallWindow.Store(0)
+	var exitRyzen *metrics.RyzenSDK // stopped at close, awaited (bounded) after the loop
 	a.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
 		a.saveWindowState()
 		a.ioClosing.Store(true)
-		a.setRyzenSDK(false) // releases the AMD SDK before the process exits
+		if r := a.sensors.Ryzen(); r != nil {
+			exitRyzen = r
+		}
+		a.setRyzenSDK(false) // Stop returns at once; the SDK is released on its own thread
 		a.rec.SetPersist(false)
 		if p, ok := a.pages[pgDisk].impl.(*diskPage); ok && p.cancel != nil {
 			p.cancel()
@@ -294,6 +298,11 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	walk.App().Run()
 	close(a.pumpDone) // pump unsubscribes and exits instead of blocking forever
 	a.finishFileWork()
+	if exitRyzen != nil {
+		// Let the worker finish UnInit so the crash marker is cleared, without
+		// letting a stuck driver hold up exit.
+		exitRyzen.Wait(1500 * time.Millisecond)
+	}
 	return nil
 }
 
