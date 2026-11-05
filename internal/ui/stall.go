@@ -26,6 +26,7 @@ var (
 	stallStart  = time.Now()
 	stallLog    stallLogConfig
 	stallDumps  atomic.Int32
+	stallLines  = make(chan string, 32)
 )
 
 // stallPhase marks a start-up phase boundary (also counts as UI activity).
@@ -46,8 +47,15 @@ func stallWatch(logPath string) {
 	}
 	stallPhase("instrumentation ready")
 	var probeBeat int64
+	timer := time.NewTicker(200 * time.Millisecond)
+	defer timer.Stop()
 	for {
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case line := <-stallLines:
+			writeStallLine(line)
+			continue
+		case <-timer.C:
+		}
 		beat := stallBeat.Load()
 		gap := time.Since(time.UnixMilli(beat))
 		if gap < 1500*time.Millisecond {
@@ -88,6 +96,16 @@ func dumpStall(gap time.Duration) {
 }
 
 func stallLine(s string) {
+	// Diagnostics must not introduce the startup stalls they measure. The
+	// existing watchdog owns all log writes; discard excess phase messages
+	// if its disk is blocked rather than growing work or waiting on the UI.
+	select {
+	case stallLines <- s:
+	default:
+	}
+}
+
+func writeStallLine(s string) {
 	if stallLog.path == "" {
 		return
 	}

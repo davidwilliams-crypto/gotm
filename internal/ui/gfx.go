@@ -113,13 +113,15 @@ func drawText(cv *walk.Canvas, s string, f *walk.Font, c walk.Color, r rect, fla
 	_ = cv.DrawTextPixels(s, f, c, r.wr(), flags|walk.TextEndEllipsis)
 }
 
-// textWidth measures s in pixels.
+// textWidth returns the natural width in design units. Walk also uses this
+// routine to count how many characters fit, so request a calculated rectangle
+// explicitly. Otherwise DrawTextEx leaves the supplied width unchanged.
 func textWidth(cv *walk.Canvas, s string, f *walk.Font) int {
-	b, _, err := cv.MeasureTextPixels(s, f, walk.Rectangle{Width: 10000, Height: 200}, walk.TextLeft|walk.TextSingleLine|walk.TextNoPrefix)
+	b, _, err := cv.MeasureTextPixels(s, f, walk.Rectangle{Width: 10000, Height: 200}, walk.TextLeft|walk.TextSingleLine|walk.TextNoPrefix|win.DT_CALCRECT)
 	if err != nil {
 		return len(s) * 8
 	}
-	return int(float64(b.Width) / gs)
+	return int(math.Ceil(float64(b.Width) / gs))
 }
 
 // ---- supersampled graphs ------------------------------------------------------

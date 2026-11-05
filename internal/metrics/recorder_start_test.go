@@ -15,7 +15,7 @@ func TestRecorderWaitsForManualStart(t *testing.T) {
 		t.Run(map[bool]string{false: "memory", true: "disk"}[persist], func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "recordings")
 			r := NewRecorder(time.Hour, 2*time.Second, dir)
-			t.Cleanup(func() { r.SetPersist(false) })
+			t.Cleanup(func() { closeRecorder(t, r) })
 			r.SetPersist(persist)
 			const base = int64(1_700_000_000_000)
 			r.Add(snap(base, 10))
@@ -44,7 +44,7 @@ func TestRecorderRelaunchWithSavedHistoryStillNeedsManualStart(t *testing.T) {
 	r.SetPersist(true)
 	r.SetEnabled(true)
 	r.Add(snap(base, 20))
-	r.SetPersist(false)
+	closeRecorder(t, r)
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil || len(files) != 1 {
 		t.Fatalf("manual recording was not saved: %v, %v", files, err)
@@ -55,7 +55,7 @@ func TestRecorderRelaunchWithSavedHistoryStillNeedsManualStart(t *testing.T) {
 	}
 
 	relaunched := NewRecorder(time.Hour, 2*time.Second, dir)
-	t.Cleanup(func() { relaunched.SetPersist(false) })
+	t.Cleanup(func() { closeRecorder(t, relaunched) })
 	relaunched.SetPersist(true)
 	if n := relaunched.LoadDisk(time.Hour); n != 1 {
 		t.Fatalf("saved history unavailable before Start: %d samples", n)

@@ -3,6 +3,7 @@
 package ui
 
 import (
+	"context"
 	"github.com/tailscale/walk"
 	"gotm/internal/config"
 	"gotm/internal/metrics"
@@ -15,6 +16,9 @@ func TestOtherSettingsPreserveCurrentProcessSort(t *testing.T) {
 	a.cfg.SortKey, a.cfg.SortDesc = "pid", false
 	if !a.saveConfig(func(c *config.Config) { c.RefreshMs = 2000 }) {
 		t.Fatal("save failed")
+	}
+	if err := a.configWrites.close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	if got := s.Get(); got.SortKey != "pid" || got.SortDesc {
 		t.Fatalf("live sort was overwritten: %s descending=%v", got.SortKey, got.SortDesc)

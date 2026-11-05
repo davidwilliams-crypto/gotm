@@ -23,6 +23,7 @@ import (
 func main() {
 	pid := flag.Uint("pid", 0, "existing process ID")
 	exe := flag.String("launch", "", "optional executable to start")
+	tab := flag.String("tab", "performance", "GOTM page to open when launching")
 	seconds := flag.Int("seconds", 15, "measurement duration (1..60 seconds)")
 	load := flag.Int("load", 0, "bounded busy CPU workers (0..logical CPUs)")
 	flag.Parse()
@@ -47,7 +48,7 @@ func main() {
 	}
 	start := time.Now()
 	if *exe != "" {
-		cmd := exec.Command(*exe, "--tab", "performance")
+		cmd := exec.Command(*exe, "--tab", *tab)
 		if err := cmd.Start(); err != nil {
 			panic(err)
 		}
@@ -62,15 +63,27 @@ func main() {
 	getPID := user.NewProc("GetWindowThreadProcessId")
 	visible := user.NewProc("IsWindowVisible")
 	getTitle := user.NewProc("GetWindowTextW")
+	getClass := user.NewProc("GetClassNameW")
 	send := user.NewProc("SendMessageTimeoutW")
 	var hwnd uintptr
 	cb := windows.NewCallback(func(w uintptr, _ uintptr) uintptr {
 		var p uint32
 		getPID.Call(w, uintptr(unsafe.Pointer(&p)))
+		if p != uint32(*pid) {
+			return 1
+		}
 		v, _, _ := visible.Call(w)
+		if v == 0 {
+			return 1
+		}
+		var class [128]uint16
+		getClass.Call(w, uintptr(unsafe.Pointer(&class[0])), uintptr(len(class)))
+		if !strings.Contains(windows.UTF16ToString(class[:]), "Walk_MainWindow_Class") {
+			return 1
+		}
 		var title [256]uint16
 		getTitle.Call(w, uintptr(unsafe.Pointer(&title[0])), uintptr(len(title)))
-		if p == uint32(*pid) && v != 0 && strings.HasPrefix(strings.ToLower(windows.UTF16ToString(title[:])), "gotm") {
+		if strings.HasPrefix(strings.ToLower(windows.UTF16ToString(title[:])), "gotm") {
 			hwnd = w
 			return 0
 		}
@@ -98,16 +111,23 @@ func main() {
 	getMem := windows.NewLazySystemDLL("psapi.dll").NewProc("GetProcessMemoryInfo")
 	var samples []float64
 	timeouts := 0
+	sendErrors := map[string]int{}
 	var firstResponse int64
 	var peakPrivate, peakWS uintptr
 	deadline := time.Now().Add(time.Duration(*seconds) * time.Second)
 	for time.Now().Before(deadline) {
 		now := time.Now()
 		var result uintptr
-		ok, _, _ := send.Call(hwnd, 0, 0, 0, 3, 1000, uintptr(unsafe.Pointer(&result)))
-		samples = append(samples, float64(time.Since(now).Microseconds())/1000)
+		// Use the actual deadline, not SMTO_ABORTIFHUNG's earlier heuristic.
+		ok, _, sendErr := send.Call(hwnd, 0, 0, 0, 1, 1000, uintptr(unsafe.Pointer(&result)))
+		elapsed := time.Since(now)
+		samples = append(samples, float64(elapsed.Microseconds())/1000)
 		if ok == 0 {
-			timeouts++
+			if sendErr == windows.ERROR_TIMEOUT || elapsed >= time.Second {
+				timeouts++
+			} else {
+				sendErrors[sendErr.Error()]++
+			}
 		} else if firstResponse == 0 {
 			firstResponse = time.Since(start).Milliseconds()
 		}
@@ -124,13 +144,16 @@ func main() {
 	}
 	sort.Float64s(samples)
 	report := map[string]any{"pid": *pid, "load_workers": *load, "samples": len(samples), "timeouts": timeouts, "p50_ms": samples[len(samples)/2], "p95_ms": samples[(len(samples)-1)*95/100], "max_ms": samples[len(samples)-1], "peak_private_bytes": peakPrivate, "peak_working_set_bytes": peakWS}
+	if len(sendErrors) > 0 {
+		report["send_errors"] = sendErrors
+	}
 	if *exe != "" {
 		report["visible_window_ms"] = first
 		report["first_response_ms"] = firstResponse
 	}
 	b, _ := json.Marshal(report)
 	fmt.Println(string(b))
-	if timeouts > 0 {
+	if timeouts > 0 || len(sendErrors) > 0 {
 		os.Exit(1)
 	}
 }

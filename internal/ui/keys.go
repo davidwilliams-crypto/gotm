@@ -68,7 +68,7 @@ func (r *keyRouter) OnPreTranslate(msg *win.MSG) bool {
 			return true
 		}
 	}
-	if r.app != nil {
+	if r.app != nil && r.app.pages[r.app.cur].initialized {
 		focus := win.GetFocus()
 		if p, ok := r.app.pages[r.app.cur].impl.(canvasKeys); ok && p.focusTarget() != nil && win.HWND(p.focusTarget().Handle()) == focus {
 			if (key == walk.KeySpace || key == walk.KeyReturn) && msg.LParam&(1<<30) != 0 {
@@ -112,7 +112,7 @@ func (a *App) setupShortcuts() {
 	// down while an edit control has focus.
 	r.keys = append(r.keys, shortcut{mods: walk.ModControl, key: walk.KeyC, fn: a.copyRows, guard: focusNotEdit})
 	add(0, walk.KeyF5, func() {
-		if rl, ok := a.pages[a.cur].impl.(reloader); ok {
+		if rl, ok := a.pages[a.cur].impl.(reloader); ok && a.pages[a.cur].initialized {
 			rl.reload()
 		}
 	})
@@ -133,6 +133,9 @@ func focusNotEdit() bool {
 
 // focusSearch puts the caret in the current page's search box, text selected.
 func (a *App) focusSearch() {
+	if !a.pages[a.cur].initialized {
+		return
+	}
 	s, ok := a.pages[a.cur].impl.(searcher)
 	if !ok || s.searchBox() == nil {
 		return
@@ -145,6 +148,9 @@ func (a *App) focusSearch() {
 // focusPage gives keyboard focus to the page's main control (its table), so
 // arrow keys work at once and no search box sits there with a blinking caret.
 func (a *App) focusPage() {
+	if !a.pages[a.cur].initialized {
+		return
+	}
 	if f, ok := a.pages[a.cur].impl.(focuser); ok && f.focusTarget() != nil {
 		_ = f.focusTarget().SetFocus()
 		return

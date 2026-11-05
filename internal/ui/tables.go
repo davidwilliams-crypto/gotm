@@ -83,20 +83,18 @@ var styledTables []*walk.TableView
 // styleTable gives a Walk TableView gotm's dark look and turns on native
 // double buffering, which is what stops rows blinking when values refresh.
 func styleTable(tv *walk.TableView) {
-	tv.SetFont(uiFont(10))
+	font := tv.Font()
+	if font == nil || font.Family() != uiFamily || font.PointSize() != 10 || font.Style() != 0 {
+		tv.SetFont(uiFont(10))
+	}
 	for _, lv := range listViews(tv) {
-		allowDark(lv)
-		darkControl(lv, "DarkMode_Explorer")
-		if hdr := win.HWND(win.SendMessage(lv, lvmGetHeader, 0, 0)); hdr != 0 {
-			allowDark(hdr)
-			darkControl(hdr, "DarkMode_ItemsView")
-		}
 		win.SendMessage(lv, win.LVM_SETEXTENDEDLISTVIEWSTYLE, win.LVS_EX_DOUBLEBUFFER, win.LVS_EX_DOUBLEBUFFER)
 	}
 	colorTable(tv)
 	styledTables = append(styledTables, tv)
 	tv.SetGridlines(false)
 	tv.SetAlternatingRowBG(false)
+	hookTable(tv)
 	fillLastColumn(tv)
 	tv.SizeChanged().Attach(func() { fillLastColumn(tv) })
 }
@@ -122,13 +120,24 @@ func colorTable(tv *walk.TableView) {
 	// or resizing. Color that surface too, not just the rows inside it.
 	setBackground(tv, T.TableBG)
 	for _, lv := range listViews(tv) {
+		tableControlTheme(lv, "DarkMode_Explorer")
 		if hdr := win.HWND(win.SendMessage(lv, lvmGetHeader, 0, 0)); hdr != 0 {
-			colorHeaderText(lv, hdr, T.Muted)
+			tableControlTheme(hdr, "DarkMode_ItemsView")
+			styleHeader(lv, hdr)
 		}
 		win.SendMessage(lv, win.LVM_SETBKCOLOR, 0, colorref(T.TableBG))
 		win.SendMessage(lv, win.LVM_SETTEXTBKCOLOR, 0, colorref(T.TableBG))
 		win.SendMessage(lv, win.LVM_SETTEXTCOLOR, 0, colorref(T.Text))
 	}
+}
+
+func tableControlTheme(hwnd win.HWND, class string) {
+	if highContrast {
+		win.SetWindowTheme(hwnd, nil, nil)
+		return
+	}
+	allowDark(hwnd)
+	darkControl(hwnd, class)
 }
 
 func recolorTables() {
@@ -153,9 +162,13 @@ var (
 
 // indentRows makes the first column of tv indent each row by depth(row) icon widths.
 func indentRows(tv *walk.TableView, depth func(row int) int) {
+	hookTable(tv)
+	tvIndent[tv.Handle()] = depth
+}
+
+func hookTable(tv *walk.TableView) {
 	tvHookOnce.Do(func() { tvHookCB = syscall.NewCallback(tvHookProc) })
 	h := win.HWND(tv.Handle())
-	tvIndent[h] = depth
 	if _, done := tvPrev[h]; done {
 		return
 	}
@@ -178,6 +191,16 @@ func tvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 	}
 	if msg == win.WM_NOTIFY && lp != 0 {
 		nmh := (*win.NMHDR)(ptrFrom(lp))
+		if nmh.Code == win.NM_CUSTOMDRAW && headerOf[nmh.HwndFrom] != 0 {
+			draw := (*win.NMLVCUSTOMDRAW)(ptrFrom(lp))
+			if draw.Nmcd.UItemState&win.CDIS_SELECTED != 0 {
+				// Suppress only the theme's selection overlay for this paint.
+				// LVIS_SELECTED remains set for keyboard and screen-reader clients.
+				draw.Nmcd.UItemState &^= win.CDIS_SELECTED
+				draw.ClrTextBk = win.COLORREF(T.RowSel)
+				draw.ClrText = win.COLORREF(T.RowSelText)
+			}
+		}
 		if nmh.Code == win.LVN_GETDISPINFO {
 			di := (*win.NMLVDISPINFO)(ptrFrom(lp))
 			if di.Item.ISubItem == 0 {

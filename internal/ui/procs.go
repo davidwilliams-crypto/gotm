@@ -224,8 +224,9 @@ func (m *procModel) StyleCell(st *walk.CellStyle) {
 	if row < 0 || row >= len(m.rows) || col < 0 || col >= len(m.cols) {
 		return
 	}
-	bg, fg := rowStyle(row, m.tab.tv.CurrentIndex())
-	if row != m.tab.tv.CurrentIndex() {
+	selected := m.tab.tv.CurrentIndex()
+	bg, fg := rowStyle(row, selected)
+	if row != selected {
 		if c := m.cols[col]; c.heat != nil {
 			if a := c.heat(&m.rows[row], m.totalMem); a > 0.03 {
 				if a > 1 {
@@ -234,12 +235,12 @@ func (m *procModel) StyleCell(st *walk.CellStyle) {
 				bg = blend(T.Warn, bg, 0.05+0.30*a)
 			}
 		}
-	}
-	if m.cols[col].key == "cpu" && m.rows[row].CPU >= 50 && row != m.tab.tv.CurrentIndex() {
-		fg = T.Warn
-	}
-	if m.rows[row].Collapsed && m.cols[col].numeric {
-		fg = T.Muted
+		if m.cols[col].key == "cpu" && m.rows[row].CPU >= 50 {
+			fg = T.Warn
+		}
+		if m.rows[row].Collapsed && m.cols[col].numeric {
+			fg = T.Muted
+		}
 	}
 	st.BackgroundColor, st.TextColor = bg, fg
 }
@@ -282,13 +283,17 @@ func newProcsTab(a *App) *procsTab {
 }
 
 func (t *procsTab) build() decl.Widget {
+	want := map[string]bool{"name": true}
+	for _, key := range t.app.cfg.Columns {
+		want[key] = true
+	}
 	cols := make([]decl.TableViewColumn, len(t.model.cols))
 	for i, c := range t.model.cols {
 		al := decl.AlignDefault
 		if c.numeric {
 			al = decl.AlignFar
 		}
-		cols[i] = decl.TableViewColumn{Name: c.key, Title: c.title, Width: c.width, Alignment: al}
+		cols[i] = decl.TableViewColumn{Name: c.key, Title: c.title, Width: c.width, Alignment: al, Hidden: !want[c.key]}
 	}
 	t.bKill = newButton("End task", "", 96, t.endTask)
 	t.bKill.tip = "End the selected process (Delete)"
@@ -306,14 +311,17 @@ func (t *procsTab) build() decl.Widget {
 	t.bPrio = newButton("Priority", "", 104, t.priorityMenu)
 	t.bPrio.glyphRight = true
 	t.bPrio.tip = "Change the selected process's priority"
-	t.bTreeView = newButton("Tree", "", 80, func() { t.setLayout(!t.app.cfg.TreeView, false) })
+	t.bTreeView = newButton("Tree", "", 80, func() { t.app.toggleProcessLayout(true) })
 	t.bTreeView.tip = "Show processes under the process that started them"
 	t.bTreeView.toggle = true
-	t.bGroup = newButton("Group", "", 90, func() { t.setLayout(false, !t.app.cfg.GroupByName) })
+	t.bGroup = newButton("Group", "", 90, func() { t.app.toggleProcessLayout(false) })
 	t.bGroup.tip = "Combine processes with the same name"
 	t.bGroup.toggle = true
-	t.bExpand = newButton("Expand all", "", 104, t.expandAll)
-	t.bFold = newButton("Collapse all", "", 112, t.collapseAll)
+	t.bExpand = newButton("Expand all", "\uE70D", 104, t.expandAll)
+	t.bFold = newButton("Collapse all", "\uE70E", 112, t.collapseAll)
+
+	filterBar := tableFilter(&t.filter, processFilterCue, "Search processes", t.refresh)
+	filterBar = append(filterBar, decl.HSpacer{}, t.bExpand.widget(), t.bFold.widget(), t.bTreeView.widget(), t.bGroup.widget())
 
 	return decl.Composite{
 		AssignTo:      &t.root,
@@ -327,32 +335,13 @@ func (t *procsTab) build() decl.Widget {
 				Background:    decl.SolidColorBrush{Color: T.Bg},
 				Layout:        decl.VBox{Margins: padBody, Spacing: 10},
 				Children: []decl.Widget{
-					decl.Composite{
-						Background: decl.SolidColorBrush{Color: T.Bg},
-						Layout:     decl.HBox{MarginsZero: true, Spacing: 8},
-						MinSize:    decl.Size{Height: 38},
-						MaxSize:    decl.Size{Height: 38},
-						Children: []decl.Widget{
-							t.bKill.widget(), t.bTree.widget(), t.bSusp.widget(), t.bRes.widget(),
-							t.bAff.widget(), t.bLoc.widget(),
-							t.bPrio.widget(),
-							decl.HSpacer{},
-						},
-					},
-					decl.Composite{
-						Background: decl.SolidColorBrush{Color: T.Bg},
-						Layout:     decl.HBox{MarginsZero: true, Spacing: 8},
-						MinSize:    decl.Size{Height: 38}, MaxSize: decl.Size{Height: 38},
-						Children: []decl.Widget{
-							decl.LineEdit{AssignTo: &t.filter, CueBanner: "Search name, PID, user, path",
-								MinSize: decl.Size{Width: 260}, MaxSize: decl.Size{Width: 260},
-								Accessibility: decl.Accessibility{Name: "Search processes", Accelerator: "Ctrl+F"},
-								Background:    decl.SolidColorBrush{Color: T.Card}, TextColor: T.Text,
-								OnTextChanged: func() { t.refresh() }},
-							decl.HSpacer{},
-							t.bExpand.widget(), t.bFold.widget(), t.bTreeView.widget(), t.bGroup.widget(),
-						},
-					},
+					commandRow([]decl.Widget{
+						t.bKill.widget(), t.bTree.widget(), t.bSusp.widget(), t.bRes.widget(),
+						t.bAff.widget(), t.bLoc.widget(),
+						t.bPrio.widget(),
+						decl.HSpacer{},
+					}),
+					commandRow(filterBar),
 					decl.TableView{
 						AssignTo:              &t.tv,
 						StretchFactor:         bodyStretch,
@@ -364,7 +353,7 @@ func (t *procsTab) build() decl.Widget {
 						OnKeyDown:             t.onKeyDown,
 						OnCurrentIndexChanged: t.onSelectionChanged,
 					},
-					decl.Label{AssignTo: &t.count, Text: "", TextColor: T.Muted},
+					decl.Label{AssignTo: &t.count, TextColor: T.Muted, EllipsisMode: decl.EllipsisEnd},
 				},
 			},
 			t.app.foots[pgProcesses].declare(0, 32, 0, 32, 0),
@@ -390,13 +379,14 @@ func (t *procsTab) contextMenu() []decl.MenuItem {
 	}
 }
 
+const processFilterCue = "Search name, PID, user or path"
+
 func (t *procsTab) init() {
 	t.app.registerRoot(pgProcesses, t.root)
 	t.tv.SetRestoringCurrentItemOnReset(false) // selection is restored by refresh()
-	_ = t.tv.SetModel(t.model)
 	styleTable(t.tv)
 	nameTable(t.tv, "Processes table")
-	searchCue(t.filter, "Search name, PID, user, path   (Ctrl+F)", t.tv)
+	searchCue(t.filter, processFilterCue+"  (Ctrl+F)", t.tv)
 	t.bExpand.v.cw.SetVisible(false) // only shown in tree layout; keeps the minimum width small
 	t.bFold.v.cw.SetVisible(false)
 	t.applyColumns()
@@ -415,7 +405,7 @@ func (t *procsTab) searchBox() *walk.LineEdit { return t.filter }
 func (t *procsTab) focusTarget() walk.Window  { return t.tv }
 func (t *procsTab) reload()                   { t.refresh() }
 
-func (t *procsTab) shown()                 { t.refresh() }
+func (t *procsTab) shown()                 {} // showPage immediately delivers the latest snapshot through tick.
 func (t *procsTab) tick(*metrics.Snapshot) { t.refresh() }
 
 func (t *procsTab) syncToggles() {
@@ -425,7 +415,7 @@ func (t *procsTab) syncToggles() {
 
 // applyColumns shows exactly the columns chosen in Settings (Name is always on).
 func (t *procsTab) applyColumns() {
-	if t.tv == nil {
+	if t.tv == nil || t.tv.Columns().Len() != len(t.model.cols) {
 		return
 	} // Settings can change columns before the first visit.
 	want := map[string]bool{"name": true}
@@ -577,16 +567,6 @@ func (t *procsTab) updateControls() {
 }
 
 // ---- layout / tree controls -------------------------------------------------
-
-func (t *procsTab) setLayout(tree, group bool) {
-	if tree && group {
-		group = false
-	}
-	t.selKey = ""
-	t.app.saveConfig(func(c *configT) { c.TreeView, c.GroupByName = tree, group })
-	t.syncToggles()
-	t.refresh()
-}
 
 // activateRow handles a double-click: expand or collapse a branch in the tree
 // layout, otherwise open the program's folder.

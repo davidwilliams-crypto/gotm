@@ -242,7 +242,6 @@ type gridPage struct {
 	cols   []decl.TableViewColumn
 	top    []decl.Widget // widgets placed between the toolbar and the table
 	left   []decl.Widget // buttons placed before the spacer
-	extra  []decl.Widget // widgets placed after the spacer, before the filter
 	last   string
 
 	filterPlaceholder string
@@ -271,29 +270,11 @@ func newGridPage(a *App, id int, cols []decl.TableViewColumn, numeric ...int) *g
 func (g *gridPage) build() decl.Widget {
 	bar := append([]decl.Widget{}, g.left...)
 	bar = append(bar, decl.HSpacer{})
-	filterBar := append([]decl.Widget{}, g.extra...)
-	filterBar = append(filterBar, decl.LineEdit{AssignTo: &g.filter, CueBanner: g.filterPlaceholder,
-		MinSize: decl.Size{Width: 280}, MaxSize: decl.Size{Width: 280},
-		Accessibility: decl.Accessibility{Name: g.filterPlaceholder, Accelerator: "Ctrl+F"},
-		Background:    decl.SolidColorBrush{Color: T.Card}, TextColor: T.Text,
-		OnTextChanged: func() {
-			if g.onFilter != nil {
-				g.onFilter()
-			}
-		}}, decl.HSpacer{}, decl.Label{Text: "Ctrl+F to search · Esc to clear", TextColor: T.Faint})
+	filterBar := tableFilter(&g.filter, g.filterPlaceholder, g.filterPlaceholder, g.onFilter)
+	filterBar = append(filterBar, decl.HSpacer{})
 	kids := []decl.Widget{
-		decl.Composite{
-			Background: decl.SolidColorBrush{Color: T.Bg},
-			Layout:     decl.HBox{MarginsZero: true, Spacing: 8},
-			MinSize:    decl.Size{Height: 38},
-			MaxSize:    decl.Size{Height: 38},
-			Children:   bar,
-		},
-		decl.Composite{
-			Background: decl.SolidColorBrush{Color: T.Bg},
-			Layout:     decl.HBox{MarginsZero: true, Spacing: 8},
-			MinSize:    decl.Size{Height: 30}, MaxSize: decl.Size{Height: 30}, Children: filterBar,
-		},
+		commandRow(bar),
+		commandRow(filterBar),
 	}
 	kids = append(kids, g.top...)
 	kids = append(kids,
@@ -319,7 +300,7 @@ func (g *gridPage) build() decl.Widget {
 				}
 			},
 		},
-		decl.Label{AssignTo: &g.status, TextColor: T.Muted},
+		decl.Label{AssignTo: &g.status, TextColor: T.Muted, EllipsisMode: decl.EllipsisEnd},
 	)
 	return decl.Composite{
 		AssignTo:      &g.root,
@@ -344,11 +325,44 @@ func (g *gridPage) init() {
 	g.model.tv = g.tv
 	g.model.noSort = g.noSort
 	g.tv.SetRestoringCurrentItemOnReset(false)
-	_ = g.tv.SetModel(g.model)
 	styleTable(g.tv)
 	nameTable(g.tv, g.app.pages[g.id].title+" table")
 	g.model.ready = true
-	searchCue(g.filter, g.filterPlaceholder+"   (Ctrl+F)", g.tv)
+	searchCue(g.filter, g.filterPlaceholder+"  (Ctrl+F)", g.tv)
+}
+
+func commandRow(children []decl.Widget) decl.Composite {
+	return decl.Composite{
+		Background: decl.SolidColorBrush{Color: T.Bg},
+		Layout:     decl.HBox{MarginsZero: true, Spacing: 5},
+		MinSize:    decl.Size{Height: 34},
+		MaxSize:    decl.Size{Height: 34},
+		Children:   children,
+	}
+}
+
+// Keep the native edit for keyboard editing and assistive technology. Clear
+// is independently focusable while there is text, including a whitespace query.
+func tableFilter(edit **walk.LineEdit, cue, name string, changed func()) []decl.Widget {
+	clear := newButton("Clear", "\uE894", 68, func() {
+		_ = (*edit).SetFocus()
+		_ = (*edit).SetText("")
+	})
+	clear.enabled, clear.tip = false, "Clear search (Esc)"
+	return []decl.Widget{
+		decl.LineEdit{
+			AssignTo: edit, CueBanner: cue + "  (Ctrl+F)",
+			MinSize: decl.Size{Width: 116, Height: 26}, MaxSize: decl.Size{Width: 306, Height: 26},
+			Accessibility: decl.Accessibility{Name: name, Accelerator: "Ctrl+F", Description: "Type to filter. Escape clears the search. Down moves to the results."},
+			Background:    decl.SolidColorBrush{Color: T.Card}, TextColor: T.Text,
+			OnTextChanged: func() {
+				clear.set((*edit).Text() != "", false)
+				if changed != nil {
+					changed()
+				}
+			},
+		}, clear.widget(),
+	}
 }
 
 func (g *gridPage) searchBox() *walk.LineEdit { return g.filter }

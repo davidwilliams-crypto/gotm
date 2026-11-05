@@ -15,89 +15,120 @@ import (
 
 // ---- sidebar -------------------------------------------------------------------
 
-const (
-	sideItemH = 40
-	sideTop   = 84
-)
+// sidebarWidth uses two fixed widths so resizing within a band never causes
+// another round of native layout work.
+func sidebarWidth(clientWidth int) int {
+	if clientWidth < 1030 {
+		return 168
+	}
+	return 204
+}
 
 func (a *App) paintSidebar(cv *walk.Canvas, w, h int) {
 	v := a.side
 	if v.keyHit == "" {
-		v.keyHit = fmt.Sprintf("nav:%d", a.cur) // keyboard focus starts on the current page
+		v.keyHit = fmt.Sprintf("nav:%d", a.cur)
 	}
-
-	// brand
-	drawText(cv, "gotm", uiBold(18), T.Text, rect{22, 16, w - 40, 32}, taLeft)
-	drawText(cv, "TASK MANAGER", uiFont(8), T.Muted, rect{24, 46, w - 40, 16}, taLeft)
-	v.addText(rect{22, 16, w - 40, 46}, "gotm task manager")
-
-	// Ten items, the section label and the pinned Settings item must fit; on
-	// short windows (small laptops at 125-150 %) the rows get tighter.
-	itemH := sideItemH
-	if avail := h - sideTop - 32 - 70; avail < 10*itemH {
-		itemH = max(26, avail/10)
+	brandH, sectionH, gap := 70, 25, 12
+	if h < 540 {
+		brandH, sectionH, gap = 46, 18, 5
 	}
-	y := sideTop
-	item := func(i int, y int) {
+	itemH := clampI((h-brandH-2*sectionH-2*gap-8)/pgCount, 24, 40)
+	if a.mw != nil && a.mw.Icon() != nil {
+		_ = cv.DrawImageStretchedPixels(a.mw.Icon(), rect{18, (brandH - 32) / 2, 32, 32}.wr())
+	}
+	drawText(cv, "gotm", uiBold(17), T.Text, rect{60, (brandH - 44) / 2, w - 70, 29}, taLeft)
+	drawText(cv, "Task Manager", uiFont(9), T.Muted, rect{61, (brandH-44)/2 + 28, w - 70, 17}, taLeft)
+	v.addText(rect{18, 0, w - 32, brandH}, "gotm Task Manager")
+	fillRect(cv, rect{w - 1, 0, 1, h}, T.Stroke)
+
+	y := brandH
+	section := func(name string) {
+		r := rect{20, y, w - 36, sectionH}
+		drawText(cv, name, uiBold(8), T.Faint, r, taLeft)
+		v.addText(r, name)
+		y += sectionH
+	}
+	item := func(i, y int) {
 		p := a.pages[i]
-		r := rect{10, y, w - 20, itemH - 4}
+		r := rect{8, y, w - 17, itemH - 3}
 		id := fmt.Sprintf("nav:%d", i)
+		name := p.title
+		selected := i == a.cur && p.initialized
+		pending := a.opening != nil && a.opening.id == i
+		ink, glyphInk := T.Muted, T.Faint
+		font := uiFont(10)
 		switch {
-		case i == a.cur:
-			fillRound(cv, r, 8, blend(T.Accent, T.Side, 0.28))
-			fillRect(cv, rect{r.X, r.Y + 9, 3, r.H - 18}, T.Accent)
+		case pending:
+			strokeRound(cv, r, 5, T.Accent)
+			ink, glyphInk = T.Text, T.Accent
+			name += ", opening"
+		case selected:
+			fill, marker := T.CardSel, T.Accent
+			ink, glyphInk = T.Text, T.Accent
+			if highContrast {
+				fill, marker, ink, glyphInk = T.RowSel, T.RowSelText, T.RowSelText, T.RowSelText
+			}
+			fillRound(cv, r, 5, fill)
+			fillRect(cv, rect{r.X, r.Y + r.H/4, 3, r.H / 2}, marker)
+			font = uiSemibold(10)
 		case v.hover == id:
-			fillRound(cv, r, 8, blend(T.Text, T.Side, 0.07))
+			fillRound(cv, r, 5, T.CardHi)
+			ink, glyphInk = T.Text, T.Text
 		}
-		ink := T.Muted
-		if i == a.cur || v.hover == id {
-			ink = T.Text
-		}
-		drawText(cv, p.glyph, iconFont(12), ink, rect{r.X + 14, r.Y, 24, r.H}, taLeft)
-		drawText(cv, p.title, uiFont(10), ink, rect{r.X + 46, r.Y, r.W - 54, r.H}, taLeft)
-		v.addItem(r, id, p.title, ctlListItem, i == a.cur)
+		drawText(cv, p.glyph, iconFont(12), glyphInk, rect{r.X + 12, r.Y, 22, r.H}, taCenter)
+		drawText(cv, p.title, font, ink, rect{r.X + 45, r.Y, r.W - 50, r.H}, taLeft)
+		v.addItem(r, id, name, ctlListItem, selected)
 	}
-
+	section("System")
 	for i := pgPerformance; i <= pgServices; i++ {
 		item(i, y)
 		y += itemH
 	}
-
-	// Advanced monitoring tools share the same access as the main pages.
-	y += 10
-	drawText(cv, "INSIGHTS", uiBold(8), T.Muted, rect{24, y, 72, 16}, taLeft)
-	v.addText(rect{24, y, 72, 16}, "Insights")
-	hline(cv, 100, w-20, y+8, T.Stroke)
-	y += 22
+	y += gap
+	section("Insights")
 	for i := pgPower; i <= pgDisk; i++ {
 		item(i, y)
 		y += itemH
 	}
-
-	// settings pinned to the bottom, or just below the list if that is lower
-	sy := max(h-16-itemH, y+8)
-	hline(cv, 18, w-18, sy-6, T.Stroke)
+	sy := h - 6 - itemH
+	hline(cv, 16, w-16, sy-3, T.Stroke)
 	item(pgSettings, sy)
 }
 
 // ---- header --------------------------------------------------------------------
 
 func (a *App) paintHeader(cv *walk.Canvas, w, h int, page int) {
-	p := a.pages[page]
-	titleW := w - 56
-	if a.alertText != "" {
-		titleW -= min(400, w/2) + 16
+	p, v := a.pages[page], a.heads[page]
+	title := rect{24, 7, w - 48, 37}
+	sub := rect{25, 44, w - 50, 23}
+	subtitle := p.subtitle
+	if a.opening != nil {
+		subtitle = "Opening " + a.pages[a.opening.id].title + "…"
 	}
-	drawText(cv, p.title, uiLight(24), T.Text, rect{28, 8, titleW, 38}, taLeft)
-	drawText(cv, p.subtitle, uiFont(10), T.Muted, rect{30, 46, w - 60, 20}, taLeft)
-	a.heads[page].addText(rect{28, 8, titleW, 58}, p.title+". "+p.subtitle)
+	var alert rect
 	if a.alertText != "" {
-		aw := min(400, w/2)
-		r := rect{w - aw - 24, 8, aw, 34}
-		fillRound(cv, r, 8, blend(T.Warn, T.Bg, 0.22))
-		strokeRound(cv, r, 8, blend(T.Warn, T.Bg, 0.6))
-		drawText(cv, "⚠  "+a.alertText, uiFont(10), T.Warn, rect{r.X + 12, r.Y, r.W - 20, r.H}, taLeft)
-		a.heads[page].addText(r, "Alert: "+a.alertText)
+		if w >= 760 {
+			aw := min(textWidth(cv, a.alertText, uiFont(9))+40, w/2)
+			alert = rect{w - 24 - aw, 22, aw, 30}
+			title.W, sub.W = alert.X-40, alert.X-40
+		} else {
+			// Give the warning its own line when it would squeeze the title.
+			alert = rect{24, 45, w - 48, 25}
+			sub.W = 0
+		}
+	}
+	drawText(cv, p.title, uiSemibold(21), T.Text, title, taLeft)
+	v.addText(title, p.title)
+	if sub.W > 0 {
+		drawText(cv, subtitle, uiFont(10), T.Muted, sub, taLeft)
+		v.addText(sub, subtitle)
+	}
+	if alert.W > 0 {
+		fillRound(cv, alert, 5, blend(T.Warn, T.Bg, 0.12))
+		fillRect(cv, rect{alert.X, alert.Y + 4, 3, alert.H - 8}, T.Warn)
+		drawText(cv, a.alertText, uiFont(9), T.Warn, rect{alert.X + 12, alert.Y, alert.W - 20, alert.H}, taLeft)
+		v.addText(alert, "Alert: "+a.alertText)
 	}
 	hline(cv, 0, w, h-1, T.Stroke)
 }
@@ -105,73 +136,80 @@ func (a *App) paintHeader(cv *walk.Canvas, w, h int, page int) {
 // ---- footer --------------------------------------------------------------------
 
 func (a *App) paintFooter(cv *walk.Canvas, w, h int, page int) {
+	v, s := a.foots[page], a.snap
 	hline(cv, 0, w, 0, T.Stroke)
-	v := a.foots[page]
-	s := a.snap
-
-	dot := T.Good
-	state := "Live"
-	if s == nil {
-		dot, state = T.Warn, "Starting…"
-	}
-	fillRound(cv, rect{20, h/2 - 4, 8, 8}, 4, dot)
-	parts := state
-	if s != nil {
-		parts += fmt.Sprintf("  •  %d processes", s.Mem.Processes)
-		if w >= 1100 {
-			parts += fmt.Sprintf("  •  %d threads", s.Mem.Threads)
-		}
-		if a.localIP != "" && w >= 1100 {
-			parts += "  •  IP " + a.localIP
-		}
-		parts += "  •  Up " + fmtDur(s.Uptime)
-	}
-	drawText(cv, parts, uiFont(9), T.Muted, rect{38, 0, w - 360, h}, taLeft)
-	v.addText(rect{20, 0, w - 342, h}, strings.ReplaceAll(parts, "  •  ", ", "))
-
-	// recorder indicator
-	rec := "REC off"
-	recC := T.Faint
-	if a.rec.Enabled() {
-		span := time.Duration(0)
+	recOn := a.rec.Enabled()
+	rec, recName, recInk := "Recording off", "Flight recorder off; turn on", T.Muted
+	if recOn {
+		rec, recInk = "Recording on", T.Bad
 		if first, ok := a.rec.Oldest(); ok {
 			if last, ok := a.rec.Nearest(time.Now().UnixMilli()); ok {
-				span = time.Duration(last.T-first) * time.Millisecond
+				rec = "Recording  " + humanDur(time.Duration(last.T-first)*time.Millisecond)
 			}
 		}
-		rec = "REC  " + humanDur(span)
-		recC = T.Bad
+		recName = rec + "; turn off"
 	}
-	rr := rect{w - 300, 4, 104, h - 8}
-	if v.hover == "rec" {
-		fillRound(cv, rr, 6, blend(T.Text, T.Side, 0.08))
+	admin := "Run as administrator"
+	if a.host.Elevated {
+		admin = "Administrator"
+		if a.elevatedAs != "" {
+			admin += " (" + a.elevatedAs + ")"
+		}
 	}
-	fillRound(cv, rect{rr.X + 10, h/2 - 4, 8, 8}, 4, recC)
-	drawText(cv, rec, uiFont(9), recC, rect{rr.X + 24, 0, rr.W - 24, h}, taLeft)
-	recName := "Flight recorder off; turn on"
-	if a.rec.Enabled() {
-		recName = "Flight recorder on, " + strings.TrimPrefix(rec, "REC  ") + " recorded; turn off"
+	font := uiFont(9)
+	aw := min(textWidth(cv, admin, font)+20, max(128, w/4))
+	ar := rect{w - 8 - aw, 3, aw, h - 6}
+	rw := min(156, textWidth(cv, rec, font)+34)
+	rr := rect{ar.X - 8 - rw, 3, rw, h - 6}
+	live, dot := "Live", T.Good
+	if s == nil {
+		live, dot = "Starting…", T.Faint
 	}
-	v.addItem(rr, "rec", recName, ctlButton, a.rec.Enabled())
-
-	// admin chip
-	label, ink := "Administrator", T.Good
-	if a.elevatedAs != "" {
-		label = "Administrator (" + a.elevatedAs + ")" // a different account's settings and startup items
+	lw := textWidth(cv, live, uiSemibold(9)) + 4
+	fillRound(cv, rect{16, h/2 - 3, 6, 6}, 3, dot)
+	drawText(cv, live, uiSemibold(9), T.Text, rect{28, 0, lw, h}, taLeft)
+	v.addText(rect{16, 0, lw + 12, h}, live)
+	x := 28 + lw + 14
+	if s != nil && rr.X-x > 96 {
+		details := fmt.Sprintf("%d processes", s.Mem.Processes)
+		if rr.X-x >= 510 {
+			details += fmt.Sprintf("   ·   %d threads", s.Mem.Threads)
+			if a.localIP != "" && rr.X-x >= 610 {
+				details += "   ·   " + a.localIP
+			}
+		}
+		if rr.X-x >= 220 {
+			details += "   ·   Up " + fmtDur(s.Uptime)
+		}
+		r := rect{x, 0, rr.X - x - 8, h}
+		drawText(cv, details, font, T.Muted, r, taLeft)
+		v.addText(r, strings.ReplaceAll(details, "   ·   ", ", "))
 	}
-	if !a.host.Elevated {
-		label, ink = "Run as administrator", T.Muted
+	if v.hover == "rec" || v.down == "rec" {
+		fillRound(cv, rr, 4, T.CardHi)
 	}
-	ar := rect{w - 188, 4, 172, h - 8}
-	if v.hover == "admin" && !a.host.Elevated {
-		fillRound(cv, ar, 6, blend(T.Accent, T.Side, 0.25))
-		ink = T.Text
-	}
-	drawText(cv, label, uiFont(9), ink, ar, taRight)
-	if !a.host.Elevated {
-		v.addItem(ar, "admin", "Run as administrator", ctlButton, false)
+	ring := rect{rr.X + 9, h/2 - 4, 9, 9}
+	if recOn {
+		fillRound(cv, ring, 5, recInk)
 	} else {
-		v.addText(ar, label)
+		strokeRound(cv, ring, 5, recInk)
+	}
+	drawText(cv, rec, font, recInk, rect{rr.X + 24, rr.Y, rr.W - 28, rr.H}, taLeft)
+	v.addItem(rr, "rec", recName, ctlCheckBox, recOn)
+
+	fillRect(cv, rect{ar.X - 4, h/2 - 6, 1, 12}, T.Stroke)
+	ink := T.Muted
+	if !a.host.Elevated {
+		ink = T.Accent
+		if v.hover == "admin" {
+			fillRound(cv, ar, 4, T.CardHi)
+		}
+	}
+	drawText(cv, admin, font, ink, ar.inset(2), taCenter)
+	if a.host.Elevated {
+		v.addText(ar, admin)
+	} else {
+		v.addItem(ar, "admin", admin, ctlButton, false)
 	}
 	if v.keyHit == "" {
 		v.keyHit = "rec"

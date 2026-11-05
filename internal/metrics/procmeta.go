@@ -9,97 +9,133 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type procMeta struct{ path, user string }
+type procMeta struct{ path, sid string }
 
 type sidAccountEntry struct {
-	name  string
-	until time.Time
+	name    string
+	until   time.Time
+	pending bool
 }
 
 // Account names belong to SIDs, not processes. Keep completed lookups bounded
-// and briefly cache failures so an unreachable domain is not contacted once
-// for every process in the first sample. A miss never holds the hit-path lock.
+// and briefly cache failures. Neither a miss nor a full work queue waits for
+// domain resolution. The two workers may block in Windows, but cannot block
+// sampling or grow into an unbounded number of goroutines.
 type sidAccountCache struct {
-	mu        sync.Mutex
-	resolveMu sync.Mutex
-	entries   map[string]sidAccountEntry
-	limit     int
+	mu      sync.Mutex
+	entries map[string]*sidAccountEntry
+	limit   int
+	jobs    chan string
 }
 
-func newSIDAccountCache(limit int) *sidAccountCache {
+func newSIDAccountCache(limit int, resolve func(string) (string, bool)) *sidAccountCache {
 	if limit < 1 {
 		limit = 1
 	}
-	return &sidAccountCache{entries: make(map[string]sidAccountEntry), limit: limit}
+	c := &sidAccountCache{entries: make(map[string]*sidAccountEntry), limit: limit, jobs: make(chan string, 64)}
+	for i := 0; i < 2; i++ {
+		go func() {
+			for sid := range c.jobs {
+				name, ok := resolve(sid) // owned SID string; no process/token handle escapes
+				ttl := 5 * time.Minute
+				if !ok {
+					name = ""
+					ttl = 30 * time.Second
+				}
+				c.mu.Lock()
+				c.entries[sid] = &sidAccountEntry{name: name, until: time.Now().Add(ttl)}
+				c.mu.Unlock()
+			}
+		}()
+	}
+	return c
 }
 
-var processAccounts = newSIDAccountCache(256)
+var processAccounts = newSIDAccountCache(256, resolveSIDAccount)
 
-func (c *sidAccountCache) cached(sid string) (string, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.entries[sid]
-	return e.name, ok && time.Now().Before(e.until)
-}
-
-func (c *sidAccountCache) lookup(sid string, resolve func() (string, bool)) string {
+func (c *sidAccountCache) lookup(sid string) string {
 	if sid == "" {
-		name, _ := resolve()
-		return name
+		return ""
 	}
-	if name, ok := c.cached(sid); ok {
-		return name
-	}
-	// Serialize misses, then recheck: simultaneous processes with the same
-	// owner share one domain lookup without creating per-process goroutines.
-	c.resolveMu.Lock()
-	defer c.resolveMu.Unlock()
-	if name, ok := c.cached(sid); ok {
-		return name
-	}
-	name, ok := resolve()
-	ttl := 5 * time.Minute
-	if !ok {
-		ttl = 30 * time.Second
-	}
-	entry := sidAccountEntry{name: name, until: time.Now().Add(ttl)}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, exists := c.entries[sid]; !exists && len(c.entries) >= c.limit {
+	e, exists := c.entries[sid]
+	if exists && (e.pending || time.Now().Before(e.until)) {
+		if e.name != "" {
+			return e.name
+		}
+		return sid
+	}
+	// Preserve completed cache entries under queue pressure. Producers hold
+	// mu, so a slot can only become more available while this check runs.
+	if len(c.jobs) == cap(c.jobs) {
+		return sid
+	}
+	if !exists && len(c.entries) >= c.limit {
 		var oldest string
 		var until time.Time
 		for key, e := range c.entries {
-			if oldest == "" || e.until.Before(until) {
+			if !e.pending && (oldest == "" || e.until.Before(until)) {
 				oldest, until = key, e.until
 			}
 		}
+		if oldest == "" {
+			return sid
+		} // all slots are queued/in flight; retry next tick
 		delete(c.entries, oldest)
 	}
-	c.entries[sid] = entry
-	return name
+	select {
+	case c.jobs <- sid:
+		c.entries[sid] = &sidAccountEntry{pending: true}
+	default:
+		// No pending entry for dropped work: a later sample may retry it.
+		if exists {
+			delete(c.entries, sid)
+		}
+	}
+	return sid
 }
 
-// metaCache resolves slow-changing per-process facts (image path, owner) once
-// per process instance (PID + creation time) instead of every tick.
+func resolveSIDAccount(sidText string) (string, bool) {
+	sid, err := windows.StringToSid(sidText)
+	if err != nil {
+		return "", false
+	}
+	account, domain, _, err := sid.LookupAccount("")
+	if err != nil {
+		return "", false
+	}
+	if domain != "" {
+		return domain + "\\" + account, true
+	}
+	return account, true
+}
+
+// metaCache retains path and owned SID per PID + creation time. Owner names
+// are read from the shared asynchronous cache each tick, so pending names and
+// retries become visible without reopening the process or confusing PID reuse.
 type metaCache struct {
-	mu sync.Mutex
-	m  map[procKey]procMeta
+	mu       sync.Mutex
+	m        map[procKey]procMeta
+	accounts *sidAccountCache
 }
 
-func newMetaCache() *metaCache { return &metaCache{m: map[procKey]procMeta{}} }
+func newMetaCache() *metaCache {
+	return &metaCache{m: map[procKey]procMeta{}, accounts: processAccounts}
+}
 
 func (c *metaCache) lookup(k procKey) (path, user string) {
 	c.mu.Lock()
 	if v, ok := c.m[k]; ok {
 		c.mu.Unlock()
-		return v.path, v.user
+		return v.path, c.accounts.lookup(v.sid)
 	}
 	c.mu.Unlock()
 	v := resolveMeta(k.pid)
 	c.mu.Lock()
 	c.m[k] = v
 	c.mu.Unlock()
-	return v.path, v.user
+	return v.path, c.accounts.lookup(v.sid)
 }
 
 func (c *metaCache) prune(live map[procKey]struct{}) {
@@ -126,16 +162,8 @@ func resolveMeta(pid uint32) procMeta {
 	if windows.OpenProcessToken(h, windows.TOKEN_QUERY, &tok) == nil {
 		defer tok.Close()
 		if tu, err := tok.GetTokenUser(); err == nil {
-			m.user = processAccounts.lookup(tu.User.Sid.String(), func() (string, bool) {
-				account, domain, _, err := tu.User.Sid.LookupAccount("")
-				if err != nil {
-					return "", false
-				}
-				if domain != "" {
-					return domain + "\\" + account, true
-				}
-				return account, true
-			})
+			// String() copies the SID before token data/handles go out of scope.
+			m.sid = tu.User.Sid.String()
 		}
 	}
 	return m

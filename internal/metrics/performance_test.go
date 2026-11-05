@@ -86,18 +86,3 @@ func BenchmarkTopProcesses5000(b *testing.B) {
 		topProcs(procs)
 	}
 }
-
-func TestRecorderStatusDoesNotWaitForDisk(t *testing.T) {
-	r := NewRecorder(time.Hour, time.Second, "")
-	r.fileMu.Lock()
-	done := make(chan struct{})
-	go func() { r.DiskErr(); close(done) }()
-	select {
-	case <-done:
-		r.fileMu.Unlock()
-	case <-time.After(100 * time.Millisecond):
-		r.fileMu.Unlock()
-		<-done
-		t.Fatal("UI error status blocked behind disk I/O")
-	}
-}

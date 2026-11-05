@@ -10,8 +10,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -44,14 +44,17 @@ type pageDef struct {
 
 // App owns the main window and everything hanging off it.
 type App struct {
-	dbgN    int
-	version string
-	store   *config.Store
-	cfg     config.Config
-	sampler *metrics.Sampler
-	host    metrics.HostInfo
-	rec     *metrics.Recorder
-	sensors *metrics.SensorHub
+	configWrites   *settingsWriter
+	settingResults settingsMailbox
+	ioClosing      atomic.Bool
+	dbgN           int
+	version        string
+	store          *config.Store
+	cfg            config.Config
+	sampler        *metrics.Sampler
+	host           metrics.HostInfo
+	rec            *metrics.Recorder
+	sensors        *metrics.SensorHub
 
 	mw    *walk.MainWindow
 	right *walk.Composite // header + current page + footer, laid out by relayout()
@@ -80,6 +83,9 @@ type App struct {
 	endSessionCB, prevMainProc uintptr // main-window hook for WM_ENDSESSION
 	pumpDone                   chan struct{}
 	startupTab                 int
+	opening                    *pageConstruction
+	loading                    *canvasView
+	pageBuildHooked            bool
 }
 
 // StartTab selects the page shown at launch (an index into the sidebar order).
@@ -150,16 +156,16 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	a.settings = newSettingsTab(a)
 	perf := newPerfPage(a)
 	a.pages = make([]*pageDef, pgCount)
-	a.pages[pgPerformance] = &pageDef{id: "performance", title: "Performance", subtitle: "Live CPU, memory, GPU, disk and network", glyph: "", impl: perf}
-	a.pages[pgProcesses] = &pageDef{id: "processes", title: "Processes", subtitle: "Everything that is running, in a tree or a flat list", glyph: "", impl: a.procs}
-	a.pages[pgStartup] = &pageDef{id: "startup", title: "Startup apps", subtitle: "What launches at sign-in, and what you can switch off", glyph: "", impl: newStartupTab(a)}
-	a.pages[pgServices] = &pageDef{id: "services", title: "Services", subtitle: "Windows services: state, start type and control", glyph: "", impl: newServicesTab(a)}
-	a.pages[pgPower] = &pageDef{id: "power", title: "Power & Freq", subtitle: "Clocks, temperatures, drive health and power state", glyph: "", pro: true, impl: newPowerPage(a)}
-	a.pages[pgRecorder] = &pageDef{id: "recorder", title: "Flight Recorder", subtitle: "Scrub back in time to see what caused a spike", glyph: "", pro: true, impl: newRecorderPage(a)}
-	a.pages[pgConnections] = &pageDef{id: "connections", title: "Connections", subtitle: "Every TCP/UDP endpoint and the process that owns it", glyph: "", pro: true, impl: newConnsPage(a)}
-	a.pages[pgApps] = &pageDef{id: "apps", title: "Installed Apps", subtitle: "Programs registered with Windows", glyph: "", pro: true, impl: newAppsPage(a)}
-	a.pages[pgDrivers] = &pageDef{id: "drivers", title: "Drivers", subtitle: "Kernel and file-system drivers, with publisher and version", glyph: "", pro: true, impl: newDriversPage(a)}
-	a.pages[pgDisk] = &pageDef{id: "disk", title: "Disk Space", subtitle: "Where the space went: folders and largest files", glyph: "", pro: true, impl: newDiskPage(a)}
+	a.pages[pgPerformance] = &pageDef{id: "performance", title: "Performance", subtitle: "Select a resource to inspect its activity and history.", glyph: "", impl: perf}
+	a.pages[pgProcesses] = &pageDef{id: "processes", title: "Processes", subtitle: "Find a process, inspect its resource use or end a task.", glyph: "", impl: a.procs}
+	a.pages[pgStartup] = &pageDef{id: "startup", title: "Startup apps", subtitle: "Choose which apps launch at sign-in.", glyph: "", impl: newStartupTab(a)}
+	a.pages[pgServices] = &pageDef{id: "services", title: "Services", subtitle: "Inspect service status, start type and available actions.", glyph: "", impl: newServicesTab(a)}
+	a.pages[pgPower] = &pageDef{id: "power", title: "Power & Freq", subtitle: "Inspect sensor readings, temperatures and recorded extremes.", glyph: "", pro: true, impl: newPowerPage(a)}
+	a.pages[pgRecorder] = &pageDef{id: "recorder", title: "Flight Recorder", subtitle: "Record activity and select a moment to investigate a spike.", glyph: "", pro: true, impl: newRecorderPage(a)}
+	a.pages[pgConnections] = &pageDef{id: "connections", title: "Connections", subtitle: "Trace a TCP or UDP endpoint to its process.", glyph: "", pro: true, impl: newConnsPage(a)}
+	a.pages[pgApps] = &pageDef{id: "apps", title: "Installed Apps", subtitle: "Find installed software and open its installation folder.", glyph: "", pro: true, impl: newAppsPage(a)}
+	a.pages[pgDrivers] = &pageDef{id: "drivers", title: "Drivers", subtitle: "Inspect driver status, publisher and version.", glyph: "", pro: true, impl: newDriversPage(a)}
+	a.pages[pgDisk] = &pageDef{id: "disk", title: "Disk Space", subtitle: "Scan a folder to find its largest files and subfolders.", glyph: "", pro: true, impl: newDiskPage(a)}
 	a.pages[pgSettings] = &pageDef{id: "settings", title: "Settings", subtitle: fmt.Sprintf("gotm %s", version), glyph: "", impl: a.settings}
 
 	a.side = newCanvasView(a.paintSidebar)
@@ -200,13 +206,15 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 			start = n
 		}
 	}
-	// Only the selected page creates native controls at startup. Other page
-	// models remain available to settings, recording and snapshot accounting.
+	// The shell paints immediately; even a direct table-page launch is staged.
+	// Page models remain available to settings, recording and sensor accounting.
 	a.wraps = make([]*walk.Composite, pgCount)
-	contents := []decl.Widget{a.pageWidget(start)}
+	contents := []decl.Widget{a.initialPageWidget(start)}
 
 	enableDarkMode() // dark context menus and list-view headers (before any window exists)
 	icon := appIcon()
+	initialSize := a.initialSize()
+	sideW := sidebarWidth(initialSize.Width)
 	err := decl.MainWindow{
 		AssignTo:   &a.mw,
 		Title:      a.windowTitle(),
@@ -214,10 +222,10 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 		Icon:       icon,
 		Background: decl.SolidColorBrush{Color: T.Bg},
 		MinSize:    a.minSize(),
-		Size:       a.initialSize(),
+		Size:       initialSize,
 		Layout:     decl.HBox{MarginsZero: true, SpacingZero: true},
 		Children: []decl.Widget{
-			a.side.declare(236, 0, 236, 0, 0),
+			a.side.declare(sideW, 0, sideW, 0, 0),
 			decl.Composite{
 				AssignTo:      &a.right,
 				StretchFactor: bodyStretch,
@@ -232,7 +240,7 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	if err != nil {
 		return err
 	}
-	a.mw.SetSize(walk.Size{Width: a.initialSize().Width, Height: a.initialSize().Height})
+	a.mw.SetSize(walk.Size{Width: initialSize.Width, Height: initialSize.Height})
 	if tb := a.mw.ToolBar(); tb != nil {
 		tb.SetVisible(false)
 	}
@@ -242,23 +250,28 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	allowDark(win.HWND(a.mw.Handle()))
 	titleBar(win.HWND(a.mw.Handle()))
 
+	a.mw.SizeChanged().Attach(func() {
+		w := sidebarWidth(a.mw.ClientBounds().Width)
+		if w != sideW {
+			sideW = w
+			size := walk.Size{Width: w}
+			_ = a.side.cw.SetMinMaxSize(size, size)
+		}
+	})
 	a.side.attachWheel()
-	if err := a.ensurePage(start); err != nil {
-		a.mw.Dispose()
-		return err
-	}
 	a.pages[pgRecorder].impl.(*recorderPage).startBackground()
-	stallPhase("pages initialized")
+	stallPhase("shell initialized")
 	a.setupShortcuts()
 	a.setupTray(icon)
 	// pages may have trimmed their minimum width during init: apply the real size now
-	a.mw.SetSize(walk.Size{Width: a.initialSize().Width, Height: a.initialSize().Height})
+	a.mw.SetSize(walk.Size{Width: initialSize.Width, Height: initialSize.Height})
 
 	a.watchSystem() // sign-out/shutdown save the window state; colour changes re-theme
 	stallWindow.Store(uintptr(a.mw.Handle()))
 	defer stallWindow.Store(0)
 	a.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
 		a.saveWindowState()
+		a.ioClosing.Store(true)
 		a.setRyzenSDK(false) // releases the AMD SDK before the process exits
 		a.rec.SetPersist(false)
 		if p, ok := a.pages[pgDisk].impl.(*diskPage); ok && p.cancel != nil {
@@ -270,11 +283,12 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	})
 
 	a.navigate(start)
-	stallPhase("first page shown; entering message loop")
+	stallPhase("navigation queued; entering message loop")
 	a.pumpDone = make(chan struct{})
 	go a.pump(startup, a.host)
 	walk.App().Run()
 	close(a.pumpDone) // pump unsubscribes and exits instead of blocking forever
+	a.finishFileWork()
 	return nil
 }
 
@@ -342,9 +356,19 @@ func (a *App) navigate(i int) {
 	if i < 0 || i >= len(a.pages) {
 		return
 	}
-	if err := a.ensurePage(i); err != nil {
-		a.errBox("Open page", err)
+	if !a.pages[i].initialized {
+		if a.opening == nil || a.opening.id != i {
+			a.startPageBuild(i)
+		}
 		return
+	}
+	a.cancelPageBuild()
+	a.showPage(i)
+}
+
+func (a *App) showPage(i int) {
+	if a.loading != nil && a.loading.cw != nil {
+		a.loading.cw.SetVisible(false)
 	}
 	a.cur = i
 	for k, w := range a.wraps {
@@ -353,6 +377,7 @@ func (a *App) navigate(i int) {
 		}
 	}
 	a.mw.RequestImmediateLayout()
+	a.side.keyHit = fmt.Sprintf("nav:%d", i)
 	a.side.invalidate()
 	a.invalidateChrome()
 	metrics.SetGPUSensorsWanted(a.gpuSensorsWanted())
@@ -365,11 +390,13 @@ func (a *App) navigate(i int) {
 }
 
 func (a *App) invalidateChrome() {
-	for _, v := range a.heads {
-		v.invalidate()
+	// Hidden pages repaint when shown. Avoid invalidating every native window
+	// on each change to the current page's status.
+	if a.cur >= 0 && a.cur < len(a.heads) {
+		a.heads[a.cur].invalidate()
 	}
-	for _, v := range a.foots {
-		v.invalidate()
+	if a.cur >= 0 && a.cur < len(a.foots) {
+		a.foots[a.cur].invalidate()
 	}
 }
 
@@ -505,8 +532,13 @@ func (a *App) onSnapshot(s *metrics.Snapshot, rows []metrics.SensorRow) {
 	}
 	a.updateTray(s)
 	a.checkAlerts(s)
-	a.invalidateChrome()
-	a.pages[a.cur].impl.tick(s)
+	// The title and instruction are static between alert and navigation changes.
+	if a.cur >= 0 && a.cur < len(a.foots) {
+		a.foots[a.cur].invalidate()
+	}
+	if a.pages[a.cur].initialized {
+		a.pages[a.cur].impl.tick(s)
+	}
 }
 
 // ---- admin ---------------------------------------------------------------------
@@ -552,32 +584,19 @@ func (a *App) elevate() {
 // clipboard (visible columns, tab-separated, header first). Pages without a
 // table do nothing.
 func (a *App) copyRows() {
+	if !a.pages[a.cur].initialized {
+		return
+	}
 	if c, ok := a.pages[a.cur].impl.(interface{ copyRow() }); ok {
 		c.copyRow()
 	}
 }
 
+// saveConfig enqueues a change. True means accepted; configuration is applied
+// only after a successful background save.
 func (a *App) saveConfig(mutate func(*config.Config)) bool {
-	c := a.store.Get()
-	// Header sorting is kept live until shutdown; other settings must retain it.
-	c.SortKey, c.SortDesc = a.cfg.SortKey, a.cfg.SortDesc
-	mutate(&c)
-	saved, err := a.store.Set(c)
-	if err != nil {
-		walk.MsgBox(a.mw, "Settings", "Could not save settings: "+err.Error(), walk.MsgBoxIconError)
-		return false
-	}
-	alertsChanged := !slices.Equal(a.cfg.Alerts, saved.Alerts)
-	a.cfg = saved
-	a.sampler.SetInterval(saved.RefreshMs)
-	a.sampler.SetHistorySeconds(saved.HistorySeconds)
-	if alertsChanged {
-		a.alertSince = map[int]int64{}
-		a.alertShown = map[int]time.Time{}
-	}
-	return true
+	return a.queueSettings(mutate, false)
 }
-
 func (a *App) errBox(title string, err error) {
 	walk.MsgBox(a.mw, title, err.Error(), walk.MsgBoxIconWarning)
 }
@@ -676,22 +695,30 @@ const bodyStretch = 1000
 // saveWindowState stores the restored window size (not a minimized or
 // maximized one), layout, sort and current page.
 func (a *App) saveWindowState() {
-	c := a.store.Get()
+	var width, height int
 	var wp win.WINDOWPLACEMENT
 	wp.Length = uint32(unsafe.Sizeof(wp))
 	if win.GetWindowPlacement(win.HWND(a.mw.Handle()), &wp) {
 		dpi := screenDPI()
 		if w := int(wp.RcNormalPosition.Right-wp.RcNormalPosition.Left) * 96 / dpi; w >= 640 {
-			c.WindowW = w
+			width = w
 		}
 		if h := int(wp.RcNormalPosition.Bottom-wp.RcNormalPosition.Top) * 96 / dpi; h >= 420 {
-			c.WindowH = h
+			height = h
 		}
 	}
-	c.TreeView, c.GroupByName = a.cfg.TreeView, a.cfg.GroupByName
-	c.SortKey, c.SortDesc = a.cfg.SortKey, a.cfg.SortDesc
-	c.LastPage = a.pages[a.cur].id
-	_, _ = a.store.Set(c)
+	page := a.pages[a.cur].id
+	// Compose with queued settings rather than replacing them with an older UI
+	// snapshot. The worker reserves a slot for this final state update.
+	a.queueSettings(func(c *config.Config) {
+		if width != 0 {
+			c.WindowW = width
+		}
+		if height != 0 {
+			c.WindowH = height
+		}
+		c.LastPage = page
+	}, true)
 }
 
 // watchSystem hooks the main window for two things Walk does not surface:

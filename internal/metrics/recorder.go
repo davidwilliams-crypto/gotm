@@ -5,6 +5,7 @@ package metrics
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -62,12 +63,17 @@ type Recorder struct {
 	persist bool
 	dir     string
 
-	// fileMu serializes disk writes and is held INSTEAD of mu during file I/O,
-	// so chart reads (Samples, Nearest, Len) never wait on the file system.
-	fileMu  sync.Mutex
-	file    *os.File
-	fileDay string
-	diskErr error // last persistence failure; cleared by the next good write
+	// A single worker owns the file. No filesystem operation holds mu.
+	file                                     io.WriteCloser
+	fileDay                                  string
+	diskErr                                  error // last persistence failure; cleared by the next good write
+	diskQueue                                []RecSample
+	diskHead, diskCount                      int
+	diskWake                                 chan struct{}
+	diskDone                                 chan struct{}
+	diskProgress                             chan struct{}
+	diskRunning, closed                      bool
+	diskAccepted, diskCompleted, diskDropped uint64
 }
 
 // NewRecorder keeps `retention` of history, one sample per `every`. Capture
@@ -88,20 +94,17 @@ func (r *Recorder) Enabled() bool     { r.mu.RLock(); defer r.mu.RUnlock(); retu
 
 // SetPersist turns on appending samples to <dir>\yyyy-mm-dd.jsonl.
 func (r *Recorder) SetPersist(v bool) {
-	// fileMu before r.mu, the same order appendDisk uses: an in-flight
-	// appendDisk then sees the switch-off and stops without reopening.
-	r.fileMu.Lock()
-	defer r.fileMu.Unlock()
 	r.mu.Lock()
-	r.persist = v
-	r.mu.Unlock()
-	if !v {
-		if r.file != nil {
-			_ = r.file.Close()
-			r.file, r.fileDay = nil, ""
-		}
-		r.setDiskErr(nil)
+	defer r.mu.Unlock()
+	if r.closed {
+		return
 	}
+	if v && !r.persist {
+		r.diskDropped = 0
+		r.diskErr = nil
+	}
+	r.persist = v
+	r.wakeDiskLocked()
 }
 
 // DiskErr reports the last on-disk persistence failure (disk full, locked
@@ -109,9 +112,11 @@ func (r *Recorder) SetPersist(v bool) {
 func (r *Recorder) DiskErr() error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if r.diskDropped > 0 {
+		return fmt.Errorf("disk backlog full: %d samples kept only in memory", r.diskDropped)
+	}
 	return r.diskErr
 }
-func (r *Recorder) setDiskErr(err error) { r.mu.Lock(); r.diskErr = err; r.mu.Unlock() }
 
 func (r *Recorder) Persist() bool { r.mu.RLock(); defer r.mu.RUnlock(); return r.persist }
 
@@ -121,7 +126,7 @@ func (r *Recorder) Add(s *Snapshot) {
 		return
 	}
 	r.mu.Lock()
-	if !r.enabled {
+	if !r.enabled || r.closed {
 		r.mu.Unlock()
 		return
 	}
@@ -151,12 +156,125 @@ func (r *Recorder) Add(s *Snapshot) {
 		clear(r.ring[n:])
 		r.ring = r.ring[:n]
 	}
-	persist := r.persist
+	if r.persist && r.dir != "" {
+		r.enqueueDiskLocked(rs)
+	}
 	r.mu.Unlock()
-	// The disk write happens without r.mu: readers of the ring never stall
-	// behind a slow or networked recordings folder.
-	if persist {
-		r.appendDisk(rs)
+}
+
+// The queue covers up to 256 pending samples (over eight minutes at the
+// default interval). A permanently stalled disk cannot grow memory without
+// bound. Rejected disk samples remain in the normal in-memory recording and
+// DiskErr reports the gap until persistence is explicitly restarted.
+func (r *Recorder) enqueueDiskLocked(s RecSample) {
+	if r.diskQueue == nil {
+		r.diskQueue = make([]RecSample, min(r.capacity, 256))
+	}
+	if r.diskCount == len(r.diskQueue) {
+		r.diskDropped++
+		return
+	}
+	r.diskQueue[(r.diskHead+r.diskCount)%len(r.diskQueue)] = s
+	r.diskCount++
+	r.diskAccepted++
+	if !r.diskRunning {
+		r.diskRunning = true
+		r.diskWake = make(chan struct{}, 1)
+		r.diskDone = make(chan struct{})
+		r.diskProgress = make(chan struct{})
+		go r.runDisk()
+	}
+	r.wakeDiskLocked()
+}
+
+func (r *Recorder) wakeDiskLocked() {
+	if r.diskRunning {
+		select {
+		case r.diskWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *Recorder) runDisk() {
+	for {
+		r.mu.Lock()
+		if r.diskCount > 0 {
+			s := r.diskQueue[r.diskHead]
+			r.diskQueue[r.diskHead] = RecSample{}
+			r.diskHead = (r.diskHead + 1) % len(r.diskQueue)
+			r.diskCount--
+			r.mu.Unlock()
+			err := r.appendDisk(s)
+			r.mu.Lock()
+			r.diskErr = err
+			r.diskCompleted++
+			close(r.diskProgress)
+			r.diskProgress = make(chan struct{})
+			r.mu.Unlock()
+			continue
+		}
+		if !r.persist {
+			r.mu.Unlock()
+			err := r.closeDisk()
+			r.mu.Lock()
+			if err != nil {
+				r.diskErr = err
+			}
+			// An enable/Add may have arrived while Close was blocked.
+			if r.diskCount > 0 || r.persist {
+				r.mu.Unlock()
+				continue
+			}
+			r.diskRunning = false
+			r.diskQueue = nil
+			r.diskHead = 0
+			close(r.diskDone)
+			r.mu.Unlock()
+			return
+		}
+		wake := r.diskWake
+		r.mu.Unlock()
+		<-wake
+	}
+}
+
+// Flush waits for disk attempts accepted before the call. Call this from a
+// background or shutdown path with a deadline, never from the UI thread.
+// DiskErr separately reports write failures or a full backlog.
+func (r *Recorder) Flush(ctx context.Context) error {
+	r.mu.RLock()
+	target := r.diskAccepted
+	for r.diskCompleted < target {
+		progress := r.diskProgress
+		r.mu.RUnlock()
+		select {
+		case <-progress:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		r.mu.RLock()
+	}
+	r.mu.RUnlock()
+	return nil
+}
+
+// Close stops capture and drains accepted writes before closing the file.
+// A timeout releases the caller; the one worker still owns any blocked I/O.
+func (r *Recorder) Close(ctx context.Context) error {
+	r.mu.Lock()
+	r.closed, r.persist = true, false
+	r.wakeDiskLocked()
+	done, running := r.diskDone, r.diskRunning
+	r.mu.Unlock()
+	if !running {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -225,52 +343,53 @@ func topProcs(procs []Proc) []RecProc {
 // could aim an administrator's write at a target of someone else's choosing.
 var errRedirectedPath = errors.New("the recordings folder or file is a link; gotm is elevated and will not write through it")
 
-func (r *Recorder) appendDisk(rs RecSample) {
-	if r.dir == "" {
-		return
-	}
-	r.fileMu.Lock()
-	defer r.fileMu.Unlock()
-	r.mu.RLock()
-	persist := r.persist
-	r.mu.RUnlock()
-	if !persist {
-		return // switched off after Add snapshotted it: no trailing write
-	}
+func (r *Recorder) appendDisk(rs RecSample) error {
 	day := time.UnixMilli(rs.T).Format("2006-01-02")
 	if r.file == nil || r.fileDay != day {
 		if r.file != nil {
-			_ = r.file.Close()
-			r.file, r.fileDay = nil, ""
+			if err := r.closeDisk(); err != nil {
+				return err
+			}
 		}
 		path := filepath.Join(r.dir, day+".jsonl")
 		if !safepath.WritableFile(path) {
-			r.setDiskErr(errRedirectedPath)
-			return
+			return errRedirectedPath
 		}
-		_ = os.MkdirAll(r.dir, 0o700)
+		if err := os.MkdirAll(r.dir, 0o700); err != nil {
+			return err
+		}
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
-			r.setDiskErr(err)
-			return
+			return err
 		}
 		r.file, r.fileDay = f, day
 	}
 	b, err := json.Marshal(rs)
 	if err != nil {
-		r.setDiskErr(err)
-		return
+		return err
 	}
-	if _, err := r.file.Write(append(b, '\n')); err != nil {
+	b = append(b, '\n')
+	n, err := r.file.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		// A failing write must not pass silently: drop the handle so the next
 		// sample reopens (recovering from a locked or replaced file) and
 		// report the error until one write succeeds.
-		r.setDiskErr(err)
-		_ = r.file.Close()
-		r.file, r.fileDay = nil, ""
-		return
+		_ = r.closeDisk()
+		return err
 	}
-	r.setDiskErr(nil)
+	return nil
+}
+
+func (r *Recorder) closeDisk() error {
+	if r.file == nil {
+		return nil
+	}
+	err := r.file.Close()
+	r.file, r.fileDay = nil, ""
+	return err
 }
 
 // LoadDisk reloads samples from the last `window` of on-disk files.
@@ -444,17 +563,27 @@ func (r *Recorder) Clear() {
 // and the process-name column is neutralized so spreadsheets open it as text
 // instead of evaluating a name that begins with =, +, - or @ as a formula.
 func (r *Recorder) ExportCSV(path string, from, to int64) error {
+	return ExportSamplesCSV(path, r.Samples(from, to))
+}
+
+// ExportSamplesCSV exports a previously captured window. Callers can freeze
+// the recording before starting background I/O, so Clear or new samples do
+// not change an export while its destination is slow to open.
+func ExportSamplesCSV(path string, samples []RecSample) error {
 	if !safepath.WritableFile(path) {
 		return errRedirectedPath
 	}
-	f, err := os.Create(path)
+	// A bounded shutdown can end an in-flight export. Do not truncate an
+	// existing destination until the new CSV has been written and closed.
+	f, err := os.CreateTemp(filepath.Dir(path), ".gotm-export-*.tmp")
 	if err != nil {
 		return err
 	}
+	defer os.Remove(f.Name())
 	defer f.Close()
 	w := csv.NewWriter(f)
 	_ = w.Write([]string{"time", "cpu_pct", "mem_pct", "gpu_pct", "disk_busy_pct", "disk_bytes_per_s", "net_bytes_per_s", "top_processes"})
-	for _, s := range r.Samples(from, to) {
+	for _, s := range samples {
 		top := ""
 		for i, p := range s.Top {
 			if i >= 5 {
@@ -476,7 +605,13 @@ func (r *Recorder) ExportCSV(path string, from, to int64) error {
 	if err := w.Error(); err != nil {
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if !safepath.WritableFile(path) {
+		return errRedirectedPath
+	}
+	return os.Rename(f.Name(), path)
 }
 
 func recordedGPUCSV(s RecSample) string {

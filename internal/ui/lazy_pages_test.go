@@ -52,6 +52,7 @@ func TestLazyPagesBuildOnNavigationOnce(t *testing.T) {
 		defer func() { T = old }()
 		T.Bg = walk.RGB(248, 248, 248)
 		a.navigate(1)
+		pumpNativeUntil(t, func() bool { return a.opening == nil })
 		created := a.wraps[1]
 		if second.builds != 1 || second.inits != 1 || second.shows != 1 || a.cur != 1 {
 			t.Fatal("first navigation did not initialize page")

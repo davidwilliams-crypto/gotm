@@ -253,7 +253,7 @@ func TestRecorderRespectsIntervalAndPersists(t *testing.T) {
 	if r.Len() != 5 {
 		t.Fatalf("kept %d samples, want 5", r.Len())
 	}
-	r.SetPersist(false) // flush/close
+	closeRecorder(t, r)
 
 	r2 := NewRecorder(time.Hour, 2*time.Second, dir)
 	if n := r2.LoadDisk(time.Hour); n != 5 {

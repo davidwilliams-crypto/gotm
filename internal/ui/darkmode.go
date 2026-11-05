@@ -9,7 +9,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tailscale/walk"
 	"github.com/tailscale/win"
 	"golang.org/x/sys/windows"
 )
@@ -70,16 +69,15 @@ func allowDark(hwnd win.HWND) {
 var (
 	lvHookOnce sync.Once
 	lvHookCB   uintptr
-	lvPrev     = map[win.HWND]uintptr{}    // list view -> the procedure below ours
-	headerInk  = map[win.HWND]walk.Color{} // list view -> header text colour
-	headerOf   = map[win.HWND]win.HWND{}   // list view -> its header
+	lvPrev     = map[win.HWND]uintptr{}  // list view -> the procedure below ours
+	headerOf   = map[win.HWND]win.HWND{} // list view -> its header
 )
 
-// colorHeaderText makes the header of list view lv draw its captions in ink.
+// styleHeader lets dark headers draw their captions in the main text colour.
 // The dark item-view theme otherwise leaves them near-black on a dark band.
-func colorHeaderText(lv, hdr win.HWND, ink walk.Color) {
+func styleHeader(lv, hdr win.HWND) {
 	lvHookOnce.Do(func() { lvHookCB = syscall.NewCallback(lvHookProc) })
-	headerInk[lv], headerOf[lv] = ink, hdr
+	headerOf[lv] = hdr
 	if _, done := lvPrev[lv]; done {
 		return
 	}
@@ -108,8 +106,8 @@ func lvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 	if msg == win.WM_NCDESTROY {
 		r := win.CallWindowProc(prev, h, uint32(msg), wp, lp)
 		delete(lvPrev, h)
-		delete(headerInk, h)
 		delete(headerOf, h)
+		delete(flexOf, h)
 		return r
 	}
 	// Walk re-applies system colours to every table on WM_SETTINGCHANGE /
@@ -123,13 +121,13 @@ func lvHookProc(hwnd, msg, wp, lp uintptr) (ret uintptr) {
 	}
 	if msg == win.WM_NOTIFY && lp != 0 {
 		nmh := (*win.NMHDR)(ptrFrom(lp))
-		if nmh.Code == win.NM_CUSTOMDRAW && nmh.HwndFrom == headerOf[h] {
+		if !highContrast && nmh.Code == win.NM_CUSTOMDRAW && nmh.HwndFrom == headerOf[h] {
 			nmcd := (*win.NMCUSTOMDRAW)(ptrFrom(lp))
 			switch nmcd.DwDrawStage {
 			case win.CDDS_PREPAINT:
 				return win.CDRF_NOTIFYITEMDRAW
 			case win.CDDS_ITEMPREPAINT:
-				procSetTextColor.Call(uintptr(nmcd.Hdc), colorref(headerInk[h]))
+				procSetTextColor.Call(uintptr(nmcd.Hdc), colorref(T.Text))
 				return win.CDRF_DODEFAULT
 			}
 		}

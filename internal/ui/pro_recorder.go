@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/tailscale/walk"
@@ -18,9 +17,11 @@ import (
 // recorderPage is the flight recorder: a timeline of recent history. Click or
 // drag on it to pick a moment and see which processes were busiest then.
 type recorderPage struct {
+	exportJob         singleFileJob
 	app               *App
 	root              *walk.Composite
 	view              *canvasView
+	plot              rect // plot used by the most recent paint, for mouse scrubbing
 	rangeSecs         int
 	selT              int64 // selected time (unix ms); 0 = follow live
 	live              bool
@@ -48,6 +49,7 @@ func newRecorderPage(a *App) *recorderPage {
 		a.rec.SetEnabled(!a.rec.Enabled())
 		p.sync()
 	})
+	p.bRec.tip = "Start or pause recording (Space)"
 	p.bMark = newButton("Add marker", "", 132, func() {
 		when := time.Now().UnixMilli()
 		if !p.live && p.selT != 0 {
@@ -58,12 +60,11 @@ func newRecorderPage(a *App) *recorderPage {
 	})
 	p.bExport = newButton("Export CSV", "", 126, p.export)
 	p.bDisk = newButton("Keep on disk", "", 138, func() {
-		v := !a.rec.Persist()
-		if a.saveConfig(func(c *configT) { c.RecorderDisk = v }) {
-			a.rec.SetPersist(v)
-		}
+		a.saveConfig(func(c *configT) { c.RecorderDisk = !c.RecorderDisk })
 		p.sync()
 	})
+	p.bDisk.toggle = true
+	p.bDisk.tip = "Keep recorded samples on disk"
 	p.bClear = newButton("Clear", "", 90, func() {
 		if !a.confirm("Clear recording", "Clear the recording and markers from memory?\n\nSaved recordings on disk are kept.") {
 			return
@@ -72,10 +73,11 @@ func newRecorderPage(a *App) *recorderPage {
 		p.selT, p.live = 0, true
 		p.view.invalidate()
 	})
+	p.bClear.danger = true
 	labels := [4]string{"5 min", "15 min", "1 hour", "3 hours"}
 	for i := range p.bRange {
 		i := i
-		p.bRange[i] = newButton(labels[i], "", 92, func() {
+		p.bRange[i] = newButton(labels[i], "", 72, func() {
 			p.rangeSecs = p.rangeChoices[i]
 			p.sync()
 		})
@@ -85,12 +87,24 @@ func newRecorderPage(a *App) *recorderPage {
 }
 
 func (p *recorderPage) build() decl.Widget {
-	bar := []decl.Widget{p.bRec.widget(), p.bMark.widget(), p.bExport.widget(), p.bDisk.widget(), p.bClear.widget(), decl.HSpacer{}}
+	record, export := p.bRec.widget(), p.bExport.widget()
+	// Keep the state-changing labels visible even when the other native
+	// buttons shrink to their icons. Their accessible names stay complete.
+	record.MinSize.Width, export.MinSize.Width = 108, 90
+	bar := []decl.Widget{record, p.bMark.widget(), export, p.bDisk.widget(), p.bClear.widget(), decl.HSpacer{}}
 	ranges := []decl.Widget{decl.Label{Text: "Time range", TextColor: T.Muted}}
 	for _, b := range p.bRange {
 		ranges = append(ranges, b.widget())
 	}
 	ranges = append(ranges, decl.HSpacer{})
+	commandRow := func(children []decl.Widget) decl.Composite {
+		return decl.Composite{
+			Background: decl.SolidColorBrush{Color: T.Bg},
+			Layout:     decl.HBox{MarginsZero: true, Spacing: 6},
+			MinSize:    decl.Size{Height: 34}, MaxSize: decl.Size{Height: 34},
+			Children: children,
+		}
+	}
 	return decl.Composite{
 		AssignTo:      &p.root,
 		StretchFactor: 1,
@@ -103,14 +117,7 @@ func (p *recorderPage) build() decl.Widget {
 				Background:    decl.SolidColorBrush{Color: T.Bg},
 				Layout:        decl.VBox{Margins: padBody, Spacing: 10},
 				Children: []decl.Widget{
-					decl.Composite{
-						Background: decl.SolidColorBrush{Color: T.Bg},
-						Layout:     decl.HBox{MarginsZero: true, Spacing: 8},
-						MinSize:    decl.Size{Height: 38},
-						MaxSize:    decl.Size{Height: 38},
-						Children:   bar,
-					},
-					decl.Composite{Background: decl.SolidColorBrush{Color: T.Bg}, Layout: decl.HBox{MarginsZero: true, Spacing: 8}, MinSize: decl.Size{Height: 38}, MaxSize: decl.Size{Height: 38}, Children: ranges},
+					commandRow(bar), commandRow(ranges),
 					p.view.declare(0, 0, 0, 0, bodyStretch),
 				},
 			},
@@ -197,9 +204,21 @@ func (p *recorderPage) sync() {
 	} else {
 		p.bRec.setText("Start recording")
 	}
-	p.bDisk.set(true, p.app.rec.Persist())
+	persist := p.app.rec.Persist()
+	p.bDisk.set(true, persist)
+	if persist {
+		p.bDisk.setText("Disk saving on")
+	} else {
+		p.bDisk.setText("Keep on disk")
+	}
 	hasSamples := p.app.rec.Len() > 0
-	p.bExport.set(hasSamples, false)
+	exporting := p.exportJob.active()
+	p.bExport.set(hasSamples && !exporting, false)
+	if exporting {
+		p.bExport.setText("Exporting…")
+	} else {
+		p.bExport.setText("Export CSV")
+	}
 	p.bClear.set(hasSamples, false)
 	p.bMark.set(hasSamples, false)
 	for i, b := range p.bRange {
@@ -209,6 +228,9 @@ func (p *recorderPage) sync() {
 }
 
 func (p *recorderPage) export() {
+	if p.exportJob.active() {
+		return
+	}
 	dlg := walk.FileDialog{
 		Title:    "Export flight recording",
 		FilePath: "gotm-recording.csv",
@@ -226,22 +248,7 @@ func (p *recorderPage) export() {
 	if filepath.Ext(path) == "" {
 		path += ".csv"
 	}
-	if err := p.app.rec.ExportCSV(path, 0, 0); err != nil {
-		p.app.errBox("Export", err)
-		return
-	}
-	openInExplorer(path)
-}
-
-// plot geometry shared by paint and click handling
-// The chart takes half the height, but leaves the detail panels below it the
-// ~190 units they need on short windows (small laptops at 125-150 %).
-func (p *recorderPage) plotRect(w, h int) rect {
-	ph := min(h/2-40, h-318)
-	if ph < 120 {
-		ph = 120
-	}
-	return rect{24, 56, w - 48, ph}
+	p.exportAsync(path)
 }
 
 // window is the time span drawn. Until the recording covers the chosen range,
@@ -267,12 +274,6 @@ func (p *recorderPage) window() (from, to int64) {
 	return from, to
 }
 
-// fitting reports whether the chart is showing less than the chosen range.
-func (p *recorderPage) fitting() bool {
-	from, to := p.window()
-	return to-from < int64(p.rangeSecs)*1000-2000
-}
-
 // humanDur prints 45 s, 15 min, 1 h 30 min.
 func humanDur(d time.Duration) string {
 	switch {
@@ -288,8 +289,8 @@ func humanDur(d time.Duration) string {
 
 func (p *recorderPage) pick(x, y int) {
 	x, y = int(float64(x)/gs), int(float64(y)/gs) // mouse is in pixels, layout in design units
-	pr := p.plotRect(p.view.w, p.view.h)
-	if !pr.contains(x, y) && !(y > pr.Y-30 && y < pr.Y+pr.H+30) {
+	pr := p.plot
+	if pr.W <= 0 || y < pr.Y-14 || y >= pr.Y+pr.H+14 {
 		return
 	}
 	from, to := p.window()
@@ -319,30 +320,77 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	rec := p.app.rec
 	from, to := p.window()
 	samples := rec.Samples(from, to)
+	on, hasSamples := rec.Enabled(), rec.Len() > 0
+	state, ink := "Recording off", T.Muted
+	switch {
+	case on && hasSamples:
+		state, ink = "Recording on", T.Bad
+	case on:
+		state, ink = "Starting recording", T.Bad
+	case hasSamples:
+		state, ink = "Recording paused", T.Warn
+	}
+	badge := rect{12, 6, 148, 30}
+	fillRound(cv, badge, 6, T.Card)
+	strokeRound(cv, badge, 6, T.Stroke)
+	fillRound(cv, rect{24, 17, 8, 8}, 4, ink)
+	drawText(cv, state, uiBold(10), ink, rect{40, 6, 112, 30}, taLeft)
+	p.view.addText(badge, state)
 
-	// header strip: state + selected time
-	state := "Recording"
-	ink := T.Bad
-	if !rec.Enabled() {
-		state, ink = "Paused", T.Warn
+	legendX, legendY := w-182, 6
+	plotY := 56
+	if legendX < badge.X+badge.W+12 {
+		legendX, legendY = 16, 34
+		plotY += 28
 	}
-	if rec.Persist() && rec.DiskErr() != nil {
-		state += " · not saving to disk"
-		ink = T.Warn
+	span := humanDur(time.Duration(to-from)*time.Millisecond) + " shown"
+	if available := legendX - 176; available >= 110 {
+		if available >= 176 {
+			span += " · every 2 s"
+		}
+		r := rect{172, 6, available, 30}
+		drawText(cv, span, uiFont(9), T.Muted, r, taLeft)
+		p.view.addText(r, span)
 	}
-	fillRound(cv, rect{26, 20, 8, 8}, 4, ink)
-	span := fmt.Sprintf("%s window", humanDur(time.Duration(p.rangeSecs)*time.Second))
-	if p.fitting() {
-		span = fmt.Sprintf("showing %s recorded so far (the %s window fills as samples arrive)",
-			humanDur(time.Duration(to-from)*time.Millisecond), humanDur(time.Duration(p.rangeSecs)*time.Second))
+	for _, l := range []struct {
+		name  string
+		color walk.Color
+		width int
+	}{{"CPU", T.CPU, 50}, {"Memory", T.Mem, 74}, {"GPU", T.GPU, 48}} {
+		fillRound(cv, rect{legendX, legendY + 13, 12, 4}, 2, l.color)
+		drawText(cv, l.name, uiFont(9), T.Muted, rect{legendX + 17, legendY, l.width - 17, 30}, taLeft)
+		legendX += l.width
 	}
-	drawText(cv, fmt.Sprintf("%s · one sample every 2 s · %s", state, span),
-		uiFont(10), T.Muted, rect{44, 12, w - 360, 24}, taLeft)
-	p.view.addText(rect{26, 12, w - 342, 24}, fmt.Sprintf("%s, one sample every 2 seconds, %s", state, span))
+	if err := rec.DiskErr(); rec.Persist() && err != nil {
+		r := rect{12, plotY - 14, w - 24, 26}
+		fillRound(cv, r, 5, blend(T.Warn, T.Bg, 0.14))
+		warning := "Disk warning · Some samples are only in memory. " + err.Error()
+		drawText(cv, warning, uiFont(9), T.Warn, rect{r.X + 10, r.Y, r.W - 20, r.H}, taLeft)
+		p.view.addText(r, warning)
+		plotY += 34
+	}
 
-	pr := p.plotRect(w, h)
-	fillRound(cv, rect{pr.X - 12, pr.Y - 12, pr.W + 24, pr.H + 52}, 10, T.Card)
-	strokeRound(cv, rect{pr.X - 12, pr.Y - 12, pr.W + 24, pr.H + 52}, 10, T.Stroke)
+	// On a short window reserve room for the selected sample and its return
+	// button. The normal height leaves room for the two full detail panels.
+	plotH := min(max(120, min(h/2-40, h-318)), max(30, h-plotY-148))
+	pr := rect{24, plotY, w - 48, plotH}
+	card := rect{pr.X - 12, pr.Y - 12, pr.W + 24, pr.H + 50}
+	p.plot = rect{}
+	if !hasSamples {
+		card.H = max(54, min(200, h-card.Y-12))
+		fillRound(cv, card, 10, T.Card)
+		strokeRound(cv, card, 10, T.Stroke)
+		message := "Start recording to collect samples."
+		if on {
+			message = "Waiting for the first sample…"
+		}
+		drawText(cv, message, uiFont(11), T.Text, card.inset(8), taCenter)
+		p.view.addText(card.inset(8), message)
+		return
+	}
+	p.plot = pr
+	fillRound(cv, card, 10, T.Card)
+	strokeRound(cv, card, 10, T.Stroke)
 
 	times := make([]int64, len(samples))
 	for i, s := range samples {
@@ -369,25 +417,24 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	drawText(cv, "100%", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + 2, 50, 14}, taLeft)
 	drawText(cv, "0", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + pr.H - 16, 30, 14}, taLeft)
 
-	// legend (top right) + time axis
-	lx := w - 300
-	for _, l := range []struct {
-		n string
-		c walk.Color
-	}{{"CPU", T.CPU}, {"Memory", T.Mem}, {"GPU", T.GPU}} {
-		fillRound(cv, rect{lx, 17, 10, 10}, 3, l.c)
-		drawText(cv, l.n, uiFont(9), T.Muted, rect{lx + 16, 10, 70, 24}, taLeft)
-		lx += 92
-	}
 	tf := "15:04"
 	if to-from < 10*60_000 { // a short span needs seconds, or every label reads the same
 		tf = "15:04:05"
 	}
-	for i := 0; i <= 4; i++ {
-		t := time.UnixMilli(from + int64(i)*(to-from)/4)
-		x := pr.X + i*pr.W/4
-		fl := walk.TextCenter | walk.TextVCenter | walk.TextSingleLine
-		drawText(cv, t.Format(tf), uiFont(8), T.Faint, rect{x - 40, pr.Y + pr.H + 6, 80, 22}, fl)
+	divisions := 4
+	if pr.W < 380 {
+		divisions = 2
+	}
+	for i := 0; i <= divisions; i++ {
+		t := time.UnixMilli(from + int64(i)*(to-from)/int64(divisions))
+		x := pr.X + i*pr.W/divisions - 32
+		align := taCenter
+		if i == 0 {
+			x, align = pr.X, taLeft
+		} else if i == divisions {
+			x, align = pr.X+pr.W-64, taRight
+		}
+		drawText(cv, t.Format(tf), uiFont(8), T.Muted, rect{x, pr.Y + pr.H + 6, 64, 22}, align)
 	}
 
 	// markers
@@ -397,7 +444,8 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		}
 		x := pr.X + int(timePosition(m.T, from, to)*float64(pr.W))
 		fillRect(cv, rect{x, pr.Y, 1, pr.H}, T.Warn)
-		drawText(cv, m.Label, uiFont(8), T.Warn, rect{x + 4, pr.Y + 2, 70, 14}, taLeft)
+		labelX := min(x+4, pr.X+pr.W-70)
+		drawText(cv, m.Label, uiFont(8), T.Warn, rect{labelX, pr.Y + 2, 70, 14}, taLeft)
 	}
 
 	// selection cursor
@@ -411,49 +459,33 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		fillRound(cv, rect{x - 5, pr.Y - 8, 10, 10}, 5, T.Text)
 	}
 	plotName := "Timeline, live"
-	if !p.live {
+	if p.live && !on {
+		plotName = "Timeline, latest"
+	} else if !p.live {
 		plotName = "Timeline, at " + time.UnixMilli(selT).Format("15:04:05")
 	}
-	if cur, ok := rec.Nearest(selT); ok {
-		plotName += fmt.Sprintf(": CPU %.0f%%, memory %.0f%%, GPU %s", cur.CPU, cur.Mem, recordedGPUText(cur))
+	s, ok := rec.Nearest(selT)
+	if ok {
+		plotName += fmt.Sprintf(", CPU %.0f%%, memory %.0f%%, GPU %s", s.CPU, s.Mem, recordedGPUText(s))
 	}
 	p.view.addItem(rect{pr.X, pr.Y - 14, pr.W, pr.H + 28}, "plot", plotName, ctlSlider, false)
 
 	// detail panel for the selected moment
-	dy := pr.Y + pr.H + 56
-	dh := h - dy - 16
-	if dh < 150 {
-		p.paintCompactDetail(cv, selT, w, pr.Y+pr.H+34, h)
-		return
-	}
-	s, ok := rec.Nearest(selT)
 	if !ok {
-		message := "Waiting for the first sample…"
-		if !rec.Enabled() {
-			message = "Select Start recording above to collect samples."
-		}
-		drawText(cv, message, uiFont(11), T.Muted, rect{24, dy, w - 48, 30}, taLeft)
 		return
 	}
-	left := rect{24, dy, 330, dh}
-	right := rect{370, dy, w - 394, dh}
+	dy := card.Y + card.H + 12
+	dh := h - dy - 8
+	if dh < 164 || w < 610 {
+		p.paintCompactDetail(cv, s, rect{12, dy, w - 24, dh})
+		return
+	}
+	left := rect{12, dy, min(330, (w-36)*45/100), dh}
+	rightX := left.X + left.W + 12
+	right := rect{rightX, dy, w - rightX - 12, dh}
 	fillRound(cv, left, 10, T.Card)
 	strokeRound(cv, left, 10, T.Stroke)
-	fillRound(cv, right, 10, T.Card)
-	strokeRound(cv, right, 10, T.Stroke)
-
-	when := time.UnixMilli(s.T).Format("Mon 15:04:05")
-	title := "At " + when
-	if p.live {
-		title = "Live · " + when
-	}
-	drawText(cv, title, uiBold(11), T.Text, rect{left.X + 16, left.Y + 10, left.W - 32, 24}, taLeft)
-	p.view.addText(rect{left.X + 16, left.Y + 10, left.W - 120, 24}, title)
-	if !p.live {
-		p.view.addItem(rect{left.X + left.W - 96, left.Y + 10, 84, 24}, "live", "Go live", ctlButton, false)
-		fillRound(cv, rect{left.X + left.W - 96, left.Y + 10, 84, 24}, 6, blend(T.Accent, T.Card, 0.3))
-		drawText(cv, "Go live", uiFont(9), T.Text, rect{left.X + left.W - 96, left.Y + 10, 84, 24}, taCenter)
-	}
+	p.paintMoment(cv, s, rect{left.X + 16, left.Y + 8, left.W - 32, 28})
 	y := left.Y + 44
 	step := 28
 	if left.H < 190 {
@@ -483,28 +515,39 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		rect{left.X + 16, y + 2, left.W - 32, 20}, taLeft)
 	p.view.addText(rect{left.X + 16, y + 2, left.W - 32, 20}, "Disk "+fmtRate(s.DiskBps)+", network "+fmtRate(s.NetBps))
 
-	// process table at that moment
-	drawText(cv, "Busiest processes at that moment", uiBold(11), T.Text, rect{right.X + 16, right.Y + 10, right.W - 32, 24}, taLeft)
-	p.view.addText(rect{right.X + 16, right.Y + 10, right.W - 32, 24}, "Busiest processes at that moment")
+	p.paintProcesses(cv, s.Top, right)
+}
+
+func (p *recorderPage) paintProcesses(cv *walk.Canvas, procs []metrics.RecProc, right rect) {
+	fillRound(cv, right, 10, T.Card)
+	strokeRound(cv, right, 10, T.Stroke)
+	title := rect{right.X + 16, right.Y + 8, right.W - 32, 24}
+	drawText(cv, "Busiest processes", uiBold(11), T.Text, title, taLeft)
+	p.view.addText(title, "Busiest processes at this sample")
 	ty := right.Y + 44
-	hdr := walk.TextRight | walk.TextVCenter | walk.TextSingleLine
-	// columns from the right edge; PID is dropped when the panel is narrow
-	memX, cpuX, pidX := right.X+right.W-160, right.X+right.W-250, right.X+right.W-330
-	showPID := right.W >= 440
-	nameEnd := pidX - 12
-	if !showPID {
-		nameEnd = cpuX - 12
+	if len(procs) == 0 {
+		r := rect{right.X + 16, ty, right.W - 32, 22}
+		drawText(cv, "No process data for this sample", uiFont(10), T.Muted, r, taLeft)
+		p.view.addText(r, "No process data for this sample")
+		return
 	}
-	nameW := max(60, nameEnd-(right.X+16))
+	memX := right.X + right.W - 96
+	cpuX, pidX := memX-60, memX-130
+	showPID := right.W >= 440
+	nameEnd := pidX - 6
+	if !showPID {
+		nameEnd = cpuX - 6
+	}
+	nameW := nameEnd - (right.X + 16)
 	drawText(cv, "Process", uiFont(9), T.Faint, rect{right.X + 16, ty, nameW, 20}, taLeft)
 	if showPID {
-		drawText(cv, "PID", uiFont(9), T.Faint, rect{pidX, ty, 60, 20}, hdr)
+		drawText(cv, "PID", uiFont(9), T.Faint, rect{pidX, ty, 60, 20}, taRight)
 	}
-	drawText(cv, "CPU", uiFont(9), T.Faint, rect{cpuX, ty, 70, 20}, hdr)
-	drawText(cv, "Memory", uiFont(9), T.Faint, rect{memX, ty, 100, 20}, hdr)
+	drawText(cv, "CPU", uiFont(9), T.Faint, rect{cpuX, ty, 48, 20}, taRight)
+	drawText(cv, "Memory", uiFont(9), T.Faint, rect{memX, ty, 80, 20}, taRight)
 	ty += 22
 	maxRows := (right.H - 70) / 24
-	for i, pr := range s.Top {
+	for i, pr := range procs {
 		if i >= maxRows {
 			break
 		}
@@ -514,44 +557,76 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		}
 		drawText(cv, pr.Name, uiFont(10), c, rect{right.X + 16, ty, nameW, 22}, taLeft)
 		if showPID {
-			drawText(cv, fmt.Sprint(pr.PID), uiFont(10), T.Muted, rect{pidX, ty, 60, 22}, hdr)
+			drawText(cv, fmt.Sprint(pr.PID), uiFont(10), T.Muted, rect{pidX, ty, 60, 22}, taRight)
 		}
-		drawText(cv, fmtPct(pr.CPU), uiFont(10), c, rect{cpuX, ty, 70, 22}, hdr)
-		drawText(cv, fmtBytes(pr.Mem), uiFont(10), T.Muted, rect{memX, ty, 100, 22}, hdr)
+		drawText(cv, fmtPct(pr.CPU), uiFont(10), c, rect{cpuX, ty, 48, 22}, taRight)
+		drawText(cv, fmtBytes(pr.Mem), uiFont(10), T.Muted, rect{memX, ty, 80, 22}, taRight)
 		p.view.addText(rect{right.X + 16, ty, right.W - 32, 22}, fmt.Sprintf("%s, PID %d, CPU %s, memory %s", pr.Name, pr.PID, fmtPct(pr.CPU), fmtBytes(pr.Mem)))
 		ty += 24
 	}
 }
 
-// paintCompactDetail is the selected moment in a single line, for windows too
-// short for the two detail panels.
-func (p *recorderPage) paintCompactDetail(cv *walk.Canvas, selT int64, w, y, h int) {
-	s, ok := p.app.rec.Nearest(selT)
-	if !ok || h-y < 20 {
+func (p *recorderPage) paintMoment(cv *walk.Canvas, s metrics.RecSample, row rect) {
+	when := time.UnixMilli(s.T).Format("Mon 15:04:05")
+	title := "Selected · " + when
+	if p.live {
+		title = "Latest · " + when
+		if p.app.rec.Enabled() {
+			title = "Live · " + when
+		}
+	} else {
+		label := "Go live"
+		if !p.app.rec.Enabled() {
+			label = "Go to latest"
+		}
+		r := rect{row.X + row.W - 90, row.Y, 90, row.H}
+		bg := T.Card
+		if p.view.hover == "live" || p.view.down == "live" {
+			bg = T.CardHi
+		}
+		fillRound(cv, r, 5, bg)
+		strokeRound(cv, r, 5, T.Accent)
+		drawText(cv, label, uiFont(9), T.Text, r, taCenter)
+		p.view.addItem(r, "live", label, ctlButton, false)
+		row.W -= r.W + 8
+	}
+	drawText(cv, title, uiBold(11), T.Text, row, taLeft)
+	p.view.addText(row, title)
+}
+
+func (p *recorderPage) paintCompactDetail(cv *walk.Canvas, s metrics.RecSample, panel rect) {
+	if panel.H < 28 {
 		return
 	}
-	when := time.UnixMilli(s.T).Format("15:04:05")
-	if p.live {
-		when = "Live " + when
+	row := rect{panel.X + 8, panel.Y, panel.W - 16, 28}
+	p.paintMoment(cv, s, row)
+	row.Y += 32
+	row.H = 20
+	if row.Y+row.H > panel.Y+panel.H {
+		return
 	}
-	line := fmt.Sprintf("%s · CPU %.0f%% · Memory %.0f%% · GPU %s · Disk %.0f%%", when, s.CPU, s.Mem, recordedGPUText(s), s.DiskP)
-	if len(s.Top) > 0 {
-		var names []string
-		for i, pr := range s.Top {
-			if i == 3 {
-				break
-			}
-			names = append(names, fmt.Sprintf("%s %s", pr.Name, fmtPct(pr.CPU)))
-		}
-		line += " · busiest: " + strings.Join(names, ", ")
+	for i, v := range []string{
+		"CPU " + fmtPct(s.CPU), "Memory " + fmtPct(s.Mem), "GPU " + recordedGPUText(s), "Disk " + fmtPct(s.DiskP),
+	} {
+		cell := rect{row.X + i*row.W/4, row.Y, row.W / 4, row.H}
+		drawText(cv, v, uiFont(10), T.Text, cell, taLeft)
+		p.view.addText(cell, v)
 	}
-	drawText(cv, line, uiFont(9), T.Muted, rect{24, y, w - 48 - 96, 20}, taLeft)
-	p.view.addText(rect{24, y, w - 48 - 96, 20}, strings.ReplaceAll(line, " · ", ", "))
-	if !p.live {
-		r := rect{w - 24 - 84, y - 2, 84, 24}
-		fillRound(cv, r, 6, blend(T.Accent, T.Card, 0.3))
-		drawText(cv, "Go live", uiFont(9), T.Text, r, taCenter)
-		p.view.addItem(r, "live", "Go live", ctlButton, false)
+	row.Y += 24
+	remaining := panel.Y + panel.H - row.Y
+	if remaining >= 2*row.H+8 || len(s.Top) == 0 && remaining >= row.H {
+		rates := "Disk " + fmtRate(s.DiskBps) + "   Network " + fmtRate(s.NetBps)
+		drawText(cv, rates, uiFont(9), T.Muted, row, taLeft)
+		p.view.addText(row, rates)
+		row.Y += 28
+		remaining -= 28
+	}
+	if remaining >= 94 {
+		p.paintProcesses(cv, s.Top, rect{panel.X, row.Y, panel.W, remaining})
+	} else if len(s.Top) > 0 && remaining >= row.H {
+		top := fmt.Sprintf("Busiest · %s  %s CPU", s.Top[0].Name, fmtPct(s.Top[0].CPU))
+		drawText(cv, top, uiFont(9), T.Muted, row, taLeft)
+		p.view.addText(row, top)
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 func TestCsvCellNeutralizesFormulaPrefixes(t *testing.T) {
@@ -41,13 +43,51 @@ func TestExportCSVNeutralizesFormulaNames(t *testing.T) {
 	}
 }
 
+func TestCSVReplacementFailureKeepsPreviousExport(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "recording.csv")
+	if err := os.WriteFile(path, []byte("previous recording"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a viewer with the old CSV open: ordinary writes may proceed,
+	// but Windows must refuse replacing the file until the viewer closes it.
+	h, err := windows.CreateFile(name, windows.GENERIC_READ, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ExportSamplesCSV(path, []RecSample{{CPU: 17}})
+	windows.CloseHandle(h)
+	if err == nil {
+		t.Fatal("export reported success while replacement was denied")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || string(b) != "previous recording" {
+		t.Fatalf("previous export was damaged: %q, %v", b, err)
+	}
+	if err := ExportSamplesCSV(path, []RecSample{{CPU: 17}}); err != nil {
+		t.Fatal(err)
+	}
+	b, err = os.ReadFile(path)
+	if err != nil || !strings.Contains(string(b), ",17.0,") {
+		t.Fatalf("completed CSV missing: %q, %v", b, err)
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("unexpected temporary files after export: %v, %v", files, err)
+	}
+}
+
 func TestRecorderReportsAndRecoversFromDiskWriteFailure(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "rec")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	r := NewRecorder(time.Hour, time.Second, dir)
-	t.Cleanup(func() { r.SetPersist(false) })
+	t.Cleanup(func() { closeRecorder(t, r) })
 	r.SetPersist(true)
 	r.SetEnabled(true)
 	base := time.Now().Add(-5 * time.Second).UnixMilli()
@@ -57,6 +97,7 @@ func TestRecorderReportsAndRecoversFromDiskWriteFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Add(snap(base, 10))
+	flushRecorder(t, r)
 	if err := r.DiskErr(); err == nil {
 		t.Fatal("a failing disk write was not reported")
 	}
@@ -65,6 +106,7 @@ func TestRecorderReportsAndRecoversFromDiskWriteFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Add(snap(base+2000, 11))
+	flushRecorder(t, r)
 	if err := r.DiskErr(); err != nil {
 		t.Fatalf("write error did not clear after a successful write: %v", err)
 	}
@@ -77,12 +119,13 @@ func TestRecorderLoadDiskSurvivesOversizedLine(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Now().Add(-4 * time.Second).UnixMilli()
 	r := NewRecorder(time.Hour, time.Second, dir)
-	t.Cleanup(func() { r.SetPersist(false) })
+	t.Cleanup(func() { closeRecorder(t, r) })
 	r.SetPersist(true)
 	r.SetEnabled(true)
 	r.Add(snap(base, 10))
 	r.Add(snap(base+2000, 20))
 	r.SetEnabled(false)
+	closeRecorder(t, r)
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil || len(files) != 1 {
 		t.Fatalf("recording files: %v, %v", files, err)

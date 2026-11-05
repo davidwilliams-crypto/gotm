@@ -97,6 +97,11 @@ func (t *settingsTab) pageKey(key walk.Key, mods walk.Modifiers) bool {
 		if mods == walk.ModShift || key == walk.KeyLeft {
 			dir = -1
 		}
+		// Let the native dialog move focus out of Settings at either end.
+		hits := t.v.hits
+		if key == walk.KeyTab && len(hits) > 0 && ((dir > 0 && t.v.keyHit == hits[len(hits)-1].id) || (dir < 0 && t.v.keyHit == hits[0].id)) {
+			return false
+		}
 		if r, ok := t.v.moveKeyboard(dir); ok {
 			y, h := int(float64(r.Y)/gs), int(float64(r.H)/gs)
 			if y < 12 {
@@ -142,14 +147,7 @@ func (t *settingsTab) tick(*metrics.Snapshot) {
 // chip an on/off switch.
 func (t *settingsTab) chip(cv *walk.Canvas, x, y, w int, label string, on bool, id, group string) int {
 	r := rect{x, y, w, 30}
-	fill, ink := T.CardHi, T.Muted
-	if on {
-		fill, ink = blend(T.Accent, T.Card, 0.45), T.Text
-	} else if t.v.hover == id {
-		ink = T.Text
-	}
-	fillRound(cv, r, 15, fill)
-	drawText(cv, label, uiFont(9), ink, r, taCenter)
+	t.drawChoice(cv, r, label, on, id)
 	if group != "" {
 		t.v.addItem(r, id, group+": "+label, ctlRadioButton, on)
 	} else {
@@ -158,12 +156,35 @@ func (t *settingsTab) chip(cv *walk.Canvas, x, y, w int, label string, on bool, 
 	return w + 8
 }
 
+// Keep offscreen hit targets available for keyboard navigation without
+// allocating a GDI pen and brush for each choice outside the viewport.
+func (t *settingsTab) drawChoice(cv *walk.Canvas, r rect, label string, on bool, id string) {
+	if r.Y+r.H <= 0 || r.Y >= t.viewH {
+		return
+	}
+	fill, ink, edge := T.CardHi, T.Muted, T.Stroke
+	if on {
+		fill, ink, edge = T.CardSel, T.Text, T.Accent
+		if highContrast {
+			fill, ink, edge = T.RowSel, T.RowSelText, T.RowSel
+		}
+	} else if id != "" && t.v.hover == id {
+		ink, edge = T.Text, T.Muted
+	}
+	fillRound(cv, r, 5, fill)
+	strokeRound(cv, r, 5, edge)
+	drawText(cv, label, uiFont(9), ink, r, taCenter)
+}
+
 func (t *settingsTab) section(cv *walk.Canvas, y int, w int, title string, height int) int {
 	r := rect{24, y, w - 48, height}
-	fillRound(cv, r, 12, T.Card)
-	strokeRound(cv, r, 12, T.Stroke)
-	drawText(cv, title, uiBold(11), T.Text, rect{r.X + 20, r.Y + 14, 400, 22}, taLeft)
-	t.v.addText(rect{r.X + 20, r.Y + 14, 400, 22}, title)
+	titleArea := rect{r.X + 20, r.Y + 12, r.W - 40, 24}
+	if r.Y+r.H > 0 && r.Y < t.viewH {
+		fillRound(cv, r, 8, T.Card)
+		strokeRound(cv, r, 8, T.Stroke)
+		drawText(cv, title, uiSemibold(12), T.Text, titleArea, taLeft)
+	}
+	t.v.addText(titleArea, title)
 	return y + height + 14
 }
 
@@ -183,14 +204,16 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 	y = t.section(cv, y, w, "Sampling", 118)
 	x := 44
 	drawText(cv, "Refresh every", uiFont(10), T.Muted, rect{x, top + 50, 130, 30}, taLeft)
-	cx := x + 140
+	labelW := clampI(w-380, 95, 140)
+	choiceW := min(72, (w-2*x-labelW)/4-6)
+	cx := x + labelW
 	for _, c := range refreshChoices {
-		cx += t.chip(cv, cx, top+50, 64, c.label, cfg.RefreshMs == c.ms, fmt.Sprintf("refresh:%d", c.ms), "Refresh every")
+		cx += t.chip(cv, cx, top+50, min(64, choiceW), c.label, cfg.RefreshMs == c.ms, fmt.Sprintf("refresh:%d", c.ms), "Refresh every")
 	}
 	drawText(cv, "Graph history", uiFont(10), T.Muted, rect{x, top + 82, 130, 30}, taLeft)
-	cx = x + 140
+	cx = x + labelW
 	for _, c := range historyChoices {
-		cx += t.chip(cv, cx, top+82, 72, c.label, cfg.HistorySeconds == c.sec, fmt.Sprintf("history:%d", c.sec), "Graph history")
+		cx += t.chip(cv, cx, top+82, choiceW, c.label, cfg.HistorySeconds == c.sec, fmt.Sprintf("history:%d", c.sec), "Graph history")
 	}
 
 	// ---- processes ----
@@ -216,12 +239,7 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 			id = "" // always on
 		}
 		r := rect{cx, cy, 116, 30}
-		fill, ink := T.CardHi, T.Muted
-		if want[d.key] {
-			fill, ink = blend(T.Accent, T.Card, 0.45), T.Text
-		}
-		fillRound(cv, r, 15, fill)
-		drawText(cv, d.title, uiFont(9), ink, r, taCenter)
+		t.drawChoice(cv, r, d.title, want[d.key], id)
 		if id != "" {
 			t.v.addItem(r, id, "Column "+d.title, ctlCheckBox, want[d.key])
 		} else {
@@ -231,21 +249,34 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 
 	// ---- alerts ----
 	top = y
-	y = t.section(cv, y, w, "Alerts — banner in the header and a tray notification", 62+len(cfg.Alerts)*44)
+	alertH := 44
+	if w < 570 {
+		alertH = 78
+	}
+	y = t.section(cv, y, w, "Alert thresholds", 60+len(cfg.Alerts)*alertH)
 	for i, al := range cfg.Alerts {
-		ry := top + 50 + i*44
+		ry := top + 48 + i*alertH
 		t.chip(cv, 44, ry, 150, metricName(al.Metric)+" above", al.Enabled, fmt.Sprintf("al:%d:en", i), "")
 		t.stepper(cv, 214, ry, fmt.Sprintf("%.0f%%", al.Above), fmt.Sprintf("al:%d:above", i), metricName(al.Metric)+" alert threshold")
-		drawText(cv, "for", uiFont(10), T.Muted, rect{356, ry, 30, 30}, taCenter)
-		t.stepper(cv, 394, ry, fmt.Sprintf("%d s", al.ForSeconds), fmt.Sprintf("al:%d:for", i), metricName(al.Metric)+" alert duration")
+		durationX := 394
+		if w < 570 {
+			ry += 34
+			durationX = 214
+		}
+		drawText(cv, "for", uiFont(10), T.Muted, rect{durationX - 38, ry, 30, 30}, taCenter)
+		t.stepper(cv, durationX, ry, fmt.Sprintf("%d s", al.ForSeconds), fmt.Sprintf("al:%d:for", i), metricName(al.Metric)+" alert duration")
 	}
 
 	// ---- recorder ----
 	top = y
-	y = t.section(cv, y, w, "Flight recorder", 96)
+	noteX, noteDy := 290, 0
+	if w < 800 {
+		noteX, noteDy = 44, 34
+	}
+	y = t.section(cv, y, w, "Flight recorder", 96+noteDy)
 	t.chip(cv, 44, top+48, 230, "Keep recording on disk", cfg.RecorderDisk, "recdisk", "")
-	t.note(cv, "Off by default: samples (including process names) stay in memory only.",
-		uiFont(9), T.Muted, rect{290, top + 48, w - 340, 30})
+	t.note(cv, "Saves samples and process names between sessions.",
+		uiFont(9), T.Muted, rect{noteX, top + 48 + noteDy, w - noteX - 44, 30})
 
 	// ---- Windows Task Manager ----
 	top = y
@@ -261,11 +292,11 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 
 	// ---- AMD Ryzen sensors ----
 	top = y
-	y = t.section(cv, y, w, "AMD Ryzen sensors", 124)
+	y = t.section(cv, y, w, "AMD Ryzen sensors", 124+noteDy)
 	rz := t.app.sensors.Ryzen()
 	t.chip(cv, 44, top+48, 230, "Use AMD Monitoring SDK", t.app.ryzenOn, "ryzensdk", "")
-	t.note(cv, "Off by default. Needs administrator rights and AMD's SDK; gotm only reads, it never changes CPU settings.",
-		uiFont(9), T.Muted, rect{290, top + 48, w - 340, 30})
+	t.note(cv, "Read AMD sensors with the installed SDK. Requires administrator rights.",
+		uiFont(9), T.Muted, rect{noteX, top + 48 + noteDy, w - noteX - 44, 30})
 	status, ink := "Off", T.Faint
 	if t.app.ryzenOn && rz == nil {
 		status = "On for this PC; it runs when gotm is started as administrator."
@@ -285,7 +316,7 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 			ink = T.Warn
 		}
 	}
-	t.note(cv, status, uiFont(9), ink, rect{44, top + 84, w - 88, 30})
+	t.note(cv, status, uiFont(9), ink, rect{44, top + 84 + noteDy, w - 88, 30})
 
 	// ---- keyboard ----
 	top = y
@@ -300,6 +331,10 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 	// ---- actions ----
 	ax := 24
 	btn := func(label string, id string, c walk.Color) {
+		if ax+190 > w-24 {
+			ax = 24
+			y += 42
+		}
 		r := rect{ax, y + 4, 190, 36}
 		fill := T.Card
 		if t.v.hover == id {
@@ -371,7 +406,6 @@ func (t *settingsTab) onClick(id string, _ walk.MouseButton) {
 		a.saveConfig(func(c *configT) { c.HistorySeconds = n })
 	case id == "hideidle":
 		a.saveConfig(func(c *configT) { c.HideSystemIdle = !c.HideSystemIdle })
-		a.procs.refresh()
 	case strings.HasPrefix(id, "col:"):
 		key := strings.TrimPrefix(id, "col:")
 		a.saveConfig(func(c *configT) {
@@ -399,7 +433,6 @@ func (t *settingsTab) onClick(id string, _ walk.MouseButton) {
 			}
 			c.Columns = keep
 		})
-		a.procs.applyColumns()
 	case strings.HasPrefix(id, "al:"):
 		parts := strings.Split(id, ":")
 		if len(parts) >= 3 {
@@ -428,10 +461,7 @@ func (t *settingsTab) onClick(id string, _ walk.MouseButton) {
 			})
 		}
 	case id == "recdisk":
-		v := !a.rec.Persist()
-		if a.saveConfig(func(c *configT) { c.RecorderDisk = v }) {
-			a.rec.SetPersist(v)
-		}
+		a.saveConfig(func(c *configT) { c.RecorderDisk = !c.RecorderDisk })
 	case id == "taskmanager":
 		t.changeTaskManager()
 	case id == "ryzensdk":

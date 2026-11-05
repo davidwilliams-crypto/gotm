@@ -3,6 +3,8 @@
 package ui
 
 import (
+	"unsafe"
+
 	"github.com/tailscale/walk"
 	decl "github.com/tailscale/walk/declarative"
 	"github.com/tailscale/win"
@@ -32,6 +34,7 @@ type canvasView struct {
 	mx, my    int  // last mouse position (pixels)
 	left      bool // left button currently held
 	focusHook bool
+	tracking  bool // Windows will post WM_MOUSELEAVE when the pointer exits
 	keyboard  bool
 	keyHit    string
 	keyName   string // what the keyboard does here (the accessible help text)
@@ -64,7 +67,16 @@ func (v *canvasView) paint(cv *walk.Canvas, _ walk.Rectangle) error {
 	}
 	if !v.focusHook {
 		v.focusHook = true
-		v.cw.FocusedChanged().Attach(v.invalidate)
+		v.cw.FocusedChanged().Attach(func() {
+			if !v.cw.Focused() {
+				v.down = ""
+			}
+			v.invalidate()
+		})
+		v.cw.Disposing().Attach(func() {
+			v.stopTracking()
+			v.focusHook = false
+		})
 	}
 	r := v.cw.ClientBoundsPixels()
 	if r.Width <= 0 || r.Height <= 0 {
@@ -78,14 +90,19 @@ func (v *canvasView) paint(cv *walk.Canvas, _ walk.Rectangle) error {
 	v.items = v.items[:0]
 	fillRect(cv, rect{0, 0, v.w + 2, v.h + 2}, v.background())
 	v.paintFn(cv, v.w, v.h)
-	if v.keyboard && v.cw.Focused() && v.keyHit != "" {
-		for _, h := range v.hits {
-			if h.id == v.keyHit {
-				r := h.r
-				strokeRound(cv, rect{int(float64(r.X) / gs), int(float64(r.Y) / gs), int(float64(r.W) / gs), int(float64(r.H) / gs)}, 6, T.Accent)
+	if v.keyboard && v.cw.Focused() && len(v.hits) > 0 {
+		focused := v.hits[0]
+		for _, item := range v.hits {
+			if item.id == v.keyHit {
+				focused = item
 				break
 			}
 		}
+		v.keyHit = focused.id
+		r := focused.r
+		focusRect := rect{int(float64(r.X) / gs), int(float64(r.Y) / gs), int(float64(r.W) / gs), int(float64(r.H) / gs)}
+		strokeRound(cv, focusRect.inset(1), 5, T.Accent)
+		strokeRound(cv, focusRect.inset(2), 4, v.background())
 	}
 	if v.acc {
 		v.ensureUIA()
@@ -113,6 +130,9 @@ func (v *canvasView) canvasKey(key walk.Key, mods walk.Modifiers) bool {
 		v.keyHit = ""
 		v.moveKeyboard(-1)
 	case walk.KeySpace, walk.KeyReturn:
+		if v.keyHit == "" && len(v.hits) > 0 {
+			v.keyHit = v.hits[0].id
+		}
 		v.click(v.keyHit)
 	default:
 		return false
@@ -187,6 +207,14 @@ func (v *canvasView) declare(minW, minH, maxW, maxH, stretch int) decl.CustomWid
 		OnMouseMove: func(x, y int, b walk.MouseButton) {
 			v.mx, v.my, v.left = x, y, b&walk.LeftButton != 0
 			id := v.hitAt(x, y)
+			if v.focusHook && !v.tracking && (id != "" || v.onMove != nil) {
+				event := win.TRACKMOUSEEVENT{DwFlags: win.TME_LEAVE, HwndTrack: v.cw.Handle()}
+				event.CbSize = uint32(unsafe.Sizeof(event))
+				if win.TrackMouseEvent(&event) {
+					v.tracking = true
+					walk.App().AddPreTranslateHandlerForHWND(event.HwndTrack, v)
+				}
+			}
 			if id != v.hover {
 				v.hover = id
 				if id != "" {
@@ -207,6 +235,7 @@ func (v *canvasView) declare(minW, minH, maxW, maxH, stretch int) decl.CustomWid
 				return
 			}
 			v.down = v.hitAt(x, y)
+			v.hover = v.down
 			if v.keyboard && v.cw != nil {
 				_ = v.cw.SetFocus()
 				if v.down != "" {
@@ -225,6 +254,27 @@ func (v *canvasView) declare(minW, minH, maxW, maxH, stretch int) decl.CustomWid
 				v.onClick(id, b)
 			}
 		},
+	}
+}
+
+// Walk has no mouse-leave event for a CustomWidget. Listen for the native
+// notification only while the pointer is over this canvas.
+func (v *canvasView) OnPreTranslate(msg *win.MSG) bool {
+	if msg.Message == win.WM_MOUSELEAVE && v.cw != nil && msg.HWnd == v.cw.Handle() {
+		v.stopTracking()
+		v.mx, v.my, v.hover = -1, -1, ""
+		if v.onMove != nil && !v.left {
+			v.onMove(-1, -1)
+		}
+		v.invalidate()
+	}
+	return false
+}
+
+func (v *canvasView) stopTracking() {
+	if v.tracking {
+		walk.App().DeletePreTranslateHandlerForHWND(v.cw.Handle())
+		v.tracking = false
 	}
 }
 
@@ -271,14 +321,16 @@ func newButton(text, glyph string, width int, onClick func()) *button {
 }
 
 func (b *button) widget() decl.CustomWidget {
-	w := b.v.declare(b.width, 34, b.width, 34, 0)
+	minWidth := b.width
+	if b.glyph != "" && !b.glyphRight {
+		minWidth = min(b.width, 42)
+	} else if b.glyphRight {
+		minWidth = min(b.width, 74)
+	}
+	w := b.v.declare(minWidth, 34, b.width, 34, 0)
 	w.Style = win.WS_TABSTOP
 	w.Enabled = b.enabled
-	name := b.text
-	if name == "" {
-		name = b.tip
-	}
-	w.Accessibility = decl.Accessibility{Name: name, Description: b.tip, Role: decl.AccRolePushbutton, DefaultAction: "Press"}
+	w.Accessibility = decl.Accessibility{Name: b.accessibleName(), Description: b.tip, Role: decl.AccRolePushbutton, DefaultAction: "Press"}
 	w.ToolTipText = b.tip
 	if b.tip == "" {
 		w.ToolTipText = b.text
@@ -310,8 +362,14 @@ func (b *button) widget() decl.CustomWidget {
 func (b *button) set(enabled, active bool) {
 	if b.enabled != enabled || b.active != active {
 		b.enabled, b.active = enabled, active
+		if !enabled {
+			b.v.down, b.v.hover = "", ""
+		}
 		if b.v.cw != nil {
 			b.v.cw.SetEnabled(enabled)
+			if b.toggle {
+				_ = b.v.cw.Accessibility().SetName(b.accessibleName())
+			}
 		}
 		b.v.invalidate()
 	}
@@ -321,55 +379,94 @@ func (b *button) setText(s string) {
 	if b.text != s {
 		b.text = s
 		if b.v.cw != nil {
-			_ = b.v.cw.Accessibility().SetName(s)
+			_ = b.v.cw.Accessibility().SetName(b.accessibleName())
 		}
 		b.v.invalidate()
 	}
 }
 
+func (b *button) accessibleName() string {
+	name := b.text
+	if name == "" {
+		name = b.tip
+	}
+	if b.toggle {
+		if b.active {
+			return name + ", on"
+		}
+		return name + ", off"
+	}
+	return name
+}
+
 func (b *button) draw(cv *walk.Canvas, w, h int) {
-	r := rect{0, 2, w, h - 4}
+	r := rect{1, 2, w - 2, h - 4}
 	fill, stroke, ink := T.Card, T.Stroke, T.Text
+	pressed, hovered := b.v.down == "b" && (!b.v.left || b.v.hover == "b"), b.v.hover == "b"
 	switch {
 	case !b.enabled:
-		ink, fill = T.Faint, blend(T.Card, T.Bg, 0.55)
+		ink, fill = T.Faint, T.Bg
+	case highContrast:
+		if b.active || b.accent || pressed || hovered {
+			fill, ink = T.Accent, T.AccentText
+		}
+		stroke = T.Text
+	case b.danger:
+		ink, stroke, fill = T.Bad, blend(T.Bad, T.Card, 0.4), blend(T.Bad, T.Card, 0.08)
+		if pressed {
+			fill = blend(T.Bad, T.Card, 0.34)
+		} else if hovered {
+			fill = blend(T.Bad, T.Card, 0.20)
+		}
 	case b.accent || b.active:
-		fill, stroke = blend(T.Accent, T.Bg, 0.30), blend(T.Accent, T.Bg, 0.70)
-		ink = T.Text
-	case b.v.down == "b":
-		fill = T.CardSel
-	case b.v.hover == "b":
-		fill = T.CardHi
-	}
-	if b.danger && b.enabled {
-		ink = T.Bad
-		if b.v.hover == "b" {
-			fill = blend(T.Bad, T.Bg, 0.18)
+		fill, stroke = T.RowSel, T.Accent
+		if pressed {
+			fill = blend(T.Accent, T.RowSel, 0.28)
+		} else if hovered {
+			fill = blend(T.Accent, T.RowSel, 0.14)
 		}
+	case pressed:
+		fill, stroke = T.CardSel, T.Accent
+	case hovered:
+		fill, stroke = T.CardHi, T.Faint
 	}
-	fillRound(cv, r, 6, fill)
+	fillRound(cv, r, 5, fill)
+	strokeRound(cv, r, 5, stroke)
+	if b.enabled && b.toggle && b.active {
+		fillRound(cv, rect{w/2 - 7, h - 6, 14, 2}, 1, ink)
+	}
 	if b.enabled && b.v.cw != nil && b.v.cw.Focused() {
-		stroke = T.Accent
+		strokeRound(cv, r.inset(2), 4, ink)
 	}
-	strokeRound(cv, r, 6, stroke)
-	x := 12
-	if b.glyphRight {
-		drawText(cv, b.text, uiFont(10), ink, rect{x, 0, w - x - 30, h}, taLeft)
-		drawText(cv, b.glyph, iconFont(9), ink, rect{w - 28, 0, 18, h}, taCenter)
-		if b.enabled {
-			b.v.addHit(rect{0, 0, w, h}, "b")
-		}
-		return
-	}
-	if b.glyph != "" && b.text == "" {
-		drawText(cv, b.glyph, iconFont(12), ink, rect{0, 0, w, h}, taCenter) // icon-only button
-	} else if b.glyph != "" {
-		drawText(cv, b.glyph, iconFont(11), ink, rect{x, 0, 20, h}, taLeft)
-		x += 24
-	}
-	drawText(cv, b.text, uiFont(10), ink, rect{x, 0, w - x - 8, h}, taLeft)
 	if b.enabled {
 		b.v.addHit(rect{0, 0, w, h}, "b")
+	}
+	if pressed {
+		r.Y++ // a tactile cue also when Windows controls both colours
+	}
+	if b.glyphRight {
+		drawText(cv, b.text, uiFont(10), ink, rect{8, r.Y, w - 30, r.H}, taLeft)
+		drawText(cv, b.glyph, iconFont(8), ink, rect{w - 23, r.Y, 16, r.H}, taCenter)
+		return
+	}
+	if b.glyph == "" {
+		drawText(cv, b.text, uiFont(10), ink, r.inset(2), taCenter)
+		return
+	}
+	if b.text == "" {
+		drawText(cv, b.glyph, iconFont(11), ink, r, taCenter)
+		return
+	}
+	labelWidth := textWidth(cv, b.text, uiFont(10))
+	switch {
+	case w < labelWidth+12:
+		drawText(cv, b.glyph, iconFont(11), ink, r, taCenter)
+	case w < labelWidth+36:
+		drawText(cv, b.text, uiFont(10), ink, r, taCenter)
+	default:
+		x := (w - labelWidth - 22) / 2
+		drawText(cv, b.glyph, iconFont(10), ink, rect{x, r.Y, 17, r.H}, taCenter)
+		drawText(cv, b.text, uiFont(10), ink, rect{x + 22, r.Y, w - x - 25, r.H}, taLeft)
 	}
 }
 

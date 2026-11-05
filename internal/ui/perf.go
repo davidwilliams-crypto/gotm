@@ -11,6 +11,7 @@ import (
 
 	"github.com/tailscale/walk"
 	decl "github.com/tailscale/walk/declarative"
+	"github.com/tailscale/win"
 
 	"gotm/internal/metrics"
 )
@@ -31,6 +32,13 @@ type perfPage struct {
 	gpuList   rect
 	gpuRows   int
 	gpuProcs  int
+
+	// The detail viewport scrolls only when its facts or core tiles cannot fit.
+	detailScroll, detailMax int
+	detailArea              rect
+
+	railArea             rect
+	railFirst, railCount int
 
 	// hover readout on the main graph: the sample under the mouse (-1 = none)
 	// and the plot area it maps to, recorded while painting.
@@ -94,11 +102,15 @@ func newPerfPage(a *App) *perfPage {
 		fmt.Sscanf(v, "%d", &p.sel)
 	}
 	p.v = newCanvasView(p.paint)
-	p.v.keyboard, p.v.keyName = true, "Performance. Up and Down select a resource, Space or Enter changes its graph view."
+	p.v.keyboard, p.v.keyName = true, "Performance. Up and Down select a resource, Space or Enter changes its graph view. Page Up and Page Down scroll through details."
 	p.v.acc, p.v.accName, p.v.accCtl = true, "Performance", ctlPane
 	p.v.onClick = func(id string, _ walk.MouseButton) {
 		var n int
 		switch {
+		case id == "rail:up":
+			p.scrollRail(-1)
+		case id == "rail:down":
+			p.scrollRail(1)
 		case id == "cores":
 			p.perCore = !p.perCore
 		case id == "gpuview:overall":
@@ -108,7 +120,7 @@ func newPerfPage(a *App) *perfPage {
 		default:
 			if _, err := fmt.Sscanf(id, "res:%d", &n); err == nil {
 				if p.sel != n {
-					p.gpuScroll = 0
+					p.gpuScroll, p.detailScroll = 0, 0
 				}
 				p.sel = n
 			}
@@ -135,12 +147,16 @@ func (p *perfPage) build() decl.Widget {
 func (p *perfPage) init() {
 	p.app.registerRoot(pgPerformance, p.root)
 	p.v.onWheel = func(delta int) {
-		if p.gpuRows == 0 || !p.gpuList.px().contains(p.v.mx, p.v.my) {
+		if p.railArea.px().contains(p.v.mx, p.v.my) {
+			p.scrollRail(-delta / 40)
 			return
 		}
-		p.gpuScroll -= delta / 40 // three rows per notch
-		p.clampGPUScroll()
-		p.v.invalidate()
+		if p.gpuList.px().contains(p.v.mx, p.v.my) && p.scrollGPUProcesses(-delta/40) {
+			return
+		}
+		if p.detailArea.px().contains(p.v.mx, p.v.my) {
+			p.scrollDetail(-delta / 2)
+		}
 	}
 	// Hovering the big graph pins a marker on the sample under the cursor and
 	// repaints only when that sample changes, so a sweep costs no more than the
@@ -161,7 +177,7 @@ func (p *perfPage) hoverIndexAt(x, y int) int {
 		return -1
 	}
 	r := p.hoverGraph.px()
-	if !r.contains(x, y) {
+	if !r.contains(x, y) || (p.detailArea.H > 0 && !p.detailArea.px().contains(x, y)) {
 		return -1
 	}
 	n := len(p.hist)
@@ -180,6 +196,21 @@ func (p *perfPage) clampGPUScroll() {
 		p.gpuScroll = 0
 	}
 }
+
+func (p *perfPage) scrollGPUProcesses(rows int) bool {
+	if p.gpuRows == 0 || p.gpuProcs <= p.gpuRows {
+		return false
+	}
+	before := p.gpuScroll
+	p.gpuScroll += rows
+	p.clampGPUScroll()
+	if p.gpuScroll == before {
+		return false
+	}
+	p.v.invalidate()
+	return true
+}
+
 func (p *perfPage) shown()                   { p.v.invalidate() }
 func (p *perfPage) focusTarget() walk.Window { return p.v.cw }
 func (p *perfPage) reload()                  { p.hist = p.app.sampler.History(); p.v.invalidate() }
@@ -198,17 +229,30 @@ func (p *perfPage) pageKey(key walk.Key, mods walk.Modifiers) bool {
 		p.sel = 0
 	case walk.KeyEnd:
 		p.sel = last
+	case walk.KeyPrior, walk.KeyNext:
+		direction := 1
+		if key == walk.KeyPrior {
+			direction = -1
+		}
+		// The process list follows the graphs and facts. Page through its
+		// rows at the bottom, then back through the facts on the way up.
+		if p.detailScroll == p.detailMax && p.scrollGPUProcesses(direction*p.gpuRows) {
+			return true
+		}
+		p.scrollDetail(direction * max(40, p.detailArea.H-32))
+		return true
 	case walk.KeySpace, walk.KeyReturn:
 		it := p.items(p.app.snap)[p.sel]
 		if it.kind == resCPU {
 			p.perCore = !p.perCore
-		} else if it.kind == resGPU {
+		} else if it.kind == resGPU && it.gpu >= 0 && len(p.app.snap.GPUs[it.gpu].Engines) > 0 {
 			p.gpuOver = !p.gpuOver
 		}
 	default:
 		return false
 	}
-	p.gpuScroll = 0
+	p.gpuScroll, p.detailScroll = 0, 0
+	p.revealResource()
 	p.v.keyHit = fmt.Sprintf("res:%d", p.sel)
 	p.v.invalidate()
 	return true
@@ -244,12 +288,7 @@ func (p *perfPage) seriesFor(it resItem) []series {
 		return []series{{vals: pick(func(h *metrics.HistPoint) float64 { return h.Mem }), color: col, fill: true}}
 	case resGPU:
 		if it.gpu >= 0 && p.app.snap != nil && it.gpu < len(p.app.snap.GPUs) {
-			return []series{{vals: p.gpuSeries(p.app.snap.GPUs[it.gpu].ID, func(g *metrics.GPUHist) float64 {
-				if !g.HasUtilization && len(g.Eng) == 0 {
-					return math.NaN()
-				}
-				return g.Pct
-			}), color: col, fill: true}}
+			return []series{{vals: p.gpuSeries(p.app.snap.GPUs[it.gpu].ID, gpuPointUtil), color: col, fill: true}}
 		}
 		return []series{{vals: pick(func(h *metrics.HistPoint) float64 {
 			if !h.GPUOK {
@@ -327,201 +366,92 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	if v.keyHit == "" {
 		v.keyHit = fmt.Sprintf("res:%d", p.sel) // keyboard focus starts on the selected card
 	}
-	// Cards shrink to fit (several GPUs, short windows); below 88 units they
-	// switch to a compact layout so the caption never runs into the value.
-	cardH, gap := 96, 10
-	if n := len(items); n > 0 && 12+n*(cardH+gap) > h {
-		gap = 6
-		cardH = max(44, (h-12)/n-gap)
-	}
-	for i, it := range items {
-		r := rect{20, 12 + i*(cardH+gap), 300, cardH}
-		id := fmt.Sprintf("res:%d", i)
-		fill := T.Card
-		switch {
-		case i == p.sel:
-			fill = T.CardSel
-		case v.hover == id:
-			fill = T.CardHi
-		}
-		fillRound(cv, r, 10, fill)
-		strokeRound(cv, r, 10, T.Stroke)
-		fillRect(cv, rect{r.X, r.Y + 14, 4, r.H - 28}, resColor(it.kind))
-		value, sub, _ := p.headline(it, s)
-		if it.kind == resCPU {
-			sub = p.cpuCardSub(s) // the full line does not fit a card
-		}
-		title := resTitle(it.kind)
-		if it.kind == resGPU && it.gpu >= 0 {
-			title = fmt.Sprintf("GPU %d", it.gpu)
-		}
-		switch {
-		case cardH >= 88:
-			drawText(cv, title, uiBold(10), T.Text, rect{r.X + 18, r.Y + 8, 120, 22}, taLeft)
-			drawText(cv, value, uiLight(20), resColor(it.kind), rect{r.X + 18, r.Y + 28, 140, 36}, taLeft)
-			drawText(cv, sub, uiFont(8), T.Muted, rect{r.X + 18, r.Y + cardH - 30, 150, 20}, taLeft)
-		case cardH >= 64:
-			drawText(cv, title, uiBold(10), T.Text, rect{r.X + 18, r.Y + 6, 70, 22}, taLeft)
-			drawText(cv, value, uiLight(14), resColor(it.kind), rect{r.X + 88, r.Y + 4, 74, 26}, taLeft)
-			drawText(cv, sub, uiFont(8), T.Muted, rect{r.X + 18, r.Y + cardH - 26, 146, 20}, taLeft)
-		default: // one line: title and value
-			drawText(cv, title, uiBold(10), T.Text, rect{r.X + 18, r.Y, 70, cardH}, taLeft)
-			drawText(cv, value, uiLight(14), resColor(it.kind), rect{r.X + 88, r.Y, 74, cardH}, taLeft)
-		}
-		spark := rect{r.X + 166, r.Y + min(14, cardH/5), 120, r.H - 2*min(14, cardH/5)}
-		plotSeries(cv, spark, p.seriesFor(it), graphStyle{bg: fill, max: p.fixedMax(it.kind), capacity: p.capacity(), lineW: 2})
-		v.addItem(r, id, fmt.Sprintf("%s: %s, %s", title, value, sub), ctlListItem, i == p.sel)
-	}
+	margin := clampI(w/42, 10, 24)
+	railW := clampI((w-2*margin)/4, 106, 282)
+	p.paintRail(cv, rect{margin, 10, railW, h - 20}, items, s)
 
-	// ---- detail pane ----------------------------------------------------------
-	x0 := 344
-	dw := w - x0 - 24
-	if dw < 300 {
-		return
-	}
+	// The detail takes the remaining width even on a small remote desktop.
+	x0 := margin + railW + margin
+	dw := w - x0 - margin
 	cur := items[p.sel]
 	kind := cur.kind
 	metrics.SetGPUSensorsWanted(p.app.gpuSensorsWanted())
-	infoColor := resColor(kind)
 	title := resTitle(kind)
+	var device string
 	switch kind {
 	case resCPU:
-		title = trimSpace(p.app.host.CPUName)
+		device = trimSpace(p.app.host.CPUName)
 	case resMem:
-		title = "Memory  " + fmtBytes(s.Mem.Total)
+		device = fmtBytes(s.Mem.Total) + " installed"
 	case resGPU:
-		title = "Graphics (all adapters)"
+		device = "All graphics adapters"
 		if cur.gpu >= 0 && cur.gpu < len(s.GPUs) {
-			title = s.GPUs[cur.gpu].Name
+			title = fmt.Sprintf("GPU %d", cur.gpu)
+			device = s.GPUs[cur.gpu].Name
 		}
 	case resDisk:
-		title = "Disks"
+		device = "All physical disks"
 	case resNet:
-		title = "Network (all adapters)"
+		device = "All network adapters"
 	}
 	value, sub, pct := p.headline(cur, s)
 	if kind == resGPU && cur.gpu >= 0 && cur.gpu < len(s.GPUs) {
-		sub = gpuSubtitle(&s.GPUs[cur.gpu], cur.gpu)
+		sub = gpuSubtitle(&s.GPUs[cur.gpu])
 	}
-	drawText(cv, title, uiLight(20), T.Text, rect{x0, 8, dw - 180, 40}, taLeft)
-	drawText(cv, sub, uiFont(10), T.Muted, rect{x0 + 2, 46, dw - 180, 22}, taLeft)
-	drawText(cv, value, uiLight(26), infoColor, rect{x0 + dw - 200, 6, 200, 44}, taRight)
-	v.addText(rect{x0, 8, dw, 60}, fmt.Sprintf("%s: %s. %s", title, value, sub))
+	span := "History window · " + humanDur(time.Duration(p.app.cfg.HistorySeconds)*time.Second)
+	valueFont := uiLight(23)
+	valueW := textWidth(cv, value, valueFont) + 4
+	drawText(cv, title, uiBold(17), T.Text, rect{x0, 3, dw - valueW - 12, 36}, taLeft)
+	drawText(cv, value, valueFont, resColor(kind), rect{x0 + dw - valueW, 1, valueW, 38}, taRight)
+	drawText(cv, device, uiFont(10), T.Text, rect{x0, 39, dw, 19}, taLeft)
+	spanW := textWidth(cv, span, uiFont(9)) + 4
+	drawText(cv, sub, uiFont(9), T.Muted, rect{x0, 59, dw - spanW - 10, 18}, taLeft)
+	drawText(cv, span, uiFont(9), T.Muted, rect{x0 + dw - spanW, 59, spanW, 18}, taRight)
+	v.addText(rect{x0, 3, dw, 74}, fmt.Sprintf("%s: %s. %s. %s. %s", title, value, device, sub, span))
+	if kind != resNet && value != "n/a" {
+		bar := rect{x0, 82, dw, 3}
+		fillRect(cv, bar, T.Grid)
+		fillRect(cv, rect{bar.X, bar.Y, clampI(int(float64(dw)*pct/100), 0, dw), bar.H}, resColor(kind))
+	} else {
+		hline(cv, x0, x0+dw, 83, T.Stroke)
+	}
 
-	// utilisation bar
-	by := 76
-	bar := rect{x0, by, dw, 8}
-	fillRound(cv, bar, 4, T.Grid)
-	if kind != resNet {
-		fillRound(cv, rect{bar.X, bar.Y, int(float64(bar.W) * pct / 100), bar.H}, 4, infoColor)
-	}
+	const top = 96
 	if kind == resGPU && cur.gpu >= 0 && cur.gpu < len(s.GPUs) {
-		p.paintGPUBody(cv, s, &s.GPUs[cur.gpu], x0, dw, 96, h)
+		p.paintGPUBody(cv, cur, x0, dw, top, h)
 		return
 	}
-
-	// main graph
 	stats := p.statsFor(cur, s)
-	gy := 96
-	// Never let the fact grid push past the footer: show as many rows as fit
-	// once a minimum graph (and the per-core grid) has been reserved.
-	reserve := 150
-	coreRoom := h - gy - 120 - 76 // what the tiles may use: a 120-unit graph and one stats row stay
+	statCols := clampI(dw/142, 2, 4)
+	const factStep = 50
+	statH := ((len(stats)+statCols-1)/statCols)*factStep + 12
+	const minGraph = 112
+	bodyH := max(1, h-top)
+	gridH, cols, rows, cellH := 0, 0, 0, 0
 	if kind == resCPU && p.perCore && len(s.Cores) > 0 {
-		c := perCoreCols(dw, len(s.Cores), coreRoom) // the same column count the grid will use
-		reserve = 150 + ((len(s.Cores)+c-1)/c)*(26+8) + 8
-	}
-	maxRows := (h - gy - reserve - 12 - 16) / 60
-	if maxRows < 1 {
-		maxRows = 1
-	}
-	if len(stats) > maxRows*4 {
-		stats = stats[:maxRows*4]
-	}
-	statRows := (len(stats) + 3) / 4
-	statH := statRows*60 + 16
-	avail := h - gy - statH - 12
-	gh := avail
-	gridH := 0
-	var cols, rows int
-	if kind == resCPU && p.perCore && len(s.Cores) > 0 {
-		cols = perCoreCols(dw, len(s.Cores), coreRoom)
+		cols = perCoreCols(dw, len(s.Cores), bodyH-minGraph-statH)
 		rows = (len(s.Cores) + cols - 1) / cols
-		cellH := 56
-		gridH = rows*(cellH+8) + 8
-		gh = avail - gridH
-		if gh < 120 {
-			gh = 120
-			cellH = (avail-gh-8)/rows - 8
-			if cellH < 26 {
-				cellH = 26
-			}
-			gridH = rows*(cellH+8) + 8
-		}
+		cellH = clampI((bodyH-minGraph-statH-8)/rows-6, 28, 52)
+		gridH = rows*(cellH+6) + 8
 	}
-	if gh < 100 {
-		gh = 100
-	}
+	gh := max(minGraph, bodyH-gridH-statH-12)
+	gy, finish := p.beginDetail(cv, rect{x0, top, dw, bodyH}, gh+gridH+statH+12)
+	defer finish()
 	gr := rect{x0, gy, dw, gh}
-	fillRound(cv, rect{gr.X - 1, gr.Y - 1, gr.W + 2, gr.H + 2}, 10, T.Card)
-	inner := gr.inset(8)
-	maxV := plotSeries(cv, inner, p.seriesFor(cur),
-		graphStyle{bg: T.Card, max: p.fixedMax(kind), capacity: p.capacity(), grid: true, lineW: 2})
-	strokeRound(cv, gr, 10, T.Stroke)
-	p.hoverGraph, p.hoverGraphOn = inner, true
-	axis := "100%"
-	if kind == resDisk || kind == resNet {
-		axis = fmtRate(maxV)
-	}
-	drawText(cv, axis, uiFont(8), T.Faint, rect{inner.X + 6, inner.Y + 2, 120, 14}, taLeft)
-	drawText(cv, fmt.Sprintf("%s ago", time.Duration(p.app.cfg.HistorySeconds)*time.Second), uiFont(8), T.Faint,
-		rect{inner.X + 6, inner.Y + inner.H - 16, 120, 14}, taLeft)
-	drawText(cv, "now", uiFont(8), T.Faint, rect{inner.X + inner.W - 60, inner.Y + inner.H - 16, 54, 14}, taRight)
-
-	// hover readout: a hairline at the sample under the mouse and a small
-	// caption with its value and age, the way the classic Task Manager does.
-	if i := p.hoverIdx; i >= 0 && i < len(p.hist) && len(p.hist) >= 2 {
-		hp := &p.hist[i]
-		x := inner.X + int(float64(inner.W)*float64(i)/float64(len(p.hist)-1))
-		if pen, err := walk.NewCosmeticPen(walk.PenSolid, blend(T.Text, T.Card, 0.45)); err == nil {
-			_ = cv.DrawLinePixels(pen, walk.Point{X: sc(x), Y: sc(inner.Y)}, walk.Point{X: sc(x), Y: sc(inner.Y + inner.H)})
-			pen.Dispose()
-		}
-		label := hoverLabel(kind, hp)
-		if age := time.Now().UnixMilli() - hp.T; age > 750 {
-			label += "  ·  " + humanDur(time.Duration(age)*time.Millisecond) + " ago"
-		}
-		lw := textWidth(cv, label, uiFont(9)) + 20
-		ly := inner.Y + 6
-		if kind == resCPU {
-			ly = inner.Y + 36 // below the per-core chip, which owns the top-right corner
-		}
-		br := rect{clampI(x-lw/2, inner.X+4, inner.X+inner.W-lw-4), ly, lw, 20}
-		fillRound(cv, br, 6, blend(T.Text, T.Card, 0.15))
-		strokeRound(cv, br, 6, T.Stroke)
-		drawText(cv, label, uiFont(9), T.Text, br, taCenter)
-	}
-
-	// per-core toggle chip (CPU only)
-	if kind == resCPU {
-		cr := rect{gr.X + gr.W - 150, gr.Y + 8, 140, 26}
-		chip := T.CardHi
-		if p.perCore {
-			chip = blend(T.Accent, T.Card, 0.35)
-		}
-		fillRound(cv, cr, 13, chip)
-		drawText(cv, "Per-core view", uiFont(9), T.Text, cr, taCenter)
-		v.addItem(cr, "cores", "Per-core view", ctlCheckBox, p.perCore)
+	if gr.Y+gr.H > top {
+		p.paintHistory(cv, gr, cur)
 	}
 
 	// per-core grid
 	y := gr.Y + gr.H + 8
 	if gridH > 0 {
 		cw := (dw - (cols-1)*8) / cols
-		cellH := (gridH-8)/rows - 8
 		for i, c := range s.Cores {
 			cx := x0 + (i%cols)*(cw+8)
-			cy := y + (i/cols)*(cellH+8)
+			cy := y + (i/cols)*(cellH+6)
+			if cy+cellH <= top || cy >= h {
+				continue
+			}
 			cr := rect{cx, cy, cw, cellH}
 			fillRound(cv, cr, 8, T.Card)
 			strokeRound(cv, cr, 8, T.Stroke)
@@ -551,14 +481,242 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	}
 
 	// stats grid
-	cw := dw / 4
+	cw := dw / statCols
 	for i, st := range stats {
-		sx := x0 + (i%4)*cw
-		sy := y + 8 + (i/4)*60
+		sx := x0 + (i%statCols)*cw
+		sy := y + (i/statCols)*factStep
+		if sy+46 <= top || sy >= h {
+			continue
+		}
 		drawText(cv, st[0], uiFont(9), T.Muted, rect{sx, sy, cw - 12, 16}, taLeft)
 		drawText(cv, st[1], uiFont(12), T.Text, rect{sx, sy + 20, cw - 12, 28}, taLeft)
 		v.addText(rect{sx, sy, cw - 12, 48}, st[0]+": "+st[1])
 	}
+}
+
+func (p *perfPage) scrollRail(by int) {
+	last := max(0, len(p.items(p.app.snap))-p.railCount)
+	if next := clampI(p.railFirst+by, 0, last); next != p.railFirst {
+		p.railFirst = next
+		p.v.invalidate()
+	}
+}
+
+func (p *perfPage) revealResource() {
+	if p.railCount > 0 {
+		p.railFirst = clampI(p.railFirst, max(0, p.sel-p.railCount+1), p.sel)
+	}
+}
+
+// A typical machine shows every card. With many adapters, the rail scrolls
+// independently so the last one is reachable without shrinking its reading.
+func (p *perfPage) paintRail(cv *walk.Canvas, r rect, items []resItem, s *metrics.Snapshot) {
+	const gap, minHeight = 6, 40
+	p.railArea = r
+	count := len(items)
+	cardRoom := r.H
+	if (r.H+gap)/(minHeight+gap) < count {
+		cardRoom -= 32
+		count = max(1, (cardRoom+gap)/(minHeight+gap))
+	}
+	if count != p.railCount {
+		p.railCount = count
+		p.revealResource()
+	}
+	p.railFirst = clampI(p.railFirst, 0, len(items)-count)
+	cardH := min(92, (cardRoom+gap)/count-gap)
+	for row, it := range items[p.railFirst : p.railFirst+count] {
+		p.paintCard(cv, rect{r.X, r.Y + row*(cardH+gap), r.W, cardH}, it, p.railFirst+row, s)
+	}
+	if count == len(items) {
+		return
+	}
+	y := r.Y + r.H - 26
+	for _, b := range []struct {
+		x               int
+		id, glyph, name string
+		enabled         bool
+	}{
+		{r.X, "rail:up", "↑", "Previous resources", p.railFirst > 0},
+		{r.X + r.W - 26, "rail:down", "↓", "More resources", p.railFirst+count < len(items)},
+	} {
+		button := rect{b.x, y, 26, 26}
+		ink := T.Faint
+		if b.enabled {
+			ink = T.Text
+			fillRound(cv, button, 6, T.CardHi)
+			p.v.addItem(button, b.id, b.name, ctlButton, false)
+		}
+		drawText(cv, b.glyph, uiFont(10), ink, button, taCenter)
+	}
+	drawText(cv, fmt.Sprintf("%d–%d/%d", p.railFirst+1, p.railFirst+count, len(items)), uiFont(8), T.Muted, rect{r.X + 26, y, r.W - 52, 26}, taCenter)
+}
+
+// paintCard gives the reading its measured space before offering any room to a sparkline.
+func (p *perfPage) paintCard(cv *walk.Canvas, r rect, it resItem, index int, s *metrics.Snapshot) {
+	id := fmt.Sprintf("res:%d", index)
+	fill, border := T.Card, T.Stroke
+	if index == p.sel {
+		fill, border = T.CardSel, blend(T.Accent, T.Card, 0.7)
+	} else if p.v.hover == id {
+		fill = T.CardHi
+	}
+	fillRound(cv, r, 8, fill)
+	strokeRound(cv, r, 8, border)
+	color := resColor(it.kind)
+	value, sub, _ := p.headline(it, s)
+	if it.kind == resCPU {
+		sub = p.cpuCardSub(s)
+	}
+	title := resTitle(it.kind)
+	if it.kind == resGPU && it.gpu >= 0 {
+		title = fmt.Sprintf("GPU %d", it.gpu)
+	}
+	p.v.addItem(r, id, fmt.Sprintf("%s: %s, %s", title, value, sub), ctlListItem, index == p.sel)
+
+	x, lineW := r.X+12, r.W-22
+	headerH, valueH, valuePt := 19, 25, 15
+	if r.H >= 76 {
+		valueH, valuePt = 31, 19
+	} else if r.H < 49 {
+		headerH, valueH, valuePt = r.H/2, r.H-r.H/2, 11
+	}
+	font := uiLight(valuePt)
+	valueW := textWidth(cv, value, font)
+	if valueW > lineW {
+		font = uiFont(10)
+		valueW = textWidth(cv, value, font)
+	}
+	labelY := r.Y + max(0, min(7, (r.H-headerH-valueH)/2))
+	valueY := labelY + headerH
+	fillRect(cv, rect{r.X + 1, labelY + 3, 3, headerH - 6}, color)
+	drawText(cv, title, uiBold(10), T.Text, rect{x, labelY, lineW, headerH}, taLeft)
+	drawText(cv, value, font, color, rect{x, valueY, lineW, valueH}, taLeft)
+	if r.Y+r.H-valueY-valueH >= 17 {
+		drawText(cv, sub, uiFont(8), T.Muted, rect{x, valueY + valueH, lineW, 17}, taLeft)
+	}
+	if r.W >= 190 && r.H >= 42 {
+		readingW := max(textWidth(cv, title, uiBold(10)), valueW) + 10
+		if sparkW := min(90, lineW-readingW); sparkW >= 56 {
+			spark := rect{x + lineW - sparkW, labelY + 3, sparkW, headerH + valueH - 7}
+			plotSeries(cv, spark, p.seriesFor(it), graphStyle{bg: fill, max: p.fixedMax(it.kind), capacity: p.capacity(), lineW: 2})
+		}
+	}
+}
+
+func (p *perfPage) scrollDetail(delta int) {
+	if next := clampI(p.detailScroll+delta, 0, p.detailMax); next != p.detailScroll {
+		p.detailScroll = next
+		p.hoverIdx = -1
+		p.v.invalidate()
+	}
+}
+
+// beginDetail keeps the heading and rail fixed. Clip both GDI output and hit
+// rectangles so scrolled controls cannot cover the header or capture its mouse.
+func (p *perfPage) beginDetail(cv *walk.Canvas, area rect, contentH int) (int, func()) {
+	p.detailArea = area
+	p.detailMax = max(0, contentH-area.H)
+	p.detailScroll = min(p.detailScroll, p.detailMax)
+	if p.detailMax == 0 {
+		return area.Y, func() {}
+	}
+	thumb := max(18, area.H*area.H/contentH)
+	thumbY := area.Y + (area.H-thumb)*p.detailScroll/p.detailMax
+	fillRound(cv, rect{area.X + area.W + 3, thumbY, 3, thumb}, 2, T.Muted)
+	view := area.px()
+	saved := win.SaveDC(cv.HDC())
+	if saved != 0 {
+		win.IntersectClipRect(cv.HDC(), int32(view.X), int32(view.Y), int32(view.X+view.W), int32(view.Y+view.H))
+	}
+	itemStart, hitStart := len(p.v.items), len(p.v.hits)
+	clip := func(r rect) rect {
+		y := max(r.Y, view.Y)
+		return rect{r.X, y, r.W, min(r.Y+r.H, view.Y+view.H) - y}
+	}
+	return area.Y - p.detailScroll, func() {
+		if saved != 0 {
+			win.RestoreDC(cv.HDC(), saved)
+		}
+		hits := p.v.hits[:hitStart]
+		for _, hit := range p.v.hits[hitStart:] {
+			hit.r = clip(hit.r)
+			if hit.r.H > 0 {
+				hits = append(hits, hit)
+			}
+		}
+		p.v.hits = hits
+		items := p.v.items[:itemStart]
+		for _, item := range p.v.items[itemStart:] {
+			item.r = clip(item.r)
+			if item.r.H > 0 {
+				items = append(items, item)
+			}
+		}
+		p.v.items = items
+	}
+}
+
+func (p *perfPage) paintHistory(cv *walk.Canvas, gr rect, cur resItem) {
+	kind := cur.kind
+	fillRound(cv, rect{gr.X - 1, gr.Y - 1, gr.W + 2, gr.H + 2}, 10, T.Card)
+	inner := gr.inset(8)
+	maxV := plotSeries(cv, inner, p.seriesFor(cur),
+		graphStyle{bg: T.Card, max: p.fixedMax(kind), capacity: p.capacity(), grid: true, lineW: 2})
+	strokeRound(cv, gr, 10, T.Stroke)
+	p.hoverGraph, p.hoverGraphOn = inner, true
+	axis := "100%"
+	if kind == resDisk || kind == resNet {
+		axis = fmtRate(maxV)
+	}
+	drawText(cv, axis, uiFont(8), T.Faint, rect{inner.X + 6, inner.Y + 2, 120, 14}, taLeft)
+	drawText(cv, p.oldestSampleLabel(), uiFont(8), T.Faint,
+		rect{inner.X + 6, inner.Y + inner.H - 16, 120, 14}, taLeft)
+	drawText(cv, "now", uiFont(8), T.Faint, rect{inner.X + inner.W - 60, inner.Y + inner.H - 16, 54, 14}, taRight)
+
+	// hover readout: a hairline at the sample under the mouse and a small
+	// caption with its value and age, the way the classic Task Manager does.
+	if i := p.hoverIdx; i >= 0 && i < len(p.hist) && len(p.hist) >= 2 {
+		hp := &p.hist[i]
+		x := inner.X + int(float64(inner.W)*float64(i)/float64(len(p.hist)-1))
+		if pen, err := walk.NewCosmeticPen(walk.PenSolid, blend(T.Text, T.Card, 0.45)); err == nil {
+			_ = cv.DrawLinePixels(pen, walk.Point{X: sc(x), Y: sc(inner.Y)}, walk.Point{X: sc(x), Y: sc(inner.Y + inner.H)})
+			pen.Dispose()
+		}
+		label := p.hoverLabel(cur, hp)
+		if age := time.Now().UnixMilli() - hp.T; age > 750 {
+			label += "  ·  " + humanDur(time.Duration(age)*time.Millisecond) + " ago"
+		}
+		lw := min(inner.W-8, textWidth(cv, label, uiFont(9))+20)
+		ly := inner.Y + 6
+		if kind == resCPU {
+			ly = inner.Y + 36 // below the per-core chip, which owns the top-right corner
+		}
+		br := rect{clampI(x-lw/2, inner.X+4, inner.X+inner.W-lw-4), ly, lw, 20}
+		fillRound(cv, br, 6, blend(T.Text, T.Card, 0.15))
+		strokeRound(cv, br, 6, T.Stroke)
+		drawText(cv, label, uiFont(9), T.Text, br, taCenter)
+	}
+
+	// per-core toggle chip (CPU only)
+	if kind == resCPU {
+		cr := rect{gr.X + gr.W - 150, gr.Y + 8, 140, 26}
+		chip := T.CardHi
+		if p.perCore {
+			chip = blend(T.Accent, T.Card, 0.35)
+		}
+		fillRound(cv, cr, 13, chip)
+		drawText(cv, "Per-core view", uiFont(9), T.Text, cr, taCenter)
+		p.v.addItem(cr, "cores", "Per-core view", ctlCheckBox, p.perCore)
+	}
+}
+
+func (p *perfPage) oldestSampleLabel() string {
+	if n := len(p.hist); n > 1 {
+		span := time.Duration(p.hist[n-1].T-p.hist[0].T) * time.Millisecond
+		return humanDur(span.Round(time.Second)) + " ago"
+	}
+	return ""
 }
 
 func heatColor(pct float64) walk.Color {
@@ -572,13 +730,22 @@ func heatColor(pct float64) walk.Color {
 }
 
 // hoverLabel is the value caption shown for one history sample under the mouse.
-func hoverLabel(kind int, h *metrics.HistPoint) string {
-	switch kind {
+func (p *perfPage) hoverLabel(cur resItem, h *metrics.HistPoint) string {
+	switch cur.kind {
 	case resCPU:
 		return fmt.Sprintf("%.0f%% CPU", h.CPU)
 	case resMem:
 		return fmt.Sprintf("%.0f%% memory", h.Mem)
 	case resGPU:
+		if cur.gpu >= 0 {
+			id := p.app.snap.GPUs[cur.gpu].ID
+			for i := range h.GPUs {
+				if g := &h.GPUs[i]; g.ID == id && finiteValue(gpuPointUtil(g)) {
+					return fmt.Sprintf("%.0f%% GPU %d", g.Pct, cur.gpu)
+				}
+			}
+			return fmt.Sprintf("GPU %d n/a", cur.gpu)
+		}
 		if !h.GPUOK {
 			return "GPU n/a"
 		}
@@ -727,5 +894,5 @@ func perCoreCols(dw, cores, room int) int {
 	for cols < 12 && cols < cores && ((cores+cols-1)/cols)*(26+8)+8 > room {
 		cols += 2
 	}
-	return cols
+	return min(cols, max(2, dw/88))
 }
