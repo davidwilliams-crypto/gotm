@@ -3,13 +3,15 @@
 package ui
 
 import (
-	"github.com/tailscale/walk"
-	decl "github.com/tailscale/walk/declarative"
-	"github.com/tailscale/win"
+	"fmt"
 	"reflect"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/tailscale/walk"
+	decl "github.com/tailscale/walk/declarative"
+	"github.com/tailscale/win"
 )
 
 const pageBuildTimer = 0x474f544d
@@ -18,19 +20,48 @@ var pageTimerOnce sync.Once
 var pageTimerCallback uintptr
 var pageBuilders = map[win.HWND]*App{} // UI-thread owned, only while a build is pending
 
+// buildStep is one unit of staged page construction. An alone step runs in a
+// timer callback of its own: the build yields to pending input and paint
+// both before and after it.
+type buildStep struct {
+	name  string
+	alone bool
+	run   func() error
+}
+
+// stepTiming records how long one construction step took (profiling, tests).
+type stepTiming struct {
+	name  string
+	took  time.Duration
+	slice int // index of the timer callback that ran it
+}
+
 type pageConstruction struct {
 	id       int
-	steps    []func() error
+	steps    []buildStep
 	maxSlice time.Duration
-	yield    bool
+	slices   int
+	timings  []stepTiming
 	palette  palette
 	clears   []func()
+	revealed bool // the show step made the page visible
+	posted   bool // a posted continuation is pending
 }
+
+// prefiller is a page that can build its first rows while still hidden.
+type prefiller interface{ prefill() }
+
+// sliceBudget is how long one timer callback keeps running small steps.
+const sliceBudget = 4 * time.Millisecond
 
 // widget splits our declarative composites and table columns into native
 // operations. Each Builder still finishes its own properties and deferred work.
-func (b *pageConstruction) widget(parent walk.Container, widget decl.Widget) func() error {
-	return func() error {
+func (b *pageConstruction) widget(parent walk.Container, widget decl.Widget) buildStep {
+	step := buildStep{name: fmt.Sprintf("%T", widget)}
+	if _, ok := widget.(decl.TableView); ok {
+		step.alone = true // the native list views: the largest single step
+	}
+	step.run = func() error {
 		// Every AssignTo published during a cancelled build must become nil again;
 		// background recorder state changes may otherwise touch disposed canvases.
 		value := reflect.ValueOf(widget)
@@ -45,7 +76,7 @@ func (b *pageConstruction) widget(parent walk.Container, widget decl.Widget) fun
 			target := assigned.Elem()
 			b.clears = append(b.clears, func() { target.SetZero() })
 		}
-		var next []func() error
+		var next []buildStep
 		switch w := widget.(type) {
 		case decl.Composite:
 			children, assign := w.Children, w.AssignTo
@@ -77,10 +108,9 @@ func (b *pageConstruction) widget(parent walk.Container, widget decl.Widget) fun
 				return err
 			}
 			tv := *w.AssignTo
-			b.yield = true
 			for _, column := range cols {
 				column := column
-				next = append(next, func() error { return column.Create(tv) })
+				next = append(next, buildStep{name: "column " + column.Name + column.Title, run: func() error { return column.Create(tv) }})
 			}
 		default:
 			return widget.Create(decl.NewBuilder(parent))
@@ -88,13 +118,14 @@ func (b *pageConstruction) widget(parent walk.Container, widget decl.Widget) fun
 		b.steps = append(next, b.steps...)
 		return nil
 	}
+	return step
 }
 
 func (a *App) startPageBuild(i int) {
 	a.cancelPageBuild()
 	b := &pageConstruction{id: i, palette: T}
 	a.opening = b
-	b.steps = []func() error{b.widget(a.right, a.pageWidget(i)), func() error {
+	b.steps = []buildStep{b.widget(a.right, a.pageWidget(i)), {name: "init", alone: true, run: func() error {
 		// A palette switch during construction must also update declarations that
 		// were captured before the switch, without waiting for another theme event.
 		if b.palette != T {
@@ -104,7 +135,21 @@ func (a *App) startPageBuild(i int) {
 		a.pages[i].impl.init()
 		a.pages[i].initialized = true
 		return nil
-	}}
+	}}}
+	if p, ok := a.pages[i].impl.(prefiller); ok {
+		// The first rows are built while the page is still hidden, in their own
+		// callback, so revealing it later only repaints.
+		b.steps = append(b.steps, buildStep{name: "rows", alone: true, run: func() error {
+			if a.snap != nil {
+				p.prefill()
+			}
+			return nil
+		}})
+	}
+	b.steps = append(b.steps,
+		buildStep{name: "show", alone: true, run: func() error { b.revealed = true; a.revealPage(i); return nil }},
+		buildStep{name: "focus", alone: true, run: func() error { a.showPage(i); return nil }},
+	)
 	if !a.pageBuildHooked {
 		a.pageBuildHooked = true
 		a.mw.Disposing().Attach(a.cancelPageBuild)
@@ -115,6 +160,23 @@ func (a *App) startPageBuild(i int) {
 		a.loading.invalidate()
 	}
 	a.schedulePageBuild()
+}
+
+// revealPage makes a freshly built page visible and lays it out, the first
+// half of showPage; the later "focus" step runs showPage itself, which then
+// finds visibility and layout already done and only activates the page
+// (shown, the current snapshot, focus and status).
+func (a *App) revealPage(i int) {
+	if a.loading != nil && a.loading.cw != nil {
+		a.loading.cw.SetVisible(false)
+	}
+	a.cur = i
+	for k, w := range a.wraps {
+		if w != nil && w.Visible() != (k == i) {
+			w.SetVisible(k == i)
+		}
+	}
+	a.mw.RequestImmediateLayout()
 }
 
 func (a *App) schedulePageBuild() {
@@ -133,6 +195,23 @@ func (a *App) schedulePageBuild() {
 	pageBuilders[h] = a
 	// WM_TIMER is lower priority than input and paint. Chained posted callbacks
 	// alone would monopolize the posted-message queue and starve those messages.
+	// A timer callback, though, waits for the next system timer tick (about
+	// 16 ms) even on an idle queue. So when no input or paint is waiting, the
+	// next step is posted instead: it still runs after every message already
+	// queued, and the check is repeated before each step.
+	if b := a.opening; b != nil && win.GetQueueStatus(win.QS_INPUT|win.QS_PAINT)>>16 == 0 {
+		if !b.posted {
+			b.posted = true
+			a.mw.Synchronize(func() {
+				b.posted = false
+				if a.opening == b && pageBuilders[h] == a && !a.mw.IsDisposed() {
+					win.KillTimer(h, pageBuildTimer)
+					a.continuePageBuild()
+				}
+			})
+		}
+		return
+	}
 	win.SetTimer(h, pageBuildTimer, 1, pageTimerCallback)
 }
 
@@ -142,26 +221,38 @@ func (a *App) continuePageBuild() {
 		return
 	}
 	start := time.Now()
+	slice := b.slices
+	b.slices++
 	defer func() {
 		if elapsed := time.Since(start); elapsed > b.maxSlice {
 			b.maxSlice = elapsed
 		}
 	}()
+	ran := 0
 	for len(b.steps) > 0 {
 		step := b.steps[0]
-		b.steps[0] = nil
+		if step.alone && ran > 0 {
+			break // yield before a large step
+		}
+		b.steps[0] = buildStep{}
 		b.steps = b.steps[1:]
-		if err := step(); err != nil {
+		began := time.Now()
+		err := step.run()
+		b.timings = append(b.timings, stepTiming{name: step.name, took: time.Since(began), slice: slice})
+		ran++
+		if err != nil {
 			a.cancelPageBuild()
 			a.errBox("Open page", err)
 			return
 		}
-		if a.wraps[b.id] != nil {
+		if a.opening != b {
+			return // the step navigated elsewhere or cancelled the build
+		}
+		if a.wraps[b.id] != nil && !b.revealed {
 			a.wraps[b.id].SetVisible(false)
 		}
-		if b.yield || time.Since(start) >= 4*time.Millisecond {
-			b.yield = false
-			break
+		if step.alone || time.Since(start) >= sliceBudget {
+			break // yield after a large step or a full slice
 		}
 	}
 	if len(b.steps) > 0 {
@@ -170,9 +261,9 @@ func (a *App) continuePageBuild() {
 	}
 	delete(pageBuilders, win.HWND(a.mw.Handle()))
 	a.opening = nil
-	a.showPage(b.id)
+	a.side.invalidate()
+	a.invalidateChrome()
 }
-
 func (a *App) cancelPageBuild() {
 	if a.mw != nil {
 		h := win.HWND(a.mw.Handle())

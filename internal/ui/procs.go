@@ -3,7 +3,9 @@
 package ui
 
 import (
+	"cmp"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +25,7 @@ type colDef struct {
 	width   int
 	numeric bool
 	text    func(r *metrics.Row) string
-	less    func(a, b *metrics.Row) bool
+	cmp     func(a, b *metrics.Row) int                // ascending; ties are broken by PID
 	heat    func(r *metrics.Row, total uint64) float64 // 0..1 background intensity
 }
 
@@ -32,30 +34,30 @@ func colDefs() []colDef {
 	return []colDef{
 		{key: "name", title: "Name", width: 300,
 			text: func(r *metrics.Row) string { return r.Name },
-			less: func(a, b *metrics.Row) bool { return strings.ToLower(a.Name) < strings.ToLower(b.Name) }},
+			cmp:  func(a, b *metrics.Row) int { return strings.Compare(a.NameFold(), b.NameFold()) }},
 		{key: "pid", title: "PID", width: 70, numeric: true,
 			text: func(r *metrics.Row) string {
 				if r.Count > 1 {
-					return fmt.Sprintf("×%d", r.Count)
+					return "×" + strconv.Itoa(r.Count)
 				}
-				return fmt.Sprint(r.PID)
+				return strconv.FormatUint(uint64(r.PID), 10)
 			},
-			less: func(a, b *metrics.Row) bool { return a.PID < b.PID }},
+			cmp: func(a, b *metrics.Row) int { return cmp.Compare(a.PID, b.PID) }},
 		{key: "ppid", title: "Parent", width: 70, numeric: true,
 			text: func(r *metrics.Row) string {
 				if r.Count > 1 {
 					return ""
 				}
-				return fmt.Sprint(r.PPID)
+				return strconv.FormatUint(uint64(r.PPID), 10)
 			},
-			less: func(a, b *metrics.Row) bool { return a.PPID < b.PPID }},
+			cmp: func(a, b *metrics.Row) int { return cmp.Compare(a.PPID, b.PPID) }},
 		{key: "cpu", title: "CPU", width: 76, numeric: true,
 			text: func(r *metrics.Row) string { return pct(r.CPU) },
-			less: func(a, b *metrics.Row) bool { return a.CPU < b.CPU },
+			cmp:  func(a, b *metrics.Row) int { return cmpFloat(a.CPU, b.CPU) },
 			heat: func(r *metrics.Row, _ uint64) float64 { return r.CPU / 30 }},
 		{key: "mem", title: "Memory", width: 96, numeric: true,
 			text: func(r *metrics.Row) string { return fmtBytes(r.Mem) },
-			less: func(a, b *metrics.Row) bool { return a.Mem < b.Mem },
+			cmp:  func(a, b *metrics.Row) int { return cmp.Compare(a.Mem, b.Mem) },
 			heat: func(r *metrics.Row, total uint64) float64 {
 				if total == 0 {
 					return 0
@@ -64,7 +66,7 @@ func colDefs() []colDef {
 			}},
 		{key: "private", title: "Private", width: 96, numeric: true,
 			text: func(r *metrics.Row) string { return fmtBytes(r.Private) },
-			less: func(a, b *metrics.Row) bool { return a.Private < b.Private }},
+			cmp:  func(a, b *metrics.Row) int { return cmp.Compare(a.Private, b.Private) }},
 		{key: "io", title: "I/O", width: 100, numeric: true,
 			text: func(r *metrics.Row) string {
 				if r.IO == 0 {
@@ -72,7 +74,7 @@ func colDefs() []colDef {
 				}
 				return fmtRate(r.IO)
 			},
-			less: func(a, b *metrics.Row) bool { return a.IO < b.IO },
+			cmp:  func(a, b *metrics.Row) int { return cmpFloat(a.IO, b.IO) },
 			heat: func(r *metrics.Row, _ uint64) float64 { return r.IO / 40e6 }},
 		{key: "gpu", title: "GPU", width: 70, numeric: true,
 			text: func(r *metrics.Row) string {
@@ -81,7 +83,7 @@ func colDefs() []colDef {
 				}
 				return pct(r.GPU)
 			},
-			less: func(a, b *metrics.Row) bool { return a.GPU < b.GPU },
+			cmp: func(a, b *metrics.Row) int { return cmpFloat(a.GPU, b.GPU) },
 			heat: func(r *metrics.Row, _ uint64) float64 {
 				if r.GPUUnavailable {
 					return 0
@@ -89,20 +91,20 @@ func colDefs() []colDef {
 				return r.GPU / 40
 			}},
 		{key: "threads", title: "Threads", width: 70, numeric: true,
-			text: func(r *metrics.Row) string { return fmt.Sprint(r.Threads) },
-			less: func(a, b *metrics.Row) bool { return a.Threads < b.Threads }},
+			text: func(r *metrics.Row) string { return strconv.FormatUint(uint64(r.Threads), 10) },
+			cmp:  func(a, b *metrics.Row) int { return cmp.Compare(a.Threads, b.Threads) }},
 		{key: "handles", title: "Handles", width: 76, numeric: true,
-			text: func(r *metrics.Row) string { return fmt.Sprint(r.Handles) },
-			less: func(a, b *metrics.Row) bool { return a.Handles < b.Handles }},
+			text: func(r *metrics.Row) string { return strconv.FormatUint(uint64(r.Handles), 10) },
+			cmp:  func(a, b *metrics.Row) int { return cmp.Compare(a.Handles, b.Handles) }},
 		{key: "prio", title: "Priority", width: 100,
 			text: func(r *metrics.Row) string { return r.Prio },
-			less: func(a, b *metrics.Row) bool { return a.Prio < b.Prio }},
+			cmp:  func(a, b *metrics.Row) int { return strings.Compare(a.Prio, b.Prio) }},
 		{key: "user", title: "User", width: 170,
 			text: func(r *metrics.Row) string { return r.User },
-			less: func(a, b *metrics.Row) bool { return strings.ToLower(a.User) < strings.ToLower(b.User) }},
+			cmp:  func(a, b *metrics.Row) int { return strings.Compare(a.UserFold(), b.UserFold()) }},
 		{key: "session", title: "Session", width: 66, numeric: true,
-			text: func(r *metrics.Row) string { return fmt.Sprint(r.Session) },
-			less: func(a, b *metrics.Row) bool { return a.Session < b.Session }},
+			text: func(r *metrics.Row) string { return strconv.FormatUint(uint64(r.Session), 10) },
+			cmp:  func(a, b *metrics.Row) int { return cmp.Compare(a.Session, b.Session) }},
 		{key: "start", title: "Started", width: 150,
 			text: func(r *metrics.Row) string {
 				if r.Start == 0 {
@@ -110,10 +112,10 @@ func colDefs() []colDef {
 				}
 				return startedLabel(time.UnixMilli(r.Start))
 			},
-			less: func(a, b *metrics.Row) bool { return a.Start < b.Start }},
+			cmp: func(a, b *metrics.Row) int { return cmp.Compare(a.Start, b.Start) }},
 		{key: "path", title: "Image path", width: 380,
 			text: func(r *metrics.Row) string { return r.Path },
-			less: func(a, b *metrics.Row) bool { return strings.ToLower(a.Path) < strings.ToLower(b.Path) }},
+			cmp:  func(a, b *metrics.Row) int { return strings.Compare(a.PathFold(), b.PathFold()) }},
 	}
 }
 
@@ -135,49 +137,43 @@ type procModel struct {
 
 func (m *procModel) RowCount() int { return len(m.rows) }
 
-func (m *procModel) Value(row, col int) interface{} {
+func (m *procModel) Value(row, col int) interface{} { return m.text(row, col) }
+
+// text is the displayed text of a cell.
+func (m *procModel) text(row, col int) string {
 	if row < 0 || row >= len(m.rows) {
 		return ""
 	}
 	r := &m.rows[row]
 	s := m.cols[col].text(r)
 	if m.cols[col].key == "name" && m.layout == metrics.LayoutTree {
-		glyph := "   "
+		glyph := "   "
 		switch {
 		case r.Collapsed:
-			glyph = "▶ "
+			glyph = "▶ "
 		case r.HasKids:
-			glyph = "▼ "
+			glyph = "▼ "
 		}
 		s = glyph + s // the row itself is indented natively (indentRows)
 		if r.Collapsed {
-			s += fmt.Sprintf("   (+%d)", r.Desc)
+			s += "   (+" + strconv.Itoa(r.Desc) + ")"
 		}
 	}
 	return s
 }
 
-// Image gives each row its program's icon as an already-extracted walk Icon:
+// iconSlot gives each row its program's icon from the shared image list:
 // handing Walk a file PATH instead would make the UI thread call
 // SHGetFileInfo (shell + file access), which on a cold machine or a sleeping
 // disk blocks for seconds and the window flags "not responding" — see
 // procIconCache. Until a worker has extracted the program's icon, the row
-// shows the stock application icon.
-func (m *procModel) Image(row int) interface{} {
+// shows the stock application icon (slot 0).
+func (m *procModel) iconSlot(row int) int32 {
 	if row < 0 || row >= len(m.rows) {
-		return nil
+		return 0
 	}
-	if p := m.rows[row].Path; p != "" {
-		if ic := procIcons.icon(p); ic != nil {
-			return ic
-		}
-		procIcons.enqueue(p)
-	}
-	return genericExeIcon
+	return procIcons.slot(m.rows[row].Path)
 }
-
-// genericExeIcon is the stock application icon: no file access, instant.
-var genericExeIcon = walk.IconApplicationSmall()
 
 // ID lets the table identify rows across rebuilds.
 func (m *procModel) ID(row int) interface{} {
@@ -204,18 +200,33 @@ func (m *procModel) Sort(col int, order walk.SortOrder) error {
 	return m.SorterBase.Sort(col, order)
 }
 
-func (m *procModel) less() func(a, b *metrics.Row) bool {
-	c := m.cols[m.sortCol]
+// cmp orders rows by the sorted column, ties by PID ascending in either
+// direction (rows with equal keys then keep snapshot order).
+func (m *procModel) cmp() func(a, b *metrics.Row) int {
+	c := m.cols[m.sortCol].cmp
 	desc := m.sortOrder == walk.SortDescending
-	return func(a, b *metrics.Row) bool {
-		if c.less(a, b) {
-			return !desc
+	return func(a, b *metrics.Row) int {
+		v := c(a, b)
+		if desc {
+			v = -v
 		}
-		if c.less(b, a) {
-			return desc
+		if v != 0 {
+			return v
 		}
-		return a.PID < b.PID
+		return cmp.Compare(a.PID, b.PID)
 	}
+}
+
+// cmpFloat orders like <, treating values that are neither smaller nor
+// larger (NaN) as equal.
+func cmpFloat(a, b float64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
 }
 
 // StyleCell paints the dark zebra rows, the selection, and heat tints.
@@ -224,8 +235,11 @@ func (m *procModel) StyleCell(st *walk.CellStyle) {
 	if row < 0 || row >= len(m.rows) || col < 0 || col >= len(m.cols) {
 		return
 	}
-	selected := m.tab.tv.CurrentIndex()
-	bg, fg := rowStyle(row, selected)
+	st.BackgroundColor, st.TextColor = m.cellColors(row, col, m.tab.tv.CurrentIndex())
+}
+
+func (m *procModel) cellColors(row, col, selected int) (bg, fg walk.Color) {
+	bg, fg = rowStyle(row, selected)
 	if row != selected {
 		if c := m.cols[col]; c.heat != nil {
 			if a := c.heat(&m.rows[row], m.totalMem); a > 0.03 {
@@ -242,7 +256,23 @@ func (m *procModel) StyleCell(st *walk.CellStyle) {
 			fg = T.Muted
 		}
 	}
-	st.BackgroundColor, st.TextColor = bg, fg
+	return bg, fg
+}
+
+// rowSigs describes a visible row for paintDiff: selection, indent and icon,
+// then each visible cell's text and colours.
+func (m *procModel) rowSigs(row int, vis []int, out []uint64) {
+	sel := m.tab.tv.CurrentIndex()
+	r := &m.rows[row]
+	own := uint64(m.iconSlot(row))<<32 | uint64(uint32(r.Depth))<<1
+	if row == sel {
+		own |= 1
+	}
+	out[0] = own * 0x9E3779B97F4A7C15
+	for k, c := range vis {
+		bg, fg := m.cellColors(row, c, sel)
+		out[k+1] = cellSig(m.text(row, c), bg, fg)
+	}
 }
 
 // ---- tab -------------------------------------------------------------------
@@ -264,6 +294,8 @@ type procsTab struct {
 	selKey    string // key of the selected row ("" = none)
 	updating  bool   // suppress selection events caused by our own refresh
 	lastCount string
+	builder   metrics.RowBuilder // reuses per-process text between ticks
+	paint     paintDiff          // what the visible rows show
 }
 
 var priorityNames = []string{"Idle", "BelowNormal", "Normal", "AboveNormal", "High", "Realtime"}
@@ -396,6 +428,19 @@ func (t *procsTab) init() {
 		}
 		return 0
 	})
+	tv := t.tv
+	iconRows(tv, func(f func()) bool {
+		mw := t.app.mw
+		if mw == nil || mw.IsDisposed() {
+			return false
+		}
+		mw.Synchronize(f)
+		return true
+	}, func() {
+		if t.tv == tv && !tv.IsDisposed() {
+			t.repaint() // one coalesced repaint of rows whose icon arrived
+		}
+	}, t.model.iconSlot)
 	t.model.ready = true
 	_ = t.model.SorterBase.Sort(t.model.sortCol, t.model.sortOrder) // shows the sort arrow
 	t.syncToggles()
@@ -438,9 +483,10 @@ func (t *procsTab) layout() metrics.Layout {
 	return metrics.LayoutFlat
 }
 
-// refresh rebuilds the rows from the newest snapshot and repaints only what
-// changed. Same rows in the same order is the common case and costs one
-// repaint of the visible rows; a reorder resets the model.
+// refresh rebuilds the rows from the newest snapshot and repaints only the
+// visible cells whose text or colour changed. The list view is never reset:
+// a changed row count is published as rows added or removed at the end, and
+// the selection follows its process to its new position.
 func (t *procsTab) refresh() {
 	s := t.app.snap
 	if s == nil || t.tv == nil || t.model.cols == nil || !t.model.ready {
@@ -449,39 +495,11 @@ func (t *procsTab) refresh() {
 	m := t.model
 	m.layout = t.layout()
 	m.totalMem = t.app.host.TotalMem
-	rows := metrics.BuildRows(s.Procs, metrics.View{
+	rows := t.builder.Build(s.Procs, metrics.View{
 		Layout: m.layout, Filter: t.filter.Text(), HideIdle: t.app.cfg.HideSystemIdle,
-		Collapsed: t.collapsed, Less: m.less(),
+		Collapsed: t.collapsed, Cmp: m.cmp(),
 	})
-
-	oldIdx := t.indexOf(m.rows, t.selKey)
-	wasVisible := oldIdx >= 0 && t.tv.ItemVisible(oldIdx)
-
-	same := len(rows) == len(m.rows)
-	if same {
-		for i := range rows {
-			if rows[i].Key != m.rows[i].Key || rows[i].Collapsed != m.rows[i].Collapsed {
-				same = false
-				break
-			}
-		}
-	}
-
-	t.updating = true
-	m.rows = rows
-	if same {
-		redrawVisible(t.tv)
-	} else {
-		m.PublishRowsReset() // the table clears its selection here…
-		redrawVisible(t.tv)
-		if newIdx := t.indexOf(rows, t.selKey); newIdx >= 0 && wasVisible {
-			_ = t.tv.SetCurrentIndex(newIdx) // …and we put it back, scrolling only if needed
-		} else {
-			t.selKey = ""
-		}
-	}
-	t.updating = false
-	t.updateControls()
+	t.setRows(rows)
 
 	unit := "processes"
 	switch m.layout {
@@ -490,7 +508,7 @@ func (t *procsTab) refresh() {
 	case metrics.LayoutTree:
 		unit = "shown"
 	}
-	txt := fmt.Sprintf("%d %s", len(rows), unit)
+	txt := strconv.Itoa(len(rows)) + " " + unit
 	if len(rows) == 0 {
 		if q := strings.TrimSpace(t.filter.Text()); q != "" {
 			txt = fmt.Sprintf("No processes match “%s” — Esc clears the search", q)
@@ -502,6 +520,46 @@ func (t *procsTab) refresh() {
 	}
 }
 
+// prefill builds the first rows while a newly constructed page is still
+// hidden, so showing it does not also have to build them.
+func (t *procsTab) prefill() { t.refresh() }
+
+// setRows replaces the model rows.
+func (t *procsTab) setRows(rows []metrics.Row) {
+	m := t.model
+	oldIdx := t.indexOf(m.rows, t.selKey)
+	wasVisible := oldIdx >= 0 && t.tv.ItemVisible(oldIdx)
+	oldCount := len(m.rows)
+
+	t.updating = true
+	m.rows = rows
+	switch {
+	case len(rows) > oldCount:
+		m.PublishRowsInserted(oldCount, len(rows)-1)
+	case len(rows) < oldCount:
+		m.PublishRowsRemoved(len(rows), oldCount-1) // clears a selection past the end
+	}
+	newIdx := t.indexOf(rows, t.selKey)
+	if newIdx < 0 {
+		t.selKey = ""
+	}
+	if cur := t.tv.CurrentIndex(); newIdx != cur {
+		if newIdx >= 0 && wasVisible {
+			_ = t.tv.SetCurrentIndex(newIdx) // a row the reader saw stays in view
+		} else {
+			selectQuietly(t.tv, newIdx) // never scroll the reader's viewport
+		}
+	}
+	t.repaint()
+	t.updating = false
+	t.updateControls()
+}
+
+// repaint redraws the visible rows whose content changed.
+func (t *procsTab) repaint() {
+	procIcons.touchGeneration()
+	t.paint.repaint(t.tv, len(t.model.rows), t.model)
+}
 func (t *procsTab) indexOf(rows []metrics.Row, key string) int {
 	if key == "" {
 		return -1
@@ -532,7 +590,8 @@ func (t *procsTab) onSelectionChanged() {
 		t.selKey = ""
 	}
 	t.updateControls()
-	redrawVisible(t.tv)
+	procIcons.touchGeneration()
+	t.paint.repaintAsync(t.tv, len(t.model.rows), t.model) // the previous and the new selected row
 }
 
 func (t *procsTab) updateControls() {

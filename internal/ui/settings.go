@@ -35,6 +35,9 @@ type settingsTab struct {
 	viewH   int
 
 	taskManager taskManagerSetting
+	tmQuerying  bool   // a background routing query is running
+	tmGen       int    // bumped by synchronous reads; older results are dropped
+	lastRyzen   string // AMD SDK status shown by the last paint
 }
 
 func newSettingsTab(a *App) *settingsTab {
@@ -138,8 +141,37 @@ func (t *settingsTab) pageKey(key walk.Key, mods walk.Modifiers) bool {
 	return true
 }
 func (t *settingsTab) tick(*metrics.Snapshot) {
+	// Machine-wide routing is re-read in the background and repaints when it
+	// changes; the AMD SDK status repaints only when its text changes.
 	t.refreshTaskManager(false)
-	t.v.invalidate() // keeps machine-wide settings and AMD SDK status current
+	if status, _ := t.ryzenStatus(); status != t.lastRyzen {
+		t.v.invalidate()
+	}
+}
+
+// ryzenStatus is the AMD Monitoring SDK status line and its colour.
+func (t *settingsTab) ryzenStatus() (string, walk.Color) {
+	rz := t.app.sensors.Ryzen()
+	status, ink := "Off", T.Faint
+	if t.app.ryzenOn && rz == nil {
+		status = "On for this PC; it runs when gotm is started as administrator."
+	}
+	if rz != nil {
+		st, detail := rz.State()
+		status = detail
+		switch st {
+		case metrics.RyzenRunning:
+			cpu, pkg := rz.Identity()
+			status = "Running: " + cpu
+			if pkg != "" {
+				status += "  ·  " + pkg
+			}
+			ink = T.Good
+		case metrics.RyzenUnavailable:
+			ink = T.Warn
+		}
+	}
+	return status, ink
 }
 
 // chip draws a pill button and registers its hit area. group names the
@@ -293,29 +325,11 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 	// ---- AMD Ryzen sensors ----
 	top = y
 	y = t.section(cv, y, w, "AMD Ryzen sensors", 124+noteDy)
-	rz := t.app.sensors.Ryzen()
 	t.chip(cv, 44, top+48, 230, "Use AMD Monitoring SDK", t.app.ryzenOn, "ryzensdk", "")
 	t.note(cv, "Read AMD sensors with the installed SDK. Requires administrator rights.",
 		uiFont(9), T.Muted, rect{noteX, top + 48 + noteDy, w - noteX - 44, 30})
-	status, ink := "Off", T.Faint
-	if t.app.ryzenOn && rz == nil {
-		status = "On for this PC; it runs when gotm is started as administrator."
-	}
-	if rz != nil {
-		st, detail := rz.State()
-		status = detail
-		switch st {
-		case metrics.RyzenRunning:
-			cpu, pkg := rz.Identity()
-			status = "Running: " + cpu
-			if pkg != "" {
-				status += "  ·  " + pkg
-			}
-			ink = T.Good
-		case metrics.RyzenUnavailable:
-			ink = T.Warn
-		}
-	}
+	status, ink := t.ryzenStatus()
+	t.lastRyzen = status
 	t.note(cv, status, uiFont(9), ink, rect{44, top + 84 + noteDy, w - 88, 30})
 
 	// ---- keyboard ----
