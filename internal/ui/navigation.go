@@ -274,13 +274,19 @@ func (a *App) cancelPageBuild() {
 		a.opening = nil
 		a.side.invalidate()
 		a.invalidateChrome()
-		if !a.pages[b.id].initialized && a.wraps[b.id] != nil {
-			a.wraps[b.id].Dispose()
-			a.wraps[b.id] = nil
-			a.pages[b.id].root = nil
-		}
-		for _, clear := range b.clears {
-			clear()
+		// A page whose init already ran is complete apart from its rows/show/focus
+		// steps: keep its controls (the next showPage reveals and activates it).
+		// Clearing its AssignTo targets here would orphan live controls and leave
+		// an initialized page with nil fields.
+		if !a.pages[b.id].initialized {
+			if a.wraps[b.id] != nil {
+				a.wraps[b.id].Dispose()
+				a.wraps[b.id] = nil
+				a.pages[b.id].root = nil
+			}
+			for _, clear := range b.clears {
+				clear()
+			}
 		}
 	}
 }
