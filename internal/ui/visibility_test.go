@@ -327,6 +327,154 @@ func TestSessionAndDisplayDecoding(t *testing.T) {
 	}
 }
 
+// fakeWindow replaces the window-state and session probes for one test.
+type fakeWindow struct {
+	minimized, cloaked bool
+	unlocked           bool
+	connected          bool
+	displayQueries     int
+}
+
+func installFakeWindow(t *testing.T) *fakeWindow {
+	f := &fakeWindow{}
+	ws, su, sc, rq := windowState, sessionUnlocked, sessionConnected, requeryDisplayState
+	windowState = func(win.HWND) (bool, bool) { return f.minimized, f.cloaked }
+	sessionUnlocked = func() bool { return f.unlocked }
+	sessionConnected = func() bool { return f.connected }
+	requeryDisplayState = func(*App) { f.displayQueries++ }
+	t.Cleanup(func() { windowState, sessionUnlocked, sessionConnected, requeryDisplayState = ws, su, sc, rq })
+	return f
+}
+
+const fakeHWND = win.HWND(1)
+
+// A missed uncloak (switching back to gotm's virtual desktop without the
+// WinEvent) is caught by activation, a frame paint or the visibility timer,
+// not only by the next sampler tick.
+func TestMissedUncloakRecoveredWithoutTick(t *testing.T) {
+	for _, signal := range []struct {
+		name string
+		send func(a *App)
+	}{
+		{"WM_ACTIVATEAPP", func(a *App) { a.observeVisibility(fakeHWND, win.WM_ACTIVATEAPP, 1, 0) }},
+		{"WM_ACTIVATE", func(a *App) { a.observeVisibility(fakeHWND, win.WM_ACTIVATE, 1, 0) }},
+		{"WM_NCPAINT", func(a *App) { a.observeVisibility(fakeHWND, win.WM_NCPAINT, 1, 0) }},
+		{"control paint", func(a *App) { a.observeLoopMessage(fakeHWND, win.WM_PAINT) }},
+		{"timer", func(a *App) {
+			if !a.observeVisibility(fakeHWND, win.WM_TIMER, visTimerID, 0) {
+				t.Fatal("visibility timer not consumed")
+			}
+		}},
+	} {
+		f := installFakeWindow(t)
+		a, p := windowlessApp()
+		f.cloaked = true
+		a.pollWindowVisibility(fakeHWND)
+		a.onSnapshot(&metrics.Snapshot{T: 1}, nil)
+		if a.vis.hidden != hideCloaked || p.ticks != 0 {
+			t.Fatalf("%s: cloak not tracked", signal.name)
+		}
+		f.cloaked = false // uncloaked; the WinEvent never arrives
+		signal.send(a)
+		if !a.vis.visible() || p.ticks != 1 {
+			t.Fatalf("%s: uncloak missed: hidden=%b ticks=%d", signal.name, a.vis.hidden, p.ticks)
+		}
+	}
+	// Activation of another app is no evidence.
+	f := installFakeWindow(t)
+	a, _ := windowlessApp()
+	f.cloaked = true
+	a.pollWindowVisibility(fakeHWND)
+	f.cloaked = false
+	a.observeVisibility(fakeHWND, win.WM_ACTIVATEAPP, 0, 0)
+	if a.vis.visible() {
+		t.Fatal("deactivation treated as visible")
+	}
+}
+
+// A missed unlock or display-on must never leave the page frozen: input to
+// the window clears every session reason at once, and the session state is
+// re-checked on paint and from the tick until it is found visible again.
+func TestMissedSessionNotificationsNeverFreezeThePage(t *testing.T) {
+	f := installFakeWindow(t)
+	a, p := windowlessApp()
+	settled := func() { a.sessionChecked, a.sessionSince = time.Time{}, time.Time{} } // time has passed
+	a.observeVisibility(0, wmWTSSessionChange, wtsSessionLock, 0)
+	a.onSnapshot(&metrics.Snapshot{T: 1}, nil)
+	// Right after the notification nothing is polled: the desktop may not
+	// have switched yet, and a probe must not undo a real lock.
+	f.unlocked = true
+	a.observeLoopMessage(fakeHWND, win.WM_PAINT)
+	if a.vis.visible() {
+		t.Fatal("a probe right after the lock notification unlocked the gate")
+	}
+	// Still locked: polls never clear on a probe that says locked.
+	f.unlocked = false
+	settled()
+	a.observeLoopMessage(fakeHWND, win.WM_PAINT)
+	if a.vis.visible() {
+		t.Fatal("paint while locked unlocked the gate")
+	}
+	// Unlocked, notification lost: the next paint finds out.
+	f.unlocked = true
+	settled()
+	a.observeLoopMessage(fakeHWND, win.WM_PAINT)
+	if !a.vis.visible() || p.ticks != 1 {
+		t.Fatalf("unlock not found on paint: hidden=%b ticks=%d", a.vis.hidden, p.ticks)
+	}
+
+	// The same from the sampler tick alone (no paint, no input), rate limited.
+	f.unlocked = false
+	a.observeVisibility(0, wmWTSSessionChange, wtsSessionLock, 0)
+	a.onSnapshot(&metrics.Snapshot{T: 2}, nil)
+	f.unlocked = true
+	settled()
+	a.sessionChecked = time.Now() // just checked: wait for the gap
+	a.onSnapshot(&metrics.Snapshot{T: 3}, nil)
+	if a.vis.visible() {
+		t.Fatal("session re-checked faster than sessionRecheckGap")
+	}
+	a.sessionChecked = time.Now().Add(-sessionRecheckGap)
+	a.onSnapshot(&metrics.Snapshot{T: 4}, nil)
+	if !a.vis.visible() || p.ticks != 2 || p.last.T != 4 {
+		t.Fatalf("tick did not recover from a missed unlock: hidden=%b ticks=%d", a.vis.hidden, p.ticks)
+	}
+
+	// Disconnected: cleared once the session is active again.
+	a.observeVisibility(0, wmWTSSessionChange, wtsRemoteDisconnect, 0)
+	f.connected = true
+	settled()
+	a.onSnapshot(&metrics.Snapshot{T: 5}, nil)
+	if !a.vis.visible() {
+		t.Fatal("missed reconnect not recovered")
+	}
+
+	// Display off: the state is asked for again (Windows answers a new
+	// registration with it), and input proves someone is looking.
+	a.setHidden(hideDisplayOff, hideDisplayOff)
+	settled()
+	a.onSnapshot(&metrics.Snapshot{T: 6}, nil)
+	if f.displayQueries != 1 || a.vis.visible() {
+		t.Fatalf("display state not re-queried: %d", f.displayQueries)
+	}
+	a.observeLoopMessage(fakeHWND, win.WM_MOUSEMOVE) // not counted: synthesized by Windows
+	if isUserInput(win.WM_MOUSEMOVE) || a.vis.visible() {
+		t.Fatal("a mouse move counted as presence")
+	}
+	a.observeLoopMessage(fakeHWND, win.WM_KEYDOWN)
+	if !a.vis.visible() || p.last.T != 6 {
+		t.Fatal("input did not clear display off")
+	}
+
+	// Input clears every session reason but leaves minimized to WM_SIZE.
+	f.minimized = true
+	a.setHidden(hideMinimized|hideLocked|hideDisplayOff, hideMinimized|hideLocked|hideDisplayOff)
+	a.observeLoopMessage(fakeHWND, win.WM_LBUTTONDOWN)
+	if a.vis.hidden != hideMinimized {
+		t.Fatalf("hidden = %b after input, want only minimized", a.vis.hidden)
+	}
+}
+
 func TestStallWatchdogBacksOffWhileHidden(t *testing.T) {
 	if stallPollPeriod(true) <= stallPollPeriod(false) || stallQuietLimit(true) <= stallQuietLimit(false) {
 		t.Fatal("watchdog does not back off while hidden")

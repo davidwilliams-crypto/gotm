@@ -90,7 +90,12 @@ type App struct {
 	vis              visibilityGate // whether anyone can see the window (visibility.go)
 	visRefreshQueued bool
 	visNotify        visibilityNotifications
-	tip              trayTip // throttled tray tooltip (shell.go)
+	visTimer         bool      // the visibility re-check timer is running
+	sessionChecked   time.Time // last poll of the session state while hidden
+	sessionSince     time.Time // when a session reason was last set by a notification
+	tip              trayTip   // throttled tray tooltip (shell.go)
+
+	ryzenStops sdkShutdown // AMD SDK instances stopped but perhaps still releasing
 }
 
 // StartTab selects the page shown at launch (an index into the sidebar order).
@@ -274,14 +279,13 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	a.watchSystem() // sign-out/shutdown save the window state; colour changes re-theme
 	stallWindow.Store(uintptr(a.mw.Handle()))
 	defer stallWindow.Store(0)
-	var exitRyzen *metrics.RyzenSDK // stopped at close, awaited (bounded) after the loop
 	a.mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
 		a.saveWindowState()
 		a.ioClosing.Store(true)
-		if r := a.sensors.Ryzen(); r != nil {
-			exitRyzen = r
-		}
-		a.setRyzenSDK(false) // Stop returns at once; the SDK is released on its own thread
+		// Stop returns at once; the SDK is released on its own thread and
+		// awaited (bounded) after the message loop, with any instance
+		// switched off earlier that is still releasing.
+		a.setRyzenSDK(false)
 		a.rec.SetPersist(false)
 		if p, ok := a.pages[pgDisk].impl.(*diskPage); ok && p.cancel != nil {
 			p.cancel()
@@ -298,11 +302,7 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	walk.App().Run()
 	close(a.pumpDone) // pump unsubscribes and exits instead of blocking forever
 	a.finishFileWork()
-	if exitRyzen != nil {
-		// Let the worker finish UnInit so the crash marker is cleared, without
-		// letting a stuck driver hold up exit.
-		exitRyzen.Wait(1500 * time.Millisecond)
-	}
+	a.stopRyzenForExit()
 	return nil
 }
 
@@ -318,7 +318,70 @@ func (a *App) setRyzenSDK(on bool) {
 	case !on && cur != nil:
 		cur.Stop()
 		a.sensors.SetRyzen(nil)
+		a.ryzenStops.add(cur) // may still be releasing the driver
 	}
+}
+
+// ryzenExitBudget bounds how long exit (or the end of the Windows session)
+// waits, in total, for stopped SDK workers to finish UnInit and clear their
+// crash marker; a stuck driver must not hold up exit.
+const ryzenExitBudget = 1500 * time.Millisecond
+
+// stopRyzenForExit stops the SDK and waits for every instance that has not
+// finished releasing, within the one shared budget.
+func (a *App) stopRyzenForExit() {
+	if a.sensors != nil {
+		a.setRyzenSDK(false)
+	}
+	a.ryzenStops.wait(ryzenExitBudget, time.Now())
+}
+
+// sdkWorker is the part of metrics.RyzenSDK the shutdown bookkeeping uses.
+type sdkWorker interface {
+	Stop()                           // non-blocking
+	Wait(timeout time.Duration) bool // true once the worker has exited
+}
+
+// sdkShutdown remembers SDK instances that were stopped (switched off in
+// Settings, or at exit) and may still be releasing, so exit waits for all of
+// them rather than only the one current at close. Every wait shares one
+// deadline, set by the first: sign-out (WM_ENDSESSION) followed by the end
+// of the message loop never waits more than the budget in total.
+type sdkShutdown struct {
+	pending  []sdkWorker
+	deadline time.Time
+}
+
+// add records a stopped worker, forgetting those already finished.
+func (s *sdkShutdown) add(w sdkWorker) {
+	kept := s.pending[:0]
+	for _, p := range s.pending {
+		if p != w && !p.Wait(0) {
+			kept = append(kept, p)
+		}
+	}
+	clear(s.pending[len(kept):])
+	s.pending = append(kept, w)
+}
+
+// wait blocks until every pending worker has finished or the shared
+// deadline passes, and reports whether all finished.
+func (s *sdkShutdown) wait(budget time.Duration, now time.Time) bool {
+	if s.deadline.IsZero() {
+		s.deadline = now.Add(budget)
+	}
+	for len(s.pending) > 0 {
+		left := time.Until(s.deadline)
+		if left <= 0 {
+			return false
+		}
+		if !s.pending[0].Wait(left) {
+			return false
+		}
+		s.pending[0] = nil
+		s.pending = s.pending[1:]
+	}
+	return true
 }
 
 func firstLocalIP() string {
@@ -761,11 +824,17 @@ func (a *App) watchSystem() {
 			activateMainWindow(hwnd)
 			return 0
 		}
-		a.observeVisibility(hwnd, msg, wp, lp) // minimize, hide, lock, display off
+		if a.observeVisibility(hwnd, msg, wp, lp) { // minimize, hide, lock, display off
+			return 0
+		}
 		switch msg {
 		case win.WM_ENDSESSION:
 			if wp != 0 {
+				// The process may be ended as soon as this returns: save, and
+				// let the AMD SDK release its driver (bounded) so its crash
+				// marker does not disable it at the next sign-in.
 				a.saveWindowState()
+				a.stopRyzenForExit()
 			}
 		case win.WM_SYSCOLORCHANGE, win.WM_THEMECHANGED:
 			a.mw.Synchronize(a.retheme)
