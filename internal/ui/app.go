@@ -333,7 +333,14 @@ func (a *App) stopRyzenForExit() {
 	if a.sensors != nil {
 		a.setRyzenSDK(false)
 	}
-	a.ryzenStops.wait(ryzenExitBudget, time.Now())
+	if a.ryzenStops.wait(ryzenExitBudget, time.Now()) {
+		// Also cover any session still queued or releasing in the metrics
+		// package (e.g. one stopped while waiting for an earlier session),
+		// within what is left of the same budget.
+		if left := time.Until(a.ryzenStops.deadline); left > 0 {
+			metrics.WaitRyzenSessions(left)
+		}
+	}
 }
 
 // sdkWorker is the part of metrics.RyzenSDK the shutdown bookkeeping uses.
@@ -449,7 +456,10 @@ func (a *App) showPage(i int) {
 	}
 	a.cur = i
 	for k, w := range a.wraps {
-		if w != nil && w.Visible() != (k == i) {
+		// The page's own WS_VISIBLE, not Walk's Visible: the latter is false for
+		// every page while the main window is hidden (tray), which would leave
+		// the previous page shown alongside this one (same rule as revealPage).
+		if w != nil && windowShown(w) != (k == i) {
 			w.SetVisible(k == i)
 		}
 	}
