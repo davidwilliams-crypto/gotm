@@ -222,6 +222,11 @@ func SetRyzenSDKEnabled(on bool) error {
 	return regMarker{registry.LOCAL_MACHINE, gotmKey, "RyzenSDKPending"}.set(false)
 }
 
+// ryzenSession serialises SDK sessions process-wide: a new poller waits (on
+// its own goroutine) until a stopping one has called UnInit and unloaded the
+// DLL, so two sessions never overlap inside the SDK.
+var ryzenSession = make(chan struct{}, 1)
+
 // Start begins polling in the background; it returns immediately.
 func (r *RyzenSDK) Start() {
 	r.mu.Lock()
@@ -235,24 +240,71 @@ func (r *RyzenSDK) Start() {
 	r.mu.Unlock()
 	go func() {
 		defer close(done)
-		r.run(stop)
+		select {
+		case ryzenSession <- struct{}{}:
+		case <-stop:
+			return
+		}
+		defer func() { <-ryzenSession }()
+		ryzenRun(r, stop)
 	}()
 }
 
-// Stop ends polling and releases the SDK. Safe to call repeatedly.
+// ryzenRun is the session body; tests substitute a stand-in for the SDK.
+var ryzenRun = (*RyzenSDK).run
+
+// Stop ends polling and returns at once: it is called on the UI thread, and
+// the worker may be inside a slow signature check, the SDK's start-up or a
+// hung driver call. The worker notices at its next step, then releases the
+// SDK on its own thread. Readings and state read "Off" immediately; nothing
+// the old worker reports afterwards is published. Use Wait to bound shutdown.
+// Safe to call repeatedly.
 func (r *RyzenSDK) Stop() {
 	r.mu.Lock()
-	stop, done := r.stop, r.done
-	r.stop, r.done = nil, nil
-	r.mu.Unlock()
-	if stop == nil {
-		return
+	stop := r.stop
+	r.stop = nil // r.done stays: Wait can still observe the worker's exit
+	if stop != nil {
+		r.state, r.detail, r.have = RyzenOff, "Off", false
 	}
-	close(stop)
-	<-done
-	r.mu.Lock()
-	r.state, r.detail, r.have = RyzenOff, "Off", false
 	r.mu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+}
+
+// Wait waits up to timeout for a stopped (or never started) worker to finish
+// releasing the SDK, and reports whether it did. Process exit paths use it so
+// UnInit normally completes without letting a stuck driver hold up exit.
+func (r *RyzenSDK) Wait(timeout time.Duration) bool {
+	r.mu.Lock()
+	done := r.done
+	r.mu.Unlock()
+	if done == nil {
+		return true
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// current reports whether stop still belongs to the running session; a
+// stopped worker's late results are dropped.
+func (r *RyzenSDK) current(stop <-chan struct{}) bool {
+	return r.stop != nil && (<-chan struct{})(r.stop) == stop
+}
+
+func stopped(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
 }
 
 // State returns the current status and a one-line explanation.
@@ -274,6 +326,30 @@ func (r *RyzenSDK) Reading() (RyzenReading, bool) {
 	return out, true
 }
 
+// Temperature returns just Tctl/Tdie: no copy of the per-core readings, for
+// callers (UI paint) that need nothing else.
+func (r *RyzenSDK) Temperature() (float64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.have {
+		return 0, false
+	}
+	return r.last.TempC, true
+}
+
+// readingInto is Reading copying into dst, reusing dst.Cores' storage.
+func (r *RyzenSDK) readingInto(dst *RyzenReading) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.have {
+		return false
+	}
+	cores := append(dst.Cores[:0], r.last.Cores...)
+	*dst = r.last
+	dst.Cores = cores
+	return true
+}
+
 // Identity returns the CPU name and package the SDK reported.
 func (r *RyzenSDK) Identity() (cpu, pkg string) {
 	r.mu.Lock()
@@ -281,9 +357,14 @@ func (r *RyzenSDK) Identity() (cpu, pkg string) {
 	return r.cpu, r.pkg
 }
 
-func (r *RyzenSDK) fail(detail string) {
+func (r *RyzenSDK) fail(detail string) { r.failFor(nil, detail) }
+
+// failFor records a failure of the session stop belongs to (nil: any).
+func (r *RyzenSDK) failFor(stop <-chan struct{}, detail string) {
 	r.mu.Lock()
-	r.state, r.detail, r.have = RyzenUnavailable, detail, false
+	if stop == nil || r.current(stop) {
+		r.state, r.detail, r.have = RyzenUnavailable, detail, false
+	}
 	r.mu.Unlock()
 }
 
@@ -443,27 +524,31 @@ func vetSDKDirectory(dir string) error {
 func (r *RyzenSDK) run(stop <-chan struct{}) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	fail := func(detail string) { r.failFor(stop, detail) }
 
 	if r.marker.on() {
-		r.fail("Disabled: the previous start-up of the AMD SDK did not finish. Turn it off and on again in Settings to retry.")
+		fail("Disabled: the previous start-up of the AMD SDK did not finish. Turn it off and on again in Settings to retry.")
 		return
 	}
 	if !IsElevated() {
-		r.fail("Needs administrator rights (use “Run as administrator”).")
+		fail("Needs administrator rights (use “Run as administrator”).")
 		return
 	}
 	dir, err := ryzenSDKDir()
 	if err != nil {
-		r.fail(err.Error())
+		fail(err.Error())
 		return
 	}
 	platformDLL := filepath.Join(dir, "Platform.dll")
 	deviceDLL := filepath.Join(dir, "Device.dll")
 	for _, f := range []string{platformDLL, deviceDLL} {
 		if _, err := os.Stat(f); err != nil {
-			r.fail("SDK file missing: " + f)
+			fail("SDK file missing: " + f)
 			return
 		}
+	}
+	if stopped(stop) {
+		return
 	}
 	// Platform.dll is loaded with its own directory on the DLL search path,
 	// so its static imports resolve from this folder too: a helper DLL planted
@@ -473,37 +558,43 @@ func (r *RyzenSDK) run(stop <-chan struct{}) {
 	// remains possible only for an attacker who can already write to this
 	// admin-only folder.)
 	if err := vetSDKDirectory(dir); err != nil {
-		r.fail(err.Error())
+		fail(err.Error())
 		return
+	}
+	if stopped(stop) {
+		return // stopped during the signature checks: never load the SDK
 	}
 
 	_ = r.marker.set(true)
 	h, err := windows.LoadLibraryEx(platformDLL, 0, windows.LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|windows.LOAD_LIBRARY_SEARCH_SYSTEM32)
 	if err != nil {
 		r.clearMarker()
-		r.fail("Could not load Platform.dll: " + err.Error())
+		fail("Could not load Platform.dll: " + err.Error())
 		return
 	}
 	defer windows.FreeLibrary(h)
 	getPlatform, err := windows.GetProcAddress(h, "GetPlatform")
 	if err != nil {
 		r.clearMarker()
-		r.fail("Platform.dll has no GetPlatform export")
+		fail("Platform.dll has no GetPlatform export")
 		return
 	}
 	platform, _, _ := syscall.SyscallN(getPlatform)
 	if platform == 0 {
 		r.clearMarker()
-		r.fail("GetPlatform returned null")
+		fail("GetPlatform returned null")
 		return
 	}
 	cpu, detail := r.initPlatform(platform, nil, false)
 	r.clearMarker()
 	if cpu == 0 {
-		r.fail(detail)
+		fail(detail)
 		return
 	}
 	defer vcall(platform, slotPlatformUnInit)
+	if stopped(stop) {
+		return // stopped during start-up: UnInit and unload without a first read
+	}
 
 	var buf [ryzenParamsBuf]byte
 	tick := time.NewTicker(1000 * time.Millisecond) // SDK guidance: at most once a second
@@ -516,16 +607,16 @@ func (r *RyzenSDK) run(stop <-chan struct{}) {
 		if rc == 0 {
 			rd, derr := decodeRyzenParams((*ryzenParams)(unsafe.Pointer(&buf[0])), time.Now())
 			r.mu.Lock()
-			if derr == nil {
+			if !r.current(stop) {
+				// Stopped while the call ran: publish nothing.
+			} else if derr == nil {
 				r.state, r.detail, r.last, r.have = RyzenRunning, "AMD Ryzen Master Monitoring SDK", rd, true
 			} else {
 				r.state, r.detail, r.have = RyzenUnavailable, "SDK returned unusable data: "+derr.Error(), false
 			}
 			r.mu.Unlock()
 		} else {
-			r.mu.Lock()
-			r.state, r.detail, r.have = RyzenUnavailable, fmt.Sprintf("GetCPUParameters failed (%d)", rc), false
-			r.mu.Unlock()
+			fail(fmt.Sprintf("GetCPUParameters failed (%d)", rc))
 		}
 		select {
 		case <-stop:

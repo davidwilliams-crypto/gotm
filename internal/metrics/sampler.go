@@ -111,6 +111,7 @@ type prevProc struct {
 	create int64
 	cpu    uint64
 	io     uint64
+	name   string // decoded image name, reused while PID and creation time match
 }
 
 // Sampler owns the sampling loop, the history ring and the SSE fan-out.
@@ -131,21 +132,33 @@ type Sampler struct {
 	prevAt    time.Time
 	meta      *metaCache
 	perf      *perfCounters
+
+	// Sampler-goroutine scratch, reused every tick. Nothing here is ever
+	// referenced by a published Snapshot.
+	spareProcs map[uint32]prevProc // double buffer for prevProcs
+	rawBuf     []rawProc
+	coreBuf    []byte
+	coreSpare  []coreTimes   // double buffer for prevCores
+	wake       chan struct{} // SetInterval: reschedule the next tick now
 }
 
 // NewSampler creates a sampler; Run starts it.
 func NewSampler(intervalMs, histSeconds int) *Sampler {
 	s := &Sampler{
-		subs:      map[chan *Snapshot]struct{}{},
-		prevProcs: map[uint32]prevProc{},
-		ncpu:      logicalCPUs(),
-		meta:      newMetaCache(),
+		subs:       map[chan *Snapshot]struct{}{},
+		prevProcs:  map[uint32]prevProc{},
+		spareProcs: map[uint32]prevProc{},
+		ncpu:       logicalCPUs(),
+		meta:       newMetaCache(),
+		wake:       make(chan struct{}, 1),
 	}
 	s.SetInterval(intervalMs)
 	s.SetHistorySeconds(histSeconds)
 	return s
 }
 
+// SetInterval changes the sampling period. A running sampler applies it at
+// once: going from 10 s to 0.25 s does not wait out the old 10 s.
 func (s *Sampler) SetInterval(ms int) {
 	if ms < 250 {
 		ms = 250
@@ -153,7 +166,12 @@ func (s *Sampler) SetInterval(ms int) {
 	if ms > 10000 {
 		ms = 10000
 	}
-	s.intervalMs.Store(int64(ms))
+	if s.intervalMs.Swap(int64(ms)) != int64(ms) {
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *Sampler) SetHistorySeconds(sec int) {
@@ -172,16 +190,42 @@ func (s *Sampler) NumCPU() int { return s.ncpu }
 func (s *Sampler) Run(ctx context.Context) {
 	s.perf = newPerfCounters()
 	defer s.perf.close()
+	s.loop(ctx, s.safeTick)
+}
+
+// loop schedules ticks on a fixed grid: each deadline is the previous one plus
+// the interval, so the tick's own duration does not stretch the period. A tick
+// that overran skips the deadlines it missed instead of bursting to catch up.
+// An interval change reschedules from the last tick at once.
+func (s *Sampler) loop(ctx context.Context, tick func(publish bool)) {
+	interval := func() time.Duration { return time.Duration(s.intervalMs.Load()) * time.Millisecond }
 	// The first pass only sets baselines (CPU deltas, PDH rates); publishing it
 	// would put a false 0 % into every graph and into the sensors' Min column.
-	s.safeTick(false)
+	last := time.Now()
+	tick(false)
+	next := last.Add(interval())
+	timer := time.NewTimer(time.Until(next))
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Duration(s.intervalMs.Load()) * time.Millisecond):
+		case <-s.wake:
+			next = last.Add(interval())
+			timer.Reset(max(0, time.Until(next)))
+			continue
+		case <-timer.C:
 		}
-		s.safeTick(true)
+		last = time.Now()
+		tick(true)
+		iv := interval()
+		next = next.Add(iv)
+		if now := time.Now(); !next.After(now) {
+			// Late (a slow tick, a suspended machine): resume on the grid.
+			missed := now.Sub(next)/iv + 1
+			next = next.Add(missed * iv)
+		}
+		timer.Reset(time.Until(next))
 	}
 }
 
@@ -201,7 +245,7 @@ func (s *Sampler) tick(publish bool) {
 	snap := &Snapshot{T: now.UnixMilli(), Version: 1}
 
 	// --- CPU (per core + total) ---
-	cores, err := readCoreTimes(s.ncpu)
+	cores, err := readCoreTimesInto(s.ncpu, s.coreSpare, &s.coreBuf)
 	var totalDelta uint64
 	if err == nil {
 		snap.Cores = make([]float64, len(cores))
@@ -226,7 +270,7 @@ func (s *Sampler) tick(publish bool) {
 		if allSum > 0 {
 			snap.CPU = round1(busySum * 100 / allSum)
 		}
-		s.prevCores = cores
+		s.coreSpare, s.prevCores = s.prevCores, cores
 	}
 
 	// --- memory ---
@@ -248,15 +292,19 @@ func (s *Sampler) tick(publish bool) {
 	}
 
 	// --- processes ---
-	raws, perr := readProcesses(&s.procBuf)
+	raws, perr := readProcessesInto(&s.procBuf, s.rawBuf, s.prevProcs)
+	s.rawBuf = raws
 	if perr == nil {
 		elapsed := now.Sub(s.prevAt).Seconds()
 		if s.prevAt.IsZero() || elapsed <= 0 {
 			elapsed = 0
 		}
-		seen := make(map[uint32]prevProc, len(raws))
+		if s.spareProcs == nil {
+			s.spareProcs = make(map[uint32]prevProc, len(raws))
+		}
+		seen := s.spareProcs // last tick's map, recycled: prevProcs is only read here
+		clear(seen)
 		procs := make([]Proc, 0, len(raws))
-		live := make(map[procKey]struct{}, len(raws))
 		for _, r := range raws {
 			pp := Proc{
 				GPUUnavailable: !snap.GPU.OK,
@@ -278,12 +326,11 @@ func (s *Sampler) tick(publish bool) {
 					pp.IO = math.Round(float64(r.IOBytes-prev.io) / elapsed)
 				}
 			}
-			seen[r.PID] = prevProc{create: r.CreateTime, cpu: r.CPUTime, io: r.IOBytes}
+			seen[r.PID] = prevProc{create: r.CreateTime, cpu: r.CPUTime, io: r.IOBytes, name: r.Name}
 			if g, ok := gpuByPID[r.PID]; ok {
 				pp.GPU = round1(g)
 			}
 			k := procKey{r.PID, r.CreateTime}
-			live[k] = struct{}{}
 			if r.PID > 4 {
 				pp.Path, pp.User = s.meta.lookup(k)
 			} else if r.PID == 4 {
@@ -291,26 +338,24 @@ func (s *Sampler) tick(publish bool) {
 			}
 			procs = append(procs, pp)
 		}
-		s.meta.prune(live)
-		s.prevProcs = seen
+		// Metadata survives exactly as long as its PID instance is alive.
+		s.meta.pruneWith(func(k procKey) bool {
+			p, ok := seen[k.pid]
+			return ok && p.create == k.create
+		})
+		s.spareProcs, s.prevProcs = s.prevProcs, seen
 		snap.Procs = procs
 	}
 	s.prevAt = now
 
-	// name the processes that use each adapter
-	if len(snap.GPUs) > 0 {
-		names := make(map[uint32]string, len(snap.Procs))
-		for _, p := range snap.Procs {
-			names[p.PID] = p.Name
-		}
-		for i := range snap.GPUs {
-			for j := range snap.GPUs[i].Procs {
-				pr := &snap.GPUs[i].Procs[j]
-				if n := names[pr.PID]; n != "" {
-					pr.Name = n
-				} else {
-					pr.Name = "PID " + itoa(pr.PID)
-				}
+	// name the processes that use each adapter (prevProcs now holds this tick)
+	for i := range snap.GPUs {
+		for j := range snap.GPUs[i].Procs {
+			pr := &snap.GPUs[i].Procs[j]
+			if p, ok := s.prevProcs[pr.PID]; ok && p.name != "" {
+				pr.Name = p.name
+			} else {
+				pr.Name = "PID " + itoa(pr.PID)
 			}
 		}
 	}

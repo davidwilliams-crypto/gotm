@@ -9,7 +9,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type procMeta struct{ path, sid string }
+// procMeta is a process instance's path and owner SID. user caches the owner
+// account once it has resolved; until then every lookup asks the shared
+// asynchronous cache, so pending names and retries still show up.
+type procMeta struct{ path, sid, user string }
 
 type sidAccountEntry struct {
 	name    string
@@ -126,22 +129,35 @@ func newMetaCache() *metaCache {
 
 func (c *metaCache) lookup(k procKey) (path, user string) {
 	c.mu.Lock()
-	if v, ok := c.m[k]; ok {
-		c.mu.Unlock()
-		return v.path, c.accounts.lookup(v.sid)
+	v, ok := c.m[k]
+	c.mu.Unlock()
+	if ok && v.user != "" {
+		return v.path, v.user // resolved once: no account-cache lock or clock read
 	}
-	c.mu.Unlock()
-	v := resolveMeta(k.pid)
-	c.mu.Lock()
-	c.m[k] = v
-	c.mu.Unlock()
-	return v.path, c.accounts.lookup(v.sid)
+	if !ok {
+		v = resolveMeta(k.pid)
+	}
+	user = c.accounts.lookup(v.sid)
+	if user != v.sid && user != "" {
+		v.user = user
+	}
+	if !ok || v.user != "" {
+		c.mu.Lock()
+		c.m[k] = v
+		c.mu.Unlock()
+	}
+	return v.path, user
 }
 
 func (c *metaCache) prune(live map[procKey]struct{}) {
+	c.pruneWith(func(k procKey) bool { _, ok := live[k]; return ok })
+}
+
+// pruneWith drops the metadata of every process instance alive rejects.
+func (c *metaCache) pruneWith(alive func(procKey) bool) {
 	c.mu.Lock()
 	for k := range c.m {
-		if _, ok := live[k]; !ok {
+		if !alive(k) {
 			delete(c.m, k)
 		}
 	}

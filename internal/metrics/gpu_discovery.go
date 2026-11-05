@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -267,6 +268,91 @@ func enumeratePresentDisplayGPUs() []gpuIdentity {
 		out = append(out, g)
 	}
 	return out
+}
+
+// ---- device-change notification -------------------------------------------------------
+
+var (
+	modCfgmgr32                  = windows.NewLazySystemDLL("cfgmgr32.dll")
+	procCMRegisterNotification   = modCfgmgr32.NewProc("CM_Register_Notification")
+	procCMUnregisterNotification = modCfgmgr32.NewProc("CM_Unregister_Notification")
+
+	// GUID_DEVINTERFACE_DISPLAY_ADAPTER and GUID_DISPLAY_DEVICE_ARRIVAL: both are
+	// registered for every display adapter, so either reports arrival/removal.
+	guidDevinterfaceDisplayAdapter = windows.GUID{Data1: 0x5b45201d, Data2: 0xf2f2, Data3: 0x4f3b, Data4: [8]byte{0x85, 0xbb, 0x30, 0xff, 0x1f, 0x95, 0x35, 0x99}}
+	guidDisplayDeviceArrival       = windows.GUID{Data1: 0x1ca05180, Data2: 0xa699, Data3: 0x450a, Data4: [8]byte{0x9a, 0x0c, 0xde, 0x4f, 0xbe, 0x3d, 0xdd, 0x89}}
+)
+
+// cmNotifyFilter is CM_NOTIFY_FILTER (x64): a 16-byte header and a union whose
+// largest member is WCHAR InstanceId[MAX_DEVICE_ID_LEN = 200].
+type cmNotifyFilter struct {
+	Size, Flags, FilterType, Reserved uint32
+	ClassGUID                         windows.GUID
+	_                                 [400 - 16]byte
+}
+
+const cmNotifyFilterTypeDeviceInterface = 0
+
+var (
+	cmNotifyOnce  sync.Once
+	cmNotifyCB    uintptr
+	cmNotifyMu    sync.Mutex
+	cmNotifyNext  uintptr
+	cmNotifyChans = map[uintptr]chan<- struct{}{}
+)
+
+// cmNotifyCallback runs on a system thread-pool thread. It only signals: the
+// GPU worker debounces and rediscovers on its own thread.
+func cmNotifyCallback(hNotify, context, action, data, size uintptr) uintptr {
+	cmNotifyMu.Lock()
+	ch := cmNotifyChans[context]
+	cmNotifyMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	return 0 // ERROR_SUCCESS
+}
+
+// registerDisplayAdapterNotifications signals ch whenever a display adapter
+// interface arrives or is removed (hot-plug, driver install, enable/disable).
+// It returns nil when Windows offers no such notification (pre-Windows 8).
+func registerDisplayAdapterNotifications(ch chan<- struct{}) (unregister func()) {
+	if procCMRegisterNotification.Find() != nil || procCMUnregisterNotification.Find() != nil {
+		return nil
+	}
+	cmNotifyOnce.Do(func() { cmNotifyCB = windows.NewCallback(cmNotifyCallback) })
+	cmNotifyMu.Lock()
+	cmNotifyNext++
+	key := cmNotifyNext
+	cmNotifyChans[key] = ch
+	cmNotifyMu.Unlock()
+	var handles []uintptr
+	for _, g := range []windows.GUID{guidDevinterfaceDisplayAdapter, guidDisplayDeviceArrival} {
+		f := cmNotifyFilter{FilterType: cmNotifyFilterTypeDeviceInterface, ClassGUID: g}
+		f.Size = uint32(unsafe.Sizeof(f))
+		var h uintptr
+		if r, _, _ := procCMRegisterNotification.Call(uintptr(unsafe.Pointer(&f)), key, cmNotifyCB, uintptr(unsafe.Pointer(&h))); r == 0 && h != 0 {
+			handles = append(handles, h)
+		}
+	}
+	forget := func() {
+		cmNotifyMu.Lock()
+		delete(cmNotifyChans, key)
+		cmNotifyMu.Unlock()
+	}
+	if len(handles) == 0 {
+		forget()
+		return nil
+	}
+	return func() {
+		for _, h := range handles {
+			procCMUnregisterNotification.Call(h) // waits for running callbacks
+		}
+		forget()
+	}
 }
 
 // Software display transports are legitimate display adapters. WARP has no
