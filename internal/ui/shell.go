@@ -4,6 +4,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -218,34 +219,64 @@ func (a *App) paintFooter(cv *walk.Canvas, w, h int, page int) {
 
 // ---- alerts + tray -------------------------------------------------------------
 
+// alertValue is the snapshot reading an alert rule watches (0 for an unknown metric).
+func alertValue(s *metrics.Snapshot, metric string) float64 {
+	switch metric {
+	case "cpu":
+		return s.CPU
+	case "mem":
+		return s.Mem.Percent
+	case "disk":
+		return s.Disk.Percent
+	case "gpu":
+		return s.GPU.Percent
+	}
+	return 0
+}
+
+// checkAlerts runs on every tick, visible or not. Its per-rule state lives in
+// the App's maps (reset only when the rules change), and nothing is formatted
+// unless a rule is firing.
 func (a *App) checkAlerts(s *metrics.Snapshot) {
-	val := map[string]float64{"cpu": s.CPU, "mem": s.Mem.Percent, "disk": s.Disk.Percent, "gpu": s.GPU.Percent}
-	var firing []string
+	if a.alertSince == nil {
+		a.alertSince = map[int]int64{}
+	}
+	first, firing := "", 0
 	for i, al := range a.cfg.Alerts {
-		if !al.Enabled || (al.Metric == "gpu" && !s.GPU.OK) || val[al.Metric] <= al.Above {
+		v := alertValue(s, al.Metric)
+		if !al.Enabled || (al.Metric == "gpu" && !s.GPU.OK) || v <= al.Above {
 			delete(a.alertSince, i)
 			continue
 		}
-		if _, ok := a.alertSince[i]; !ok {
-			a.alertSince[i] = s.T
+		since, ok := a.alertSince[i]
+		if !ok {
+			since = s.T
+			a.alertSince[i] = since
 		}
-		secs := (s.T - a.alertSince[i]) / 1000
+		secs := (s.T - since) / 1000
 		if secs < int64(al.ForSeconds) {
 			continue
 		}
-		msg := fmt.Sprintf("%s above %.0f%% for %d s (now %.0f%%)", metricName(al.Metric), al.Above, secs, val[al.Metric])
-		firing = append(firing, msg)
-		if a.tray != nil && time.Since(a.alertShown[i]) > 2*time.Minute {
+		firing++
+		notify := a.tray != nil && time.Since(a.alertShown[i]) > 2*time.Minute
+		if firing > 1 && !notify {
+			continue // only counted in the header
+		}
+		msg := fmt.Sprintf("%s above %.0f%% for %d s (now %.0f%%)", metricName(al.Metric), al.Above, secs, v)
+		if firing == 1 {
+			first = msg
+		}
+		if notify {
+			if a.alertShown == nil {
+				a.alertShown = map[int]time.Time{}
+			}
 			a.alertShown[i] = time.Now()
 			_ = a.tray.ShowWarning("gotm alert", msg)
 		}
 	}
-	text := ""
-	if len(firing) > 0 {
-		text = firing[0]
-		if len(firing) > 1 {
-			text += fmt.Sprintf("  (+%d more)", len(firing)-1)
-		}
+	text := first
+	if firing > 1 {
+		text += fmt.Sprintf("  (+%d more)", firing-1)
 	}
 	if text != a.alertText {
 		a.alertText = text
@@ -296,6 +327,7 @@ func (a *App) setupTray(icon *walk.Icon) {
 
 func (a *App) showWindow() {
 	h := win.HWND(a.mw.Handle())
+	a.userPresent() // the tray was clicked: the screen is on and unlocked
 	a.mw.Show()
 	if win.IsIconic(h) {
 		win.ShowWindow(h, win.SW_RESTORE)
@@ -304,8 +336,47 @@ func (a *App) showWindow() {
 	_ = a.mw.SetFocus()
 }
 
+// updateTray keeps the tray tooltip current. Shell_NotifyIcon(NIM_MODIFY) is
+// a synchronous call into Explorer that can stall the UI thread while
+// Explorer is busy, so it is made only when the displayed (rounded) text
+// changes, and at most once per trayTipInterval.
 func (a *App) updateTray(s *metrics.Snapshot) {
-	if a.tray != nil {
-		_ = a.tray.SetToolTip(fmt.Sprintf("gotm — CPU %.0f%% · RAM %.0f%%", s.CPU, s.Mem.Percent))
+	if a.tray != nil && a.tip.offer(s.CPU, s.Mem.Percent, time.Now()) {
+		_ = a.tray.SetToolTip(a.tip.text())
 	}
+}
+
+const trayTipInterval = 2 * time.Second
+
+// trayTip throttles and de-duplicates the tray tooltip. The newest values are
+// always retained, so the tooltip converges on them with the first offer (or
+// flush) after the throttle window, even if the readings stop changing.
+type trayTip struct {
+	cpu, ram           float64 // newest values, rounded as displayed
+	shownCPU, shownRAM float64
+	shown              bool // a tooltip has been sent
+	last               time.Time
+}
+
+// offer records the newest readings and reports whether the tooltip should
+// be updated now (then text returns it).
+func (t *trayTip) offer(cpu, ram float64, now time.Time) bool {
+	t.cpu, t.ram = math.RoundToEven(cpu), math.RoundToEven(ram)
+	return t.flush(now)
+}
+
+// flush reports whether the retained readings should be sent now.
+func (t *trayTip) flush(now time.Time) bool {
+	if t.shown && t.cpu == t.shownCPU && t.ram == t.shownRAM {
+		return false // displayed text would not change
+	}
+	if t.shown && now.Sub(t.last) < trayTipInterval {
+		return false // kept pending until the window has passed
+	}
+	t.shownCPU, t.shownRAM, t.shown, t.last = t.cpu, t.ram, true, now
+	return true
+}
+
+func (t *trayTip) text() string {
+	return fmt.Sprintf("gotm — CPU %.0f%% · RAM %.0f%%", t.shownCPU, t.shownRAM)
 }

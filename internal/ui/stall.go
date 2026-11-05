@@ -27,7 +27,28 @@ var (
 	stallLog    stallLogConfig
 	stallDumps  atomic.Int32
 	stallLines  = make(chan string, 32)
+	// stallHidden is set while nobody can see the main window. The watchdog
+	// then wakes less often and only treats long silences as stalls, so an
+	// idle, minimized gotm is not woken every 1.5 s just to prove it is alive.
+	stallHidden atomic.Bool
 )
+
+// stallPollPeriod is how often the watchdog checks the UI heartbeat.
+func stallPollPeriod(hidden bool) time.Duration {
+	if hidden {
+		return time.Second
+	}
+	return 200 * time.Millisecond
+}
+
+// stallQuietLimit is the silence after which the UI thread is probed (and,
+// if the probe also goes unanswered, its stacks are logged).
+func stallQuietLimit(hidden bool) time.Duration {
+	if hidden {
+		return 10 * time.Second
+	}
+	return 1500 * time.Millisecond
+}
 
 // stallPhase marks a start-up phase boundary (also counts as UI activity).
 func stallPhase(name string) {
@@ -47,7 +68,8 @@ func stallWatch(logPath string) {
 	}
 	stallPhase("instrumentation ready")
 	var probeBeat int64
-	timer := time.NewTicker(200 * time.Millisecond)
+	period := stallPollPeriod(false)
+	timer := time.NewTicker(period)
 	defer timer.Stop()
 	for {
 		select {
@@ -56,9 +78,14 @@ func stallWatch(logPath string) {
 			continue
 		case <-timer.C:
 		}
+		hidden := stallHidden.Load()
+		if p := stallPollPeriod(hidden); p != period {
+			period = p
+			timer.Reset(p)
+		}
 		beat := stallBeat.Load()
 		gap := time.Since(time.UnixMilli(beat))
-		if gap < 1500*time.Millisecond {
+		if gap < stallQuietLimit(hidden) {
 			continue
 		}
 		// A quiet GetMessage loop is healthy. Probe it once before treating

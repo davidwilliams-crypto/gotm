@@ -86,6 +86,11 @@ type App struct {
 	opening                    *pageConstruction
 	loading                    *canvasView
 	pageBuildHooked            bool
+
+	vis              visibilityGate // whether anyone can see the window (visibility.go)
+	visRefreshQueued bool
+	visNotify        visibilityNotifications
+	tip              trayTip // throttled tray tooltip (shell.go)
 }
 
 // StartTab selects the page shown at launch (an index into the sidebar order).
@@ -392,6 +397,10 @@ func (a *App) showPage(i int) {
 func (a *App) invalidateChrome() {
 	// Hidden pages repaint when shown. Avoid invalidating every native window
 	// on each change to the current page's status.
+	if !a.vis.visible() {
+		a.vis.stale = true // repainted by refreshVisible when the window is seen again
+		return
+	}
 	if a.cur >= 0 && a.cur < len(a.heads) {
 		a.heads[a.cur].invalidate()
 	}
@@ -530,8 +539,14 @@ func (a *App) onSnapshot(s *metrics.Snapshot, rows []metrics.SensorRow) {
 	if p, ok := a.pages[pgPower].impl.(*powerPage); ok {
 		p.rows = rows
 	}
+	// Alerts and the tray are features of their own: they run even while the
+	// window cannot be seen. Recording and sensor extrema already ran on the
+	// pump goroutine (prepareSnapshot), and the sampler keeps filling history.
 	a.updateTray(s)
 	a.checkAlerts(s)
+	if a.skipPresentation() {
+		return // nobody can see it: refreshVisible catches up when they can
+	}
 	// The title and instruction are static between alert and navigation changes.
 	if a.cur >= 0 && a.cur < len(a.foots) {
 		a.foots[a.cur].invalidate()
@@ -733,9 +748,11 @@ func (a *App) watchSystem() {
 		stallBeat.Store(time.Now().UnixMilli()) // the UI thread is alive
 		if activation != 0 && msg == activation {
 			// a second launch asked this instance to show itself
+			a.userPresent()
 			activateMainWindow(hwnd)
 			return 0
 		}
+		a.observeVisibility(hwnd, msg, wp, lp) // minimize, hide, lock, display off
 		switch msg {
 		case win.WM_ENDSESSION:
 			if wp != 0 {
@@ -751,6 +768,7 @@ func (a *App) watchSystem() {
 		return win.CallWindowProc(a.prevMainProc, hwnd, msg, wp, lp)
 	})
 	a.prevMainProc = win.SetWindowLongPtr(win.HWND(a.mw.Handle()), win.GWLP_WNDPROC, a.endSessionCB)
+	a.registerVisibility(win.HWND(a.mw.Handle()))
 	signalActivationReady() // second launches can stop knocking now
 }
 
