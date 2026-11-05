@@ -67,25 +67,96 @@ func parseNativeGPULUID(id string) (low uint32, high int32, ok bool) {
 
 // nativeNodeCache remembers, per adapter LUID, what the driver answered
 // before: which nodes are 3D engines (metadata does not change while the
-// driver stays loaded) and which queries it does not implement. The worker
-// drops it whenever the inventory changes (driver update, hot-plug).
+// driver stays loaded) and which queries it does not implement. It also holds
+// the adapter handle open between polls, so a GPU view does not open and
+// close every adapter on every sample. It is used only on the GPU worker
+// goroutine; the worker drops it (closing the handle) whenever the inventory
+// changes (driver update, hot-plug), when GPU sensors have not been wanted for
+// a while, and when it shuts down.
 type nativeNodeCache struct {
-	scanned       bool     // node metadata has been enumerated
-	nodes3D       []uint32 // ordinals of 3D engine nodes, in order
-	adapterFails  int      // consecutive failed adapter performance queries
-	nodeFails     int      // consecutive failed node performance queries
-	adapterRetry  time.Time
-	nodeRetry     time.Time
-	unsupportedAt time.Time // the LUID could not be opened
+	scanned      bool     // node metadata has been enumerated
+	nodes3D      []uint32 // ordinals of 3D engine nodes, in order
+	adapterFails int      // consecutive failed adapter performance queries
+	nodeFails    int      // consecutive failed node performance queries
+	scanFails    int      // consecutive node scans that found no 3D engine
+	openFails    int      // consecutive failed D3DKMTOpenAdapterFromLuid calls
+	adapterRetry time.Time
+	nodeRetry    time.Time
+	openRetry    time.Time // the LUID could not be opened: not before this
+
+	handle  uint32       // open D3DKMT adapter handle, 0 when closed
+	closeFn func(uint32) // closes handle (the ops that opened it)
 }
 
 const (
-	// nativeGPUGiveUp failures in a row mark a query unsupported until
-	// nativeGPURetry has passed: a driver that cannot answer is not asked every
-	// sample, and one that was merely busy is asked again later.
-	nativeGPUGiveUp = 3
-	nativeGPURetry  = 5 * time.Minute
+	// nativeGPUGiveUp failures in a row mark a query (or opening the adapter)
+	// unsupported until nativeGPURetry has passed: a driver that cannot answer
+	// is not asked every sample. Failures before that are retried after
+	// nativeGPUBackoff, so a driver that was merely busy for a moment (a TDR,
+	// a power transition) is asked again within seconds, not minutes.
+	nativeGPUGiveUp  = 3
+	nativeGPUBackoff = 5 * time.Second
+	nativeGPURetry   = 5 * time.Minute
 )
+
+// nativeStrike records one failure in a row of *fails: a short pause before
+// the next attempt, and a long one once nativeGPUGiveUp have failed.
+func nativeStrike(fails *int, retry *time.Time, now time.Time) {
+	if *fails++; *fails >= nativeGPUGiveUp {
+		*fails, *retry = 0, now.Add(nativeGPURetry)
+	} else {
+		*retry = now.Add(nativeGPUBackoff)
+	}
+}
+
+// closeHandle closes the held adapter handle, if any.
+func (c *nativeNodeCache) closeHandle() {
+	if c == nil || c.handle == 0 {
+		return
+	}
+	if c.closeFn != nil {
+		c.closeFn(c.handle)
+	}
+	c.handle, c.closeFn = 0, nil
+}
+
+// nativeGPUOps are the three D3DKMT calls; tests substitute fakes.
+type nativeGPUOps struct {
+	available func() bool
+	open      func(low uint32, high int32) (uint32, bool)
+	query     func(h uint32, kind int32, data unsafe.Pointer, size uint32) bool
+	close     func(h uint32)
+}
+
+var nativeGPUSys = &nativeGPUOps{
+	available: func() bool {
+		return procD3DKMTOpenAdapterFromLuid.Find() == nil && procD3DKMTQueryAdapterInfo.Find() == nil && procD3DKMTCloseAdapter.Find() == nil
+	},
+	open: func(low uint32, high int32) (uint32, bool) {
+		open := struct {
+			Low     uint32
+			High    int32
+			Adapter uint32
+		}{Low: low, High: high}
+		status, _, _ := procD3DKMTOpenAdapterFromLuid.Call(uintptr(unsafe.Pointer(&open)))
+		return open.Adapter, int32(status) >= 0 && open.Adapter != 0
+	},
+	query: func(h uint32, kind int32, data unsafe.Pointer, size uint32) bool {
+		q := struct {
+			Adapter uint32
+			Type    int32
+			Data    unsafe.Pointer
+			Size    uint32
+		}{h, kind, data, size}
+		status, _, _ := procD3DKMTQueryAdapterInfo.Call(uintptr(unsafe.Pointer(&q)))
+		runtime.KeepAlive(data)
+		return int32(status) >= 0
+	},
+	close: func(h uint32) {
+		closeArg := h
+		procD3DKMTCloseAdapter.Call(uintptr(unsafe.Pointer(&closeArg)))
+	},
+}
 
 // fillNativeGPUSensors fills missing readings for this exact DXGI/PDH LUID.
 // The caller gates sampling on the GPU detail view to avoid waking idle GPUs.
@@ -94,12 +165,19 @@ func fillNativeGPUSensors(g *GPUAdapter) { fillNativeGPUSensorsCached(g, nil) }
 // fillNativeGPUSensorsCached is fillNativeGPUSensors using (and updating) a
 // per-adapter cache; nil scans and queries everything, as on first use.
 func fillNativeGPUSensorsCached(g *GPUAdapter, c *nativeNodeCache) {
+	fillNativeGPUSensorsWith(g, c, nativeGPUSys, time.Now())
+}
+
+// fillNativeGPUSensorsWith does the work with explicit D3DKMT calls. Without
+// a cache the adapter is opened and closed here; with one, its handle stays
+// open in the cache until a poll in which no query was answered (a stale
+// handle after a reset or removal), or until the worker drops it.
+func fillNativeGPUSensorsWith(g *GPUAdapter, c *nativeNodeCache, ops *nativeGPUOps, now time.Time) {
 	if g == nil || g.Software || (g.HasTemp && g.HasFan && g.HasClock && (g.HasMemClock || g.MemClockMHz > 0)) {
 		return
 	}
-	now := time.Now()
 	if c != nil {
-		if !c.unsupportedAt.IsZero() && now.Sub(c.unsupportedAt) < nativeGPURetry {
+		if c.openRetry.After(now) {
 			return
 		}
 		needAdapter := (!g.HasTemp || !g.HasFan || (!g.HasMemClock && g.MemClockMHz <= 0)) && !c.adapterRetry.After(now)
@@ -112,36 +190,38 @@ func fillNativeGPUSensorsCached(g *GPUAdapter, c *nativeNodeCache) {
 	if !ok {
 		return
 	}
-	if procD3DKMTOpenAdapterFromLuid.Find() != nil || procD3DKMTQueryAdapterInfo.Find() != nil || procD3DKMTCloseAdapter.Find() != nil {
+	if !ops.available() {
 		return
 	}
-
-	open := struct {
-		Low     uint32
-		High    int32
-		Adapter uint32
-	}{Low: low, High: high}
-	if status, _, _ := procD3DKMTOpenAdapterFromLuid.Call(uintptr(unsafe.Pointer(&open))); int32(status) < 0 || open.Adapter == 0 {
-		if c != nil {
-			c.unsupportedAt = now
+	var h uint32
+	if c != nil {
+		h = c.handle
+	}
+	if h == 0 {
+		var opened bool
+		if h, opened = ops.open(low, high); !opened {
+			if c != nil {
+				nativeStrike(&c.openFails, &c.openRetry, now)
+			}
+			return
 		}
-		return
+		if c == nil {
+			defer ops.close(h)
+		} else {
+			c.handle, c.closeFn, c.openFails = h, ops.close, 0
+		}
 	}
-	defer func() {
-		closeArg := open.Adapter
-		procD3DKMTCloseAdapter.Call(uintptr(unsafe.Pointer(&closeArg)))
-	}()
+	asked, answered := false, false
 	fillNativeGPUFromQueryCached(g, func(kind int32, data unsafe.Pointer, size uint32) bool {
-		q := struct {
-			Adapter uint32
-			Type    int32
-			Data    unsafe.Pointer
-			Size    uint32
-		}{open.Adapter, kind, data, size}
-		status, _, _ := procD3DKMTQueryAdapterInfo.Call(uintptr(unsafe.Pointer(&q)))
-		runtime.KeepAlive(data)
-		return int32(status) >= 0
+		ok := ops.query(h, kind, data, size)
+		asked, answered = true, answered || ok
+		return ok
 	}, c, now)
+	if c != nil && asked && !answered {
+		// Nothing answered: the handle may be stale (adapter reset or
+		// removed). Open a fresh one next time.
+		c.closeHandle()
+	}
 }
 
 func nativeGPUClockMHz(hz uint64) (float64, bool) {
@@ -182,9 +262,7 @@ func fillNativeGPUFromQueryCached(g *GPUAdapter, query nativeGPUQuery, c *native
 			}
 			// Power is tenths of a percent, NOT watts. Never populate PowerW here.
 		} else if c != nil {
-			if c.adapterFails++; c.adapterFails >= nativeGPUGiveUp {
-				c.adapterFails, c.adapterRetry = 0, now.Add(nativeGPURetry)
-			}
+			nativeStrike(&c.adapterFails, &c.adapterRetry, now)
 		}
 	}
 	if g.HasClock || (c != nil && c.nodeRetry.After(now)) {
@@ -215,8 +293,8 @@ func fillNativeGPUFromQueryCached(g *GPUAdapter, query nativeGPUQuery, c *native
 		}
 		if answered {
 			c.nodeFails = 0
-		} else if c.nodeFails++; c.nodeFails >= nativeGPUGiveUp {
-			c.nodeFails, c.nodeRetry = 0, now.Add(nativeGPURetry)
+		} else {
+			nativeStrike(&c.nodeFails, &c.nodeRetry, now)
 		}
 		return
 	}
@@ -245,9 +323,11 @@ func fillNativeGPUFromQueryCached(g *GPUAdapter, query nativeGPUQuery, c *native
 		return
 	}
 	if len(nodes) == 0 {
-		// No 3D node (or no metadata support): look again only after a while.
-		c.nodeRetry = now.Add(nativeGPURetry)
+		// No 3D node, no metadata support, or a driver busy at this moment
+		// (metadata failing at ordinal 0): look again soon, and only after
+		// nativeGPUGiveUp empty scans in a row wait nativeGPURetry.
+		nativeStrike(&c.scanFails, &c.nodeRetry, now)
 		return
 	}
-	c.scanned, c.nodes3D = true, nodes
+	c.scanned, c.nodes3D, c.scanFails = true, nodes, 0
 }

@@ -150,9 +150,14 @@ type RyzenSDK struct {
 	cpu    string
 	pkg    string
 
-	stop chan struct{}
-	done chan struct{}
+	stop    chan struct{}
+	done    chan struct{}
+	earlier []chan struct{} // done channels of sessions started before this one and still running then
 }
+
+// ryzenWaitingDetail is the status while a new session waits for an earlier
+// one (an off/on toggle) to release the SDK. The state stays RyzenStarting.
+const ryzenWaitingDetail = "Waiting for the previous AMD SDK session to close…"
 
 // NewRyzenSDK prepares (but does not start) a poller. A value in
 // HKLM\SOFTWARE\gotm detects a crash during initialisation.
@@ -227,6 +232,49 @@ func SetRyzenSDKEnabled(on bool) error {
 // DLL, so two sessions never overlap inside the SDK.
 var ryzenSession = make(chan struct{}, 1)
 
+// ryzenLive lists the done channels of session workers that may still be
+// running, process-wide. The UI creates a new RyzenSDK for every off/on
+// toggle, so the instance an exit path waits on is not necessarily the one
+// still releasing the SDK.
+var ryzenLive struct {
+	sync.Mutex
+	done []chan struct{}
+}
+
+// registerRyzenSession records done as a live session and returns the
+// sessions registered before it that have not finished yet.
+func registerRyzenSession(done chan struct{}) (earlier []chan struct{}) {
+	ryzenLive.Lock()
+	defer ryzenLive.Unlock()
+	live := ryzenLive.done[:0]
+	for _, d := range ryzenLive.done {
+		select {
+		case <-d: // finished: forget it
+		default:
+			live = append(live, d)
+		}
+	}
+	clear(ryzenLive.done[len(live):])
+	earlier = append([]chan struct{}(nil), live...)
+	ryzenLive.done = append(live, done)
+	return earlier
+}
+
+// liveRyzenSessions returns every session worker that has not finished.
+func liveRyzenSessions() []chan struct{} {
+	ryzenLive.Lock()
+	defer ryzenLive.Unlock()
+	var out []chan struct{}
+	for _, d := range ryzenLive.done {
+		select {
+		case <-d:
+		default:
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // Start begins polling in the background; it returns immediately.
 func (r *RyzenSDK) Start() {
 	r.mu.Lock()
@@ -235,6 +283,7 @@ func (r *RyzenSDK) Start() {
 		return
 	}
 	r.stop, r.done = make(chan struct{}), make(chan struct{})
+	r.earlier = registerRyzenSession(r.done)
 	r.state, r.detail, r.have = RyzenStarting, "Starting…", false
 	stop, done := r.stop, r.done
 	r.mu.Unlock()
@@ -242,12 +291,32 @@ func (r *RyzenSDK) Start() {
 		defer close(done)
 		select {
 		case ryzenSession <- struct{}{}:
-		case <-stop:
-			return
+		default:
+			// An earlier session still holds the SDK (it is releasing it, or
+			// hung in the driver): say so instead of "Starting…" forever.
+			r.setDetailFor(stop, ryzenWaitingDetail)
+			select {
+			case ryzenSession <- struct{}{}:
+			case <-stop:
+				return
+			}
+			r.setDetailFor(stop, "Starting…")
 		}
 		defer func() { <-ryzenSession }()
+		if stopped(stop) {
+			return // stopped while queued: never start the SDK
+		}
 		ryzenRun(r, stop)
 	}()
+}
+
+// setDetailFor updates the starting detail of the session stop belongs to.
+func (r *RyzenSDK) setDetailFor(stop <-chan struct{}, detail string) {
+	r.mu.Lock()
+	if r.current(stop) && r.state == RyzenStarting {
+		r.detail = detail
+	}
+	r.mu.Unlock()
 }
 
 // ryzenRun is the session body; tests substitute a stand-in for the SDK.
@@ -275,21 +344,41 @@ func (r *RyzenSDK) Stop() {
 // Wait waits up to timeout for a stopped (or never started) worker to finish
 // releasing the SDK, and reports whether it did. Process exit paths use it so
 // UnInit normally completes without letting a stuck driver hold up exit.
+// Sessions started before this one (an earlier instance after a quick
+// off/on toggle) are waited for too, within the same timeout: a session
+// stopped while queued finishes at once, while the earlier one may still be
+// in UnInit.
 func (r *RyzenSDK) Wait(timeout time.Duration) bool {
 	r.mu.Lock()
-	done := r.done
+	var waits []chan struct{}
+	if r.done != nil {
+		waits = append(append(waits, r.done), r.earlier...)
+	}
 	r.mu.Unlock()
-	if done == nil {
+	return waitRyzenDone(waits, timeout)
+}
+
+// WaitRyzenSessions waits up to timeout for every AMD SDK session worker in
+// the process (stopped ones included) to finish, for exit paths that no
+// longer hold the instance that ran last.
+func WaitRyzenSessions(timeout time.Duration) bool {
+	return waitRyzenDone(liveRyzenSessions(), timeout)
+}
+
+func waitRyzenDone(waits []chan struct{}, timeout time.Duration) bool {
+	if len(waits) == 0 {
 		return true
 	}
 	t := time.NewTimer(timeout)
 	defer t.Stop()
-	select {
-	case <-done:
-		return true
-	case <-t.C:
-		return false
+	for _, done := range waits {
+		select {
+		case <-done:
+		case <-t.C:
+			return false
+		}
 	}
+	return true
 }
 
 // current reports whether stop still belongs to the running session; a
