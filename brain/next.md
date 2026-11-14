@@ -4,6 +4,9 @@
 - [?] Meridian dark palette, radii, buttons, selection and status tints across every drawn page (internal/ui)
 - [?] Contrast and radius tests (internal/ui/meridian_test.go); UI test suite passes
 - [?] Geist Regular/SemiBold bundled with tabular digits, licence in the notices (internal/ui/fonts, fonts.go, tools/fonts)
+- [?] Release kit 0.9.11 built (unsigned): dist\release\gotm-0.9.11
+- [?] v0.9.11 tagged and published as a GitHub Release
+- [ ] Run gotm-0.9.11-setup.exe once (install, open, uninstall)
 - [ ] Decide: Meridian light theme following the Windows app mode
 - [ ] Native table headers, search boxes and column rules in Meridian style (owner-draw work)
 - [ ] Decide: sentence-case page names ("Flight recorder", "Installed apps", "Disk space") per Meridian
