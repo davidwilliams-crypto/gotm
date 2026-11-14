@@ -4,12 +4,17 @@ package ui
 
 import (
 	"container/list"
+	"image"
+	"image/color"
 	"runtime"
 	"sync"
 	"unsafe"
 
+	"github.com/tailscale/walk"
 	"github.com/tailscale/win"
 	"golang.org/x/sys/windows"
+
+	"gotm/internal/art"
 )
 
 // procIconCache turns process image paths into small icons on a background
@@ -88,7 +93,16 @@ func (c *procIconCache) imageList() win.HIMAGELIST {
 		cx := win.GetSystemMetrics(win.SM_CXSMICON)
 		cy := win.GetSystemMetrics(win.SM_CYSMICON)
 		c.himl = win.ImageList_Create(cx, cy, win.ILC_COLOR32|win.ILC_MASK, 32, 32)
-		// The small stock application icon (a shared icon: never destroyed).
+		// Slot 0 is gotm's own placeholder, drawn for exactly this size in
+		// the muted ink. Windows' stock application icon (a 1990s window)
+		// is only the fallback if the bitmap cannot be made.
+		if hbm := genericAppBitmap(int(cx), int(cy)); hbm != 0 {
+			added := win.ImageList_Add(c.himl, hbm, 0)
+			win.DeleteObject(win.HGDIOBJ(hbm)) // the image list keeps its own copy
+			if added == 0 {
+				return c.himl
+			}
+		}
 		generic := win.HICON(win.LoadImage(0, win.MAKEINTRESOURCE(win.IDI_APPLICATION), win.IMAGE_ICON, cx, cy, win.LR_SHARED))
 		if generic == 0 {
 			generic = win.LoadIcon(0, win.MAKEINTRESOURCE(win.IDI_APPLICATION))
@@ -96,6 +110,36 @@ func (c *procIconCache) imageList() win.HIMAGELIST {
 		win.ImageList_ReplaceIcon(c.himl, -1, generic)
 	}
 	return c.himl
+}
+
+var (
+	procImageListReplace     = windows.NewLazySystemDLL("comctl32.dll").NewProc("ImageList_Replace")
+	procImageListGetIconSize = windows.NewLazySystemDLL("comctl32.dll").NewProc("ImageList_GetIconSize")
+)
+
+// retheme redraws the placeholder in the current palette's ink (the muted
+// ink of the dark theme is too faint on a high-contrast white window).
+func (c *procIconCache) retheme() {
+	if c.himl == 0 {
+		return
+	}
+	var cx, cy int32
+	if r, _, _ := procImageListGetIconSize.Call(uintptr(c.himl), uintptr(unsafe.Pointer(&cx)), uintptr(unsafe.Pointer(&cy))); r == 0 {
+		return
+	}
+	if hbm := genericAppBitmap(int(cx), int(cy)); hbm != 0 {
+		procImageListReplace.Call(uintptr(c.himl), 0, uintptr(hbm), 0)
+		win.DeleteObject(win.HGDIOBJ(hbm))
+	}
+}
+
+// genericAppBitmap renders the placeholder icon in the muted ink. The caller
+// deletes it.
+func genericAppBitmap(w, h int) win.HBITMAP {
+	if w <= 0 || h <= 0 || w != h {
+		return 0
+	}
+	return rgbaBitmap(art.GenericApp(w, nrgba(T.Muted)))
 }
 
 // attach shows the shared image list in a table's native list views. post
@@ -237,7 +281,90 @@ func shellSmallIcon(p string) win.HICON {
 	if win.SHGetFileInfo(name, 0, &shfi, uint32(unsafe.Sizeof(shfi)), win.SHGFI_ICON|win.SHGFI_SMALLICON) == 0 {
 		return 0
 	}
+	// A program without an icon of its own gets the shell's stock "program"
+	// picture. gotm shows its own placeholder for those instead.
+	if generic := genericExeIndex(); generic >= 0 && shfi.IIcon == generic {
+		if shfi.HIcon != 0 {
+			win.DestroyIcon(shfi.HIcon)
+		}
+		return 0
+	}
 	return shfi.HIcon
+}
+
+// genericExeIndex is the system image list index of the icon the shell gives
+// to an .exe that has none (asked by file type, so no file is touched), or -1.
+var genericExeIndex = sync.OnceValue(func() int32 {
+	name, err := windows.UTF16PtrFromString("program.exe")
+	if err != nil {
+		return -1
+	}
+	const fileAttributeNormal = 0x80
+	var shfi win.SHFILEINFO
+	if win.SHGetFileInfo(name, fileAttributeNormal, &shfi, uint32(unsafe.Sizeof(shfi)),
+		win.SHGFI_SYSICONINDEX|win.SHGFI_SMALLICON|win.SHGFI_USEFILEATTRIBUTES) == 0 {
+		return -1
+	}
+	return shfi.IIcon
+})
+
+// rgbaBitmap copies an image into a 32-bit premultiplied DIB, the form an
+// ILC_COLOR32 image list takes without a mask. The caller deletes it.
+func rgbaBitmap(img *image.NRGBA) win.HBITMAP {
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	bi := win.BITMAPINFOHEADER{BiWidth: int32(w), BiHeight: -int32(h), BiPlanes: 1, BiBitCount: 32, BiCompression: win.BI_RGB}
+	bi.BiSize = uint32(unsafe.Sizeof(bi))
+	var bits unsafe.Pointer
+	hbm := win.CreateDIBSection(0, &bi, win.DIB_RGB_COLORS, &bits, 0, 0)
+	if hbm == 0 || bits == nil {
+		return 0
+	}
+	dst := unsafe.Slice((*byte)(bits), w*h*4)
+	for i := 0; i < w*h; i++ {
+		r, g, b, a := uint32(img.Pix[i*4]), uint32(img.Pix[i*4+1]), uint32(img.Pix[i*4+2]), uint32(img.Pix[i*4+3])
+		dst[i*4+0] = byte(b * a / 255)
+		dst[i*4+1] = byte(g * a / 255)
+		dst[i*4+2] = byte(r * a / 255)
+		dst[i*4+3] = byte(a)
+	}
+	return hbm
+}
+
+func nrgba(c walk.Color) color.NRGBA { return color.NRGBA{c.R(), c.G(), c.B(), 0xff} }
+
+// styleChecks replaces a list view's stock check boxes (white squares on any
+// theme) with Meridian ones in the current palette. The list view owns the
+// new image list; the one it had is destroyed here.
+func styleChecks(lv win.HWND) {
+	if win.SendMessage(lv, win.LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0)&win.LVS_EX_CHECKBOXES == 0 {
+		return
+	}
+	cx, cy := win.GetSystemMetrics(win.SM_CXSMICON), win.GetSystemMetrics(win.SM_CYSMICON)
+	if old := win.SendMessage(lv, 0x1002 /* LVM_GETIMAGELIST */, win.LVSIL_STATE, 0); old != 0 {
+		procImageListGetIconSize.Call(old, uintptr(unsafe.Pointer(&cx)), uintptr(unsafe.Pointer(&cy)))
+	}
+	if cx <= 0 || cx != cy {
+		return
+	}
+	himl := win.ImageList_Create(cx, cy, win.ILC_COLOR32, 2, 0)
+	if himl == 0 {
+		return
+	}
+	for _, checked := range []bool{false, true} {
+		hbm := rgbaBitmap(art.Checkbox(int(cx), checked, nrgba(T.Stroke), nrgba(T.Accent), nrgba(T.OnAccent)))
+		added := int32(-1)
+		if hbm != 0 {
+			added = win.ImageList_Add(himl, hbm, 0)
+			win.DeleteObject(win.HGDIOBJ(hbm))
+		}
+		if added < 0 {
+			win.ImageList_Destroy(himl)
+			return
+		}
+	}
+	if old := win.SendMessage(lv, win.LVM_SETIMAGELIST, win.LVSIL_STATE, uintptr(himl)); old != 0 {
+		win.ImageList_Destroy(win.HIMAGELIST(old))
+	}
 }
 
 // flush moves finished icons into the image list (UI thread) and asks the

@@ -138,7 +138,8 @@ Verified by sampling the window ~75 times a second for 8 s per page: the visible
 | `internal/metrics` | sampler + Windows readers: processes, CPU, memory, PDH, services, startup, **power, drive health, connections, apps, drivers, users, disk scan, flight recorder, sensor tree**; `tree.go` builds flat / tree / grouped process rows |
 | `internal/ui` | Walk-based UI: `app.go` window, `shell.go` sidebar/header/footer/tray/alerts, `theme.go` (dark and high-contrast palettes) + `gfx.go` drawing, `widgets.go` canvas views and buttons, `uia.go` UI Automation provider for the drawn surfaces, `grid.go` table pages, one file per page |
 | `internal/config` | `%APPDATA%\gotm\config.json` |
-| `winres/`, `tools/genicon` | icon, version info, manifest → `rsrc_windows_amd64.syso` |
+| `winres/`, `tools/genicon` | icon (drawn by `internal/art`, one PNG per size), version info, manifest → `rsrc_windows_amd64.syso` |
+| `internal/art` | gotm's own artwork: the application icon, the placeholder for programs without an icon, table check boxes |
 | `tools/setup` | installer/uninstaller (Go, no third-party tool): embeds gotm.exe, installs to Program Files for all users, Start menu shortcut, Apps & features entry |
 | `tools/notices` | writes THIRD-PARTY-NOTICES.txt from the modules linked into gotm.exe, plus the bundled Geist font licence |
 | `tools/fonts` | `tabular.py` prepares the embedded Geist fonts (see `internal/ui/fonts/README.md`) |

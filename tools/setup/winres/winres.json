@@ -2,7 +2,13 @@
   "RT_GROUP_ICON": {
     "APP": {
       "0000": [
-        "../../../winres/icon.png",
+        "../../../winres/icon256.png",
+        "../../../winres/icon64.png",
+        "../../../winres/icon48.png",
+        "../../../winres/icon40.png",
+        "../../../winres/icon32.png",
+        "../../../winres/icon24.png",
+        "../../../winres/icon20.png",
         "../../../winres/icon16.png"
       ]
     }

@@ -49,3 +49,7 @@
 2026-11-13 — Geist Regular/SemiBold are embedded in gotm.exe and registered per process (user chose "Bundle Geist"). **Why:** Meridian's type is Geist; embedding avoids installing a font on the PC and keeps the portable zip self-contained.
 2026-11-13 — The embedded Geist files have tabular digits as the default glyphs (a modification allowed by the OFL; Geist reserves no font name). **Why:** GDI cannot switch on OpenType tnum, and proportional digits make live number columns shimmer.
 2026-11-13 — Geist Mono is not bundled. **Why:** nothing in the UI draws with the mono font today.
+2026-11-14 — The app icon is drawn in code (internal/art) and rendered separately for every size, not exported from a design tool or scaled from one image. **Why:** each size gets pixel-snapped edges and a drawing simplified for it, the build stays Go-only, and the colours stay tied to Meridian tokens.
+2026-11-14 — Icon tile is the light-theme accent #2152e5, not navy. **Why:** it must read on gotm's own dark canvas, on a light taskbar and on high-contrast white.
+2026-11-14 — Programs whose shell icon is the stock program picture show gotm's placeholder. **Why:** that stock picture is the dated one that made the process list look rough; it carries no information a placeholder does not.
+2026-11-14 — The app icon is three rising bars, not a usage line (user's choice from the comparison sheet). **Why:** it stays crisp and recognisable at 16 pixels, where the line turned soft.

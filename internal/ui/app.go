@@ -713,6 +713,16 @@ func trimSpace(s string) string {
 	return string(b)
 }
 
+// brandIcon is the application icon at the size of the sidebar mark (32
+// design units). The window's own icon object is title-bar sized, and drawing
+// that one larger stretches a 16-pixel image.
+var brandIcon = sync.OnceValue(func() *walk.Icon {
+	if ic, err := walk.NewIconFromResourceWithSize("APP", walk.Size{Width: 32, Height: 32}); err == nil {
+		return ic
+	}
+	return nil
+})
+
 // appIcon loads the embedded application icon, or the stock one if the
 // executable was built without resources.
 func appIcon() *walk.Icon {
@@ -872,6 +882,7 @@ func (a *App) retheme() {
 	setBackground(a.mw, T.Bg)
 	rethemeChildren(a.mw)
 	recolorTables()
+	procIcons.retheme()
 	const rdwInvalidate, rdwErase, rdwAllChildren = 0x0001, 0x0004, 0x0080
 	procRedrawWindow.Call(uintptr(hwnd), 0, 0, rdwInvalidate|rdwErase|rdwAllChildren)
 }

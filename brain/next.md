@@ -1,5 +1,13 @@
 # Next
 
+## Artwork (2026-11-14)
+- [?] New app icon at eight native sizes (internal/art, tools/genicon, winres)
+- [?] Sharp sidebar logo, placeholder for icon-less programs, Meridian table check boxes
+- [?] Icon design: three rising bars (your choice over the usage line)
+- [ ] Tell Claude which other artwork still looks wrong (nav glyphs are Windows' Segoe Fluent Icons; table headers and search boxes are native)
+- [?] Release kit 0.9.12 built (unsigned): dist\release\gotm-0.9.12
+- [ ] Commit the artwork, tag v0.9.12 and publish the GitHub Release
+
 ## Meridian design (2026-11-13)
 - [?] Meridian dark palette, radii, buttons, selection and status tints across every drawn page (internal/ui)
 - [?] Contrast and radius tests (internal/ui/meridian_test.go); UI test suite passes

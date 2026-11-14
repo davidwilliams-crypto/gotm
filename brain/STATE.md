@@ -1,6 +1,16 @@
 ## Objective
 gotm is your own Windows task manager in Go: a native Win32 application (no browser, no local server) over a metrics core that reads the system directly. Built clean-room, using TMOG only as a feature-category and design inspiration.
 
+## Status (2026-11-14) — release kit 0.9.12 built from uncommitted work
+- dist\release\gotm-0.9.12\ (setup 7,751,680 B, portable 5,076,786 B, README.txt, SHA256SUMS.txt): new bars icon, placeholder, check boxes. Unsigned. Built from the working tree BEFORE the artwork was committed; not tagged, not on GitHub, installer not run. Commit, then tag v0.9.12 on that commit before publishing.
+
+## Status (2026-11-14) — new artwork (uncommitted, awaiting your OK)
+- New application icon drawn by internal/art and rendered natively at 16/20/24/32/40/48/64/256 (was a crude 256 + 16 only, so the sidebar logo was a stretched 16-pixel image). Meridian accent tile with three rising bars (the tallest white, the others in the quiet accent), bars and gaps on whole pixels at every size. The user chose this over the usage-line design on 2026-11-14.
+- In the app: sidebar logo loads the icon at its own size; programs without an icon (and those the shell gave its stock 1990s program picture) show a clean placeholder drawn at the exact row-icon size; table check boxes (Startup apps) are Meridian ones instead of white squares. All follow the palette, including high contrast.
+- Verified: icon sizes extracted from a built exe are each native; captures of Processes, Startup apps (dark and high contrast); go vet clean; internal/art and internal/ui tests pass. Not done: Installed Apps and Drivers captures taken but not opened.
+- Known flake (pre-existing, about 1 run in 3 today, same rate without these changes): internal/ui tests can panic inside walk's layout goroutine ("send on closed channel") during TestGraphCachesFollowPageAndWindowNotRedrawSuspend.
+- The first design (a usage line over a tinted area) was replaced by the bars at the user's choice.
+
 ## Status (2026-11-13) — v0.9.11 released on GitHub
 - dist\release\gotm-0.9.11\ built from a6873c3 (pushed to main): unsigned setup + portable zip, checksums verified. Tagged v0.9.11 and published as a GitHub Release (see links.md). The installer and the packaged exe have not been run.
 

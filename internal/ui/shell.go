@@ -35,7 +35,9 @@ func (a *App) paintSidebar(cv *walk.Canvas, w, h int) {
 		brandH, sectionH, gap = 46, 18, 5
 	}
 	itemH := clampI((h-brandH-2*sectionH-2*gap-8)/pgCount, 24, 40)
-	if a.mw != nil && a.mw.Icon() != nil {
+	if mark := brandIcon(); mark != nil {
+		_ = cv.DrawImageStretchedPixels(mark, rect{18, (brandH - 32) / 2, 32, 32}.wr())
+	} else if a.mw != nil && a.mw.Icon() != nil {
 		_ = cv.DrawImageStretchedPixels(a.mw.Icon(), rect{18, (brandH - 32) / 2, 32, 32}.wr())
 	}
 	drawText(cv, "gotm", uiSemibold(17), T.Text, rect{60, (brandH - 44) / 2, w - 70, 29}, taLeft)

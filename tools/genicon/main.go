@@ -1,89 +1,73 @@
-// genicon writes the gotm application icon (a rounded tile with a usage graph)
-// to winres/icon.png and winres/icon16.png. Run: go run ./tools/genicon
+// genicon writes the gotm application icon, drawn by internal/art, as one PNG
+// per icon size into winres/ (icon16.png … icon256.png). go-winres packs them
+// into the executable's icon resource, so Windows always finds an image made
+// for the size it needs (title bar, taskbar, Alt+Tab, Start, Explorer at any
+// scaling) instead of stretching another one.
+//
+//	go run ./tools/genicon                 # the icon PNGs
+//	go run ./tools/genicon -sheet out.png  # also a comparison sheet of the design
 package main
 
 import (
+	"flag"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/png"
-	"math"
 	"os"
+	"path/filepath"
+
+	"gotm/internal/art"
 )
 
-func render(size int) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, size, size))
-	s := float64(size)
-	bg := color.RGBA{0x1d, 0x4e, 0xd8, 0xff}
-	fg := color.RGBA{0xff, 0xff, 0xff, 0xff}
-	soft := color.RGBA{0xff, 0xff, 0xff, 0x55}
+// Sizes are the ones Windows asks for at 100–250 % scaling, plus 256 for the
+// large Explorer views.
+var sizes = []int{16, 20, 24, 32, 40, 48, 64, 256}
 
-	// rounded square, antialiased by 4x supersampling
-	r := s * 0.2
-	inside := func(x, y float64) bool {
-		cx := math.Min(math.Max(x, r), s-r)
-		cy := math.Min(math.Max(y, r), s-r)
-		return (x-cx)*(x-cx)+(y-cy)*(y-cy) <= r*r
-	}
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
-			n := 0
-			for sy := 0; sy < 4; sy++ {
-				for sx := 0; sx < 4; sx++ {
-					if inside(float64(x)+(float64(sx)+0.5)/4, float64(y)+(float64(sy)+0.5)/4) {
-						n++
-					}
-				}
-			}
-			if n > 0 {
-				c := bg
-				c.A = uint8(255 * n / 16)
-				img.SetRGBA(x, y, c)
-			}
-		}
-	}
-
-	// usage curve
-	pts := [][2]float64{{0.14, 0.70}, {0.30, 0.52}, {0.42, 0.62}, {0.58, 0.30}, {0.72, 0.46}, {0.86, 0.24}}
-	thick := math.Max(1.2, s*0.065)
-	line := func(a, b [2]float64, c color.RGBA, t float64) {
-		ax, ay, bx, by := a[0]*s, a[1]*s, b[0]*s, b[1]*s
-		steps := int(math.Hypot(bx-ax, by-ay)*2) + 1
-		for i := 0; i <= steps; i++ {
-			f := float64(i) / float64(steps)
-			px, py := ax+(bx-ax)*f, ay+(by-ay)*f
-			for dy := -t; dy <= t; dy++ {
-				for dx := -t; dx <= t; dx++ {
-					if dx*dx+dy*dy <= t*t {
-						ix, iy := int(px+dx), int(py+dy)
-						if ix >= 0 && iy >= 0 && ix < size && iy < size && img.RGBAAt(ix, iy).A > 0 {
-							draw.Draw(img, image.Rect(ix, iy, ix+1, iy+1), &image.Uniform{c}, image.Point{}, draw.Over)
-						}
-					}
-				}
-			}
-		}
-	}
-	// baseline hint, then the curve
-	line([2]float64{0.14, 0.82}, [2]float64{0.86, 0.82}, soft, math.Max(0.6, thick/3))
-	for i := 1; i < len(pts); i++ {
-		line(pts[i-1], pts[i], fg, thick/2)
-	}
-	return img
-}
-
-func write(path string, size int) {
+func write(path string, img image.Image) {
 	f, err := os.Create(path)
 	if err != nil {
 		panic(err)
 	}
 	defer f.Close()
-	if err := png.Encode(f, render(size)); err != nil {
+	if err := png.Encode(f, img); err != nil {
 		panic(err)
 	}
 }
 
+// sheet lays the icon out at every size on the grounds it has to work on:
+// gotm's own canvas, a light taskbar and plain white.
+func sheet(path string) {
+	grounds := []color.NRGBA{{0x07, 0x0b, 0x16, 0xff}, {0xe8, 0xed, 0xf7, 0xff}, {0xff, 0xff, 0xff, 0xff}}
+	const pad, row = 24, 256 + 24
+	w := pad
+	for _, s := range sizes {
+		w += s + pad
+	}
+	out := image.NewNRGBA(image.Rect(0, 0, w, row*len(grounds)))
+	for g, ground := range grounds {
+		draw.Draw(out, image.Rect(0, g*row, w, (g+1)*row), &image.Uniform{ground}, image.Point{}, draw.Src)
+		x := pad
+		for i := len(sizes) - 1; i >= 0; i-- {
+			s := sizes[i]
+			img := art.AppIcon(s)
+			y := g*row + (row-s)/2
+			draw.Draw(out, image.Rect(x, y, x+s, y+s), img, image.Point{}, draw.Over)
+			x += s + pad
+		}
+	}
+	write(path, out)
+}
+
 func main() {
-	write("winres/icon.png", 256)
-	write("winres/icon16.png", 16)
+	sheetPath := flag.String("sheet", "", "also write a comparison sheet to this PNG")
+	dir := flag.String("dir", "winres", "folder for the icon PNGs")
+	flag.Parse()
+	for _, s := range sizes {
+		write(filepath.Join(*dir, fmt.Sprintf("icon%d.png", s)), art.AppIcon(s))
+	}
+	if *sheetPath != "" {
+		sheet(*sheetPath)
+	}
 }

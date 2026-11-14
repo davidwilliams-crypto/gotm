@@ -4,7 +4,9 @@ package ui
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"github.com/tailscale/walk"
 	"github.com/tailscale/win"
@@ -20,10 +22,7 @@ func imageCount(h win.HIMAGELIST) int {
 
 func TestIconCacheEvictsLeastRecentlyShownAndReusesSlots(t *testing.T) {
 	runNativeTest(t, func() {
-		exe, err := os.Executable()
-		if err != nil {
-			panic(err)
-		}
+		exe := iconTestProgram()
 		c := newProcIconCache(3)
 		c.extract = func(string) win.HICON { return shellSmallIcon(exe) }
 		defer win.ImageList_Destroy(c.imageList())
@@ -96,7 +95,7 @@ func iconAlive(h win.HICON) bool {
 // must not keep their HICONs until the process exits.
 func TestIconResultsAfterWindowCloseAreDestroyed(t *testing.T) {
 	runNativeTest(t, func() {
-		exe, _ := os.Executable()
+		exe := iconTestProgram()
 		icon := func() win.HICON {
 			h := shellSmallIcon(exe)
 			if h == 0 {
@@ -154,7 +153,7 @@ func TestIconResultsAfterWindowCloseAreDestroyed(t *testing.T) {
 
 func TestIconResultsCoalesceIntoOneRepaint(t *testing.T) {
 	runNativeTest(t, func() {
-		exe, _ := os.Executable()
+		exe := iconTestProgram()
 		c := newProcIconCache(8)
 		defer win.ImageList_Destroy(c.imageList())
 		var posted []func()
@@ -174,6 +173,54 @@ func TestIconResultsCoalesceIntoOneRepaint(t *testing.T) {
 		c.deliver(iconResult{path: "w"})
 		if len(posted) != 2 {
 			t.Error("a later icon was not posted")
+		}
+	})
+}
+
+// iconTestProgram is a program that has an icon of its own. (The test binary
+// has none: the shell gives it the stock program picture, which gotm replaces
+// with its placeholder.)
+func iconTestProgram() string {
+	return filepath.Join(os.Getenv("SystemRoot"), "explorer.exe")
+}
+
+// A program without its own icon keeps slot 0, gotm's placeholder, instead of
+// the shell's stock program picture.
+func TestProgramWithoutIconGetsPlaceholder(t *testing.T) {
+	runNativeTest(t, func() {
+		exe, err := os.Executable()
+		if err != nil {
+			panic(err)
+		}
+		if genericExeIndex() < 0 {
+			t.Skip("the shell reports no stock program icon")
+		}
+		if h := shellSmallIcon(exe); h != 0 {
+			win.DestroyIcon(h)
+			t.Error("the test binary has no icon, yet a shell icon was returned for it")
+		}
+		if h := shellSmallIcon(iconTestProgram()); h == 0 {
+			t.Error("explorer.exe has its own icon, yet none was returned")
+		} else {
+			win.DestroyIcon(h)
+		}
+	})
+}
+
+// The placeholder and the check boxes are 32-bit bitmaps of the size asked.
+func TestArtBitmaps(t *testing.T) {
+	runNativeTest(t, func() {
+		for _, size := range []int{16, 20, 24, 32} {
+			hbm := genericAppBitmap(size, size)
+			if hbm == 0 {
+				t.Fatalf("no placeholder bitmap at %d", size)
+			}
+			var bm win.BITMAP
+			win.GetObject(win.HGDIOBJ(hbm), unsafe.Sizeof(bm), unsafe.Pointer(&bm))
+			win.DeleteObject(win.HGDIOBJ(hbm))
+			if int(bm.BmWidth) != size || int(bm.BmHeight) != size || bm.BmBitsPixel != 32 {
+				t.Errorf("placeholder at %d: %dx%d, %d bpp", size, bm.BmWidth, bm.BmHeight, bm.BmBitsPixel)
+			}
 		}
 	})
 }

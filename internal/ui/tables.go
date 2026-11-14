@@ -128,6 +128,7 @@ func colorTable(tv *walk.TableView) {
 		win.SendMessage(lv, win.LVM_SETBKCOLOR, 0, colorref(T.TableBG))
 		win.SendMessage(lv, win.LVM_SETTEXTBKCOLOR, 0, colorref(T.TableBG))
 		win.SendMessage(lv, win.LVM_SETTEXTCOLOR, 0, colorref(T.Text))
+		styleChecks(lv)
 		// Rows repaint only when their content changes, so a new palette must
 		// repaint the whole list once.
 		win.InvalidateRect(lv, nil, true)
