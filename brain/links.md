@@ -4,5 +4,5 @@
 - [Azure Trusted Signing](https://azure.microsoft.com/products/trusted-signing) — the code-signing service build.ps1 -TrustedSigning uses; setup in docs/SIGNING.md
 - [Trusted Signing quickstart](https://learn.microsoft.com/en-us/azure/trusted-signing/quickstart) — Microsoft's portal steps (account, identity validation, certificate profile, roles)
 - [gotm on GitHub](https://github.com/davidwilliams-crypto/gotm) — public source repository (main branch); dist/, third_party/ and the signing client stay local
-- [gotm releases](https://github.com/davidwilliams-crypto/gotm/releases) — downloadable installer, portable zip and checksums per version (latest: v0.9.11)
+- [gotm releases](https://github.com/davidwilliams-crypto/gotm/releases) — downloadable installer, portable zip and checksums per version (latest: v0.9.12)
 - [Meridian Design System](https://claude.ai/artifact/PqWyPG4LE2KZp48hyx2j4s) — the design system gotm's UI follows (tokens, type, component rules)

@@ -6,7 +6,8 @@
 - [?] Icon design: three rising bars (your choice over the usage line)
 - [ ] Tell Claude which other artwork still looks wrong (nav glyphs are Windows' Segoe Fluent Icons; table headers and search boxes are native)
 - [?] Release kit 0.9.12 built (unsigned): dist\release\gotm-0.9.12
-- [ ] Commit the artwork, tag v0.9.12 and publish the GitHub Release
+- [?] Artwork committed (49dd215), v0.9.12 tagged and published
+- [ ] Run gotm-0.9.12-setup.exe once (install, open, uninstall)
 
 ## Meridian design (2026-11-13)
 - [?] Meridian dark palette, radii, buttons, selection and status tints across every drawn page (internal/ui)
