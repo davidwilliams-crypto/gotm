@@ -12,48 +12,95 @@ import (
 	"github.com/tailscale/win"
 )
 
-// palette holds every colour gotm paints with. Channel colours identify a
-// resource on every page (a card, its graph and its legend always share one
-// hue). There are two palettes: gotm's own dark theme, and one built from the
+// palette holds every colour gotm paints with. The values are the dark theme
+// of the Meridian design system; each field names the Meridian token it
+// carries. There are two palettes: Meridian dark, and one built from the
 // system colours while Windows' high-contrast mode is on.
+//
+// The resource channel colours are gotm's own extension: Meridian has a single
+// accent, but a card, its graph and its legend must share one hue per resource
+// and the recorder plots several series at once. CPU, the lead resource, takes
+// the accent; the others are calm hues of similar lightness.
 type palette struct {
-	Bg, Side, Card, CardHi, CardSel, Stroke, Grid walk.Color
-	Text, Muted, Faint, Accent, AccentText        walk.Color
-	Good, Warn, Bad                               walk.Color
-	CPU, Mem, GPU, Disk, Net, Power, Thermal      walk.Color
-	Clock                                         walk.Color // a calm sky blue: clocks are information, not a warning
-	RowAlt, RowSel, RowSelText, TableBG           walk.Color
+	Bg, Side                                 walk.Color // canvas: the page ground and the sidebar
+	Card                                     walk.Color // surface: every card and control ground
+	Sunken                                   walk.Color // surface-sunken: inset tracks, unselected segments
+	CardHi                                   walk.Color // hover on a surface (an app token: ink at 6% over surface)
+	Tint                                     walk.Color // surface-tint: selected rows and cards, progress tracks
+	Edge                                     walk.Color // shadow-card in dark: the faint outline of a resting card
+	Line                                     walk.Color // border: decorative hairlines only
+	Stroke                                   walk.Color // border-strong: control outlines that must be seen
+	Grid                                     walk.Color // graph grid lines (border)
+	Text, Muted                              walk.Color // ink, ink-muted
+	Disabled                                 walk.Color // ink-muted at 45% over surface
+	Accent                                   walk.Color // accent: fills only
+	AccentHover                              walk.Color // accent-hover
+	OnAccent                                 walk.Color // on-accent: text and icons on an accent fill
+	AccentInk                                walk.Color // accent-text: accent-coloured text and glyphs
+	Focus                                    walk.Color // focus: the keyboard focus ring
+	Good, Warn, Bad                          walk.Color // success, warning, danger
+	GoodTint, WarnTint, BadTint              walk.Color // their badge grounds
+	CPU, Mem, GPU, Disk, Net, Power, Thermal walk.Color
+	Clock                                    walk.Color // a calm sky blue: clocks are information, not a warning
+	RowAlt, RowSel, RowSelText, TableBG      walk.Color
 }
 
-var darkPalette = palette{
-	Bg:         walk.RGB(0x18, 0x1A, 0x1D),
-	Side:       walk.RGB(0x10, 0x12, 0x14),
-	Card:       walk.RGB(0x20, 0x23, 0x27),
-	CardHi:     walk.RGB(0x29, 0x2E, 0x34),
-	CardSel:    walk.RGB(0x22, 0x36, 0x4B),
-	Stroke:     walk.RGB(0x36, 0x3B, 0x42),
-	Grid:       walk.RGB(0x32, 0x38, 0x3E),
-	Text:       walk.RGB(0xF0, 0xF2, 0xF4),
-	Muted:      walk.RGB(0xBA, 0xC1, 0xC9),
-	Faint:      walk.RGB(0x96, 0x9F, 0xA9),
-	Accent:     walk.RGB(0x82, 0xB7, 0xFF),
-	AccentText: walk.RGB(0x10, 0x18, 0x21),
-	Good:       walk.RGB(0x77, 0xCE, 0xA0),
-	Warn:       walk.RGB(0xF2, 0xBF, 0x70),
-	Bad:        walk.RGB(0xFF, 0x92, 0x94),
-	CPU:        walk.RGB(0x83, 0xB5, 0xFF),
-	Mem:        walk.RGB(0xC4, 0x9C, 0xF0),
-	GPU:        walk.RGB(0x6A, 0xD5, 0xC5),
-	Disk:       walk.RGB(0x80, 0xCA, 0x94),
-	Net:        walk.RGB(0xE5, 0xBB, 0x83),
-	Power:      walk.RGB(0xE9, 0xCF, 0x86),
-	Thermal:    walk.RGB(0xED, 0xA7, 0x85),
-	Clock:      walk.RGB(0x93, 0xCD, 0xE4),
-	RowAlt:     walk.RGB(0x1D, 0x20, 0x24),
-	RowSel:     walk.RGB(0x31, 0x4F, 0x70),
-	RowSelText: walk.RGB(0xFF, 0xFF, 0xFF),
-	TableBG:    walk.RGB(0x19, 0x1B, 0x1E),
+func hex(v uint32) walk.Color { return walk.RGB(byte(v>>16), byte(v>>8), byte(v)) }
+
+var darkPalette = meridianDark()
+
+func meridianDark() palette {
+	canvas, surface := hex(0x070b16), hex(0x10172a)
+	ink, muted, accent := hex(0xeef2fb), hex(0x9aa6c1), hex(0x7da2ff)
+	tint := hex(0x1a2c5e)
+	return palette{
+		Bg:          canvas,
+		Side:        canvas,
+		Card:        surface,
+		Sunken:      hex(0x0a101f),
+		CardHi:      blend(ink, surface, 0.06),
+		Tint:        tint,
+		Edge:        blend(hex(0xffffff), surface, 0.05),
+		Line:        hex(0x222b45),
+		Stroke:      hex(0x66749a),
+		Grid:        hex(0x222b45),
+		Text:        ink,
+		Muted:       muted,
+		Disabled:    blend(muted, surface, 0.45),
+		Accent:      accent,
+		AccentHover: hex(0x9bb8ff),
+		OnAccent:    hex(0x06102b),
+		AccentInk:   hex(0x9bb8ff),
+		Focus:       hex(0x9bb8ff),
+		Good:        hex(0x4fd1a5),
+		Warn:        hex(0xf2b84b),
+		Bad:         hex(0xff8a73),
+		GoodTint:    hex(0x0f2f29),
+		WarnTint:    hex(0x33270d),
+		BadTint:     hex(0x3a1712),
+		CPU:         accent,
+		Mem:         hex(0xc49cf0),
+		GPU:         hex(0x6ad5c5),
+		Disk:        hex(0x80ca94),
+		Net:         hex(0xe5bb83),
+		Power:       hex(0xe9cf86),
+		Thermal:     hex(0xeda785),
+		Clock:       hex(0x93cde4),
+		RowAlt:      surface, // Meridian tables have no zebra stripes
+		RowSel:      tint,
+		RowSelText:  ink,
+		TableBG:     surface,
+	}
 }
+
+// Meridian radii, in design units. fillRound and strokeRound cap a radius at
+// half the shape's shorter side, so rFull always gives a pill.
+const (
+	rSm   = 8   // radius-sm: chips, segments, small buttons
+	rMd   = 12  // radius-md: buttons, inputs, list rows
+	rLg   = 20  // radius-lg: cards
+	rFull = 999 // radius-full: badges, toggles, progress bars
+)
 
 // T is the palette in use. Everything reads it at paint time, so swapping it
 // and repainting is enough to re-theme the owner-drawn surfaces.
@@ -144,11 +191,13 @@ func highContrastPalette() palette {
 		return c
 	}
 	p := darkPalette
-	p.Bg, p.Side, p.Card = bg, side, bg
-	p.CardHi, p.CardSel = blend(hi, bg, 0.22), blend(hi, bg, 0.45)
-	p.Stroke, p.Grid = txt, gray
-	p.Text, p.Muted, p.Faint = txt, txt, gray
-	p.Accent, p.AccentText = hi, hiT
+	p.Bg, p.Side, p.Card, p.Sunken = bg, side, bg, bg
+	p.CardHi, p.Tint = blend(hi, bg, 0.22), blend(hi, bg, 0.45)
+	p.Edge, p.Line, p.Stroke, p.Grid = txt, txt, txt, gray
+	p.Text, p.Muted, p.Disabled = txt, txt, gray
+	p.Accent, p.AccentHover, p.OnAccent = hi, hi, hiT
+	p.AccentInk, p.Focus = txt, hi
+	p.GoodTint, p.WarnTint, p.BadTint = bg, bg, bg
 	p.Good, p.Warn, p.Bad = vivid(darkPalette.Good), vivid(darkPalette.Warn), vivid(darkPalette.Bad)
 	p.CPU, p.Mem, p.GPU = vivid(darkPalette.CPU), vivid(darkPalette.Mem), vivid(darkPalette.GPU)
 	p.Disk, p.Net = vivid(darkPalette.Disk), vivid(darkPalette.Net)
@@ -189,8 +238,6 @@ var (
 	fontCache = map[fontKey]*walk.Font{}
 )
 
-const uiFamily = "Segoe UI"
-
 func fontOf(family string, pt int, style walk.FontStyle) *walk.Font {
 	k := fontKey{family, pt, style}
 	fontMu.Lock()
@@ -200,16 +247,14 @@ func fontOf(family string, pt int, style walk.FontStyle) *walk.Font {
 	}
 	f, err := walk.NewFont(family, pt, style)
 	if err != nil {
-		f, _ = walk.NewFont(uiFamily, pt, style)
+		f, _ = walk.NewFont("Segoe UI", pt, style)
 	}
 	fontCache[k] = f
 	return f
 }
 
-func uiFont(pt int) *walk.Font     { return fontOf(uiFamily, pt, 0) }
-func uiSemibold(pt int) *walk.Font { return fontOf("Segoe UI Semibold", pt, 0) }
-func uiBold(pt int) *walk.Font     { return fontOf(uiFamily, pt, walk.FontBold) }
-func uiLight(pt int) *walk.Font    { return fontOf("Segoe UI Light", pt, 0) }
+func uiFont(pt int) *walk.Font     { return fontOf(uiFamily(), pt, 0) }
+func uiSemibold(pt int) *walk.Font { return fontOf(uiStrongFamily(), pt, 0) }
 func iconFont(pt int) *walk.Font   { return fontOf(iconFamily(), pt, 0) }
 func monoFont(pt int) *walk.Font   { return fontOf("Cascadia Mono", pt, 0) }
 

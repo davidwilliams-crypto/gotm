@@ -153,7 +153,7 @@ func (t *settingsTab) tick(*metrics.Snapshot) {
 // ryzenStatus is the AMD Monitoring SDK status line and its colour.
 func (t *settingsTab) ryzenStatus() (string, walk.Color) {
 	rz := t.app.sensors.Ryzen()
-	status, ink := "Off", T.Faint
+	status, ink := "Off", T.Muted
 	if t.app.ryzenOn && rz == nil {
 		status = "On for this PC; it runs when gotm is started as administrator."
 	}
@@ -195,26 +195,29 @@ func (t *settingsTab) drawChoice(cv *walk.Canvas, r rect, label string, on bool,
 	if r.Y+r.H <= 0 || r.Y >= t.viewH {
 		return
 	}
-	fill, ink, edge := T.CardHi, T.Muted, T.Stroke
+	fill, ink, edge := T.Sunken, T.Muted, T.Sunken
+	if highContrast {
+		edge = T.Stroke // no fill difference to rely on: outline every chip
+	}
 	if on {
-		fill, ink, edge = T.CardSel, T.Text, T.Accent
+		fill, ink, edge = T.Tint, T.AccentInk, T.Tint
 		if highContrast {
 			fill, ink, edge = T.RowSel, T.RowSelText, T.RowSel
 		}
 	} else if id != "" && t.v.hover == id {
-		ink, edge = T.Text, T.Muted
+		ink, edge = T.Text, T.Stroke
 	}
-	fillRound(cv, r, 5, fill)
-	strokeRound(cv, r, 5, edge)
-	drawText(cv, label, uiFont(9), ink, r, taCenter)
+	fillRound(cv, r, rSm, fill)
+	strokeRound(cv, r, rSm, edge)
+	drawText(cv, label, uiSemibold(9), ink, r, taCenter)
 }
 
 func (t *settingsTab) section(cv *walk.Canvas, y int, w int, title string, height int) int {
 	r := rect{24, y, w - 48, height}
 	titleArea := rect{r.X + 20, r.Y + 12, r.W - 40, 24}
 	if r.Y+r.H > 0 && r.Y < t.viewH {
-		fillRound(cv, r, 8, T.Card)
-		strokeRound(cv, r, 8, T.Stroke)
+		fillRound(cv, r, rLg, T.Card)
+		strokeRound(cv, r, rLg, T.Edge)
 		drawText(cv, title, uiSemibold(12), T.Text, titleArea, taLeft)
 	}
 	t.v.addText(titleArea, title)
@@ -320,9 +323,9 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 		// "Replace Task Manager / Off", which would flip once the query answers.
 		r := rect{44, top + 48, 300, 30}
 		if r.Y+r.H > 0 && r.Y < t.viewH {
-			fillRound(cv, r, 5, T.Card)
-			strokeRound(cv, r, 5, T.Stroke)
-			drawText(cv, label, uiFont(9), T.Faint, r, taCenter)
+			fillRound(cv, r, rSm, T.Sunken)
+			strokeRound(cv, r, rSm, T.Line)
+			drawText(cv, label, uiFont(9), T.Disabled, r, taCenter)
 		}
 		t.v.addText(r, "Windows Task Manager replacement: "+label)
 	} else {
@@ -350,7 +353,7 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 	y = t.section(cv, y, w, "Keyboard shortcuts", 52+len(shortcutHelp)*24)
 	for i, k := range shortcutHelp {
 		ky := top + 48 + i*24
-		drawText(cv, k[0], uiBold(9), T.Text, rect{44, ky, 220, 22}, taLeft)
+		drawText(cv, k[0], uiSemibold(9), T.Text, rect{44, ky, 220, 22}, taLeft)
 		drawText(cv, k[1], uiFont(9), T.Muted, rect{270, ky, w - 330, 22}, taLeft)
 		t.v.addText(rect{44, ky, w - 104, 22}, k[0]+": "+k[1])
 	}
@@ -367,9 +370,9 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 		if t.v.hover == id {
 			fill = T.CardHi
 		}
-		fillRound(cv, r, 8, fill)
-		strokeRound(cv, r, 8, T.Stroke)
-		drawText(cv, label, uiFont(10), c, r, taCenter)
+		fillRound(cv, r, rMd, fill)
+		strokeRound(cv, r, rMd, T.Stroke)
+		drawText(cv, label, uiSemibold(10), c, r, taCenter)
 		t.v.addItem(r, id, label, ctlButton, false)
 		ax += 202
 	}
@@ -380,7 +383,7 @@ func (t *settingsTab) paint(cv *walk.Canvas, w, h int) {
 	btn("Quit gotm", "quit", T.Bad)
 
 	t.note(cv, fmt.Sprintf("gotm %s  ·  %s", t.app.version, strings.TrimSpace(t.app.store.File("config.json"))),
-		uiFont(8), T.Faint, rect{24, y + 52, w - 48, 20})
+		uiFont(8), T.Muted, rect{24, y + 52, w - 48, 20})
 
 	t.content = y + t.scroll + 52 + 20 + 16
 	t.scrollBy(0)
@@ -410,10 +413,10 @@ func (t *settingsTab) stepper(cv *walk.Canvas, x, y int, value, id, what string)
 	}{{minus, "−", id + ":-", "Lower " + what + " (" + value + ")"}, {plus, "+", id + ":+", "Raise " + what + " (" + value + ")"}} {
 		fill := T.CardHi
 		if t.v.hover == b.i {
-			fill = T.CardSel
+			fill = T.Tint
 		}
-		fillRound(cv, b.r, 8, fill)
-		drawText(cv, b.s, uiBold(12), T.Text, b.r, taCenter)
+		fillRound(cv, b.r, rSm, fill)
+		drawText(cv, b.s, uiSemibold(12), T.Text, b.r, taCenter)
 		t.v.addItem(b.r, b.i, b.name, ctlButton, false)
 	}
 	drawText(cv, value, uiFont(10), T.Text, rect{x + 30, y, 70, 30}, taCenter)

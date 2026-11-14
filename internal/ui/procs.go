@@ -249,7 +249,7 @@ func (m *procModel) cellColors(row, col, selected int) (bg, fg walk.Color) {
 				if a > 1 {
 					a = 1
 				}
-				bg = blend(T.Warn, bg, 0.05+0.30*a)
+				bg = blend(T.Accent, bg, 0.05+0.30*a)
 			}
 		}
 		if m.cols[col].key == "cpu" && m.rows[row].CPU >= 50 {

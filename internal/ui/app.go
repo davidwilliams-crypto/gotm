@@ -228,7 +228,7 @@ func Run(version string, store *config.Store, sampler *metrics.Sampler) error {
 	err := decl.MainWindow{
 		AssignTo:   &a.mw,
 		Title:      a.windowTitle(),
-		Font:       decl.Font{Family: uiFamily, PointSize: 10},
+		Font:       decl.Font{Family: uiFamily(), PointSize: 10},
 		Icon:       icon,
 		Background: decl.SolidColorBrush{Color: T.Bg},
 		MinSize:    a.minSize(),

@@ -256,11 +256,11 @@ func newConnsPage(a *App) *connsPage {
 		case col == 3 && text == "Established":
 			return T.Good, true
 		case col == 3 && text == "Listen":
-			return T.Accent, true
+			return T.AccentInk, true
 		case col == 6 && text == "Network":
 			return T.Warn, true
 		case col == 6 && text == "Local only":
-			return T.Faint, true
+			return T.Muted, true
 		}
 		return T.Text, false
 	}
@@ -528,7 +528,7 @@ func newDriversPage(a *App) *driversPage {
 			return T.Good, true
 		}
 		if col == 2 {
-			return T.Faint, true
+			return T.Muted, true
 		}
 		return T.Text, false
 	}

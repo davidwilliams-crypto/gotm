@@ -84,7 +84,7 @@ var styledTables []*walk.TableView
 // double buffering, which is what stops rows blinking when values refresh.
 func styleTable(tv *walk.TableView) {
 	font := tv.Font()
-	if font == nil || font.Family() != uiFamily || font.PointSize() != 10 || font.Style() != 0 {
+	if font == nil || font.Family() != uiFamily() || font.PointSize() != 10 || font.Style() != 0 {
 		tv.SetFont(uiFont(10))
 	}
 	for _, lv := range listViews(tv) {

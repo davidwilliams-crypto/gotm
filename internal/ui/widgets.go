@@ -128,8 +128,8 @@ func (v *canvasView) paint(cv *walk.Canvas, _ walk.Rectangle) error {
 		v.keyHit = focused.id
 		r := focused.r
 		focusRect := rect{int(float64(r.X) / gs), int(float64(r.Y) / gs), int(float64(r.W) / gs), int(float64(r.H) / gs)}
-		strokeRound(cv, focusRect.inset(1), 5, T.Accent)
-		strokeRound(cv, focusRect.inset(2), 4, v.background())
+		strokeRound(cv, focusRect.inset(1), rSm, T.Focus)
+		strokeRound(cv, focusRect.inset(2), rSm-1, v.background())
 	}
 	if v.acc {
 		v.ensureUIA()
@@ -452,42 +452,55 @@ func (b *button) accessibleName() string {
 
 func (b *button) draw(cv *walk.Canvas, w, h int) {
 	r := rect{1, 2, w - 2, h - 4}
-	fill, stroke, ink := T.Card, T.Stroke, T.Text
+	// Meridian buttons: the default is a ghost (border-strong outline on the
+	// ground it sits on), an accent button is the filled primary, a switched-on
+	// toggle is the tinted secondary, and a destructive one sits on danger-tint.
+	ground := b.v.background()
+	fill, stroke, ink, ring := ground, T.Stroke, T.Text, T.Focus
 	pressed, hovered := b.v.down == "b" && (!b.v.left || b.v.hover == "b"), b.v.hover == "b"
 	switch {
 	case !b.enabled:
-		ink, fill = T.Faint, T.Bg
+		fill, stroke = T.Sunken, T.Line // a disabled control sits on surface-sunken
+		ink = blend(T.Muted, fill, 0.45)
+		if highContrast {
+			ink = T.Disabled // the system's own disabled-text colour
+		}
 	case highContrast:
 		if b.active || b.accent || pressed || hovered {
-			fill, ink = T.Accent, T.AccentText
+			fill, ink, ring = T.Accent, T.OnAccent, T.OnAccent
 		}
 		stroke = T.Text
 	case b.danger:
-		ink, stroke, fill = T.Bad, blend(T.Bad, T.Card, 0.4), blend(T.Bad, T.Card, 0.08)
+		ink, fill = T.Bad, T.BadTint
 		if pressed {
-			fill = blend(T.Bad, T.Card, 0.34)
+			fill = blend(T.Bad, T.BadTint, 0.24)
 		} else if hovered {
-			fill = blend(T.Bad, T.Card, 0.20)
+			fill = blend(T.Bad, T.BadTint, 0.12)
 		}
-	case b.accent || b.active:
-		fill, stroke = T.RowSel, T.Accent
+		stroke = fill
+	case b.accent:
+		fill, ink, ring = T.Accent, T.OnAccent, T.OnAccent
+		if pressed || hovered {
+			fill = T.AccentHover
+		}
+		stroke = fill
+	case b.active:
+		fill, ink = T.Tint, T.AccentInk
 		if pressed {
-			fill = blend(T.Accent, T.RowSel, 0.28)
+			fill, ink = blend(T.Accent, T.Tint, 0.28), T.Text
 		} else if hovered {
-			fill = blend(T.Accent, T.RowSel, 0.14)
+			fill, ink = blend(T.Accent, T.Tint, 0.14), T.Text
 		}
+		stroke = fill
 	case pressed:
-		fill, stroke = T.CardSel, T.Accent
+		fill = T.Tint
 	case hovered:
-		fill, stroke = T.CardHi, T.Faint
+		fill = T.CardHi
 	}
-	fillRound(cv, r, 5, fill)
-	strokeRound(cv, r, 5, stroke)
-	if b.enabled && b.toggle && b.active {
-		fillRound(cv, rect{w/2 - 7, h - 6, 14, 2}, 1, ink)
-	}
+	fillRound(cv, r, rSm, fill)
+	strokeRound(cv, r, rSm, stroke)
 	if b.enabled && b.v.cw != nil && b.v.cw.Focused() {
-		strokeRound(cv, r.inset(2), 4, ink)
+		strokeRound(cv, r.inset(2), rSm-2, ring)
 	}
 	if b.enabled {
 		b.v.addHit(rect{0, 0, w, h}, "b")
@@ -495,29 +508,30 @@ func (b *button) draw(cv *walk.Canvas, w, h int) {
 	if pressed {
 		r.Y++ // a tactile cue also when Windows controls both colours
 	}
+	font := uiSemibold(10) // body-strong: every button label
 	if b.glyphRight {
-		drawText(cv, b.text, uiFont(10), ink, rect{8, r.Y, w - 30, r.H}, taLeft)
+		drawText(cv, b.text, font, ink, rect{8, r.Y, w - 30, r.H}, taLeft)
 		drawText(cv, b.glyph, iconFont(8), ink, rect{w - 23, r.Y, 16, r.H}, taCenter)
 		return
 	}
 	if b.glyph == "" {
-		drawText(cv, b.text, uiFont(10), ink, r.inset(2), taCenter)
+		drawText(cv, b.text, font, ink, r.inset(2), taCenter)
 		return
 	}
 	if b.text == "" {
 		drawText(cv, b.glyph, iconFont(11), ink, r, taCenter)
 		return
 	}
-	labelWidth := textWidth(cv, b.text, uiFont(10))
+	labelWidth := textWidth(cv, b.text, font)
 	switch {
 	case w < labelWidth+12:
 		drawText(cv, b.glyph, iconFont(11), ink, r, taCenter)
 	case w < labelWidth+36:
-		drawText(cv, b.text, uiFont(10), ink, r, taCenter)
+		drawText(cv, b.text, font, ink, r, taCenter)
 	default:
 		x := (w - labelWidth - 22) / 2
 		drawText(cv, b.glyph, iconFont(10), ink, rect{x, r.Y, 17, r.H}, taCenter)
-		drawText(cv, b.text, uiFont(10), ink, rect{x + 22, r.Y, w - x - 25, r.H}, taLeft)
+		drawText(cv, b.text, font, ink, rect{x + 22, r.Y, w - x - 25, r.H}, taLeft)
 	}
 }
 

@@ -140,7 +140,8 @@ Verified by sampling the window ~75 times a second for 8 s per page: the visible
 | `internal/config` | `%APPDATA%\gotm\config.json` |
 | `winres/`, `tools/genicon` | icon, version info, manifest → `rsrc_windows_amd64.syso` |
 | `tools/setup` | installer/uninstaller (Go, no third-party tool): embeds gotm.exe, installs to Program Files for all users, Start menu shortcut, Apps & features entry |
-| `tools/notices` | writes THIRD-PARTY-NOTICES.txt from the modules linked into gotm.exe |
+| `tools/notices` | writes THIRD-PARTY-NOTICES.txt from the modules linked into gotm.exe, plus the bundled Geist font licence |
+| `tools/fonts` | `tabular.py` prepares the embedded Geist fonts (see `internal/ui/fonts/README.md`) |
 | `tools/elevated-check.ps1` | runs the administrator-only self-tests (`internal/metrics/elevated_test.go`: service control, ending a SYSTEM process, the AMD SDK) through one UAC prompt |
 | `docs/README-user.txt` | the README.txt shipped to end users |
 | `docs/FEATURES.md` | feature spec and status |

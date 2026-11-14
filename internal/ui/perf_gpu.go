@@ -187,7 +187,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 	y := top
 	area := rect{x0, y, dw, engH}
 	if available {
-		drawText(cv, "Utilization", uiBold(9), T.Muted, rect{x0, y, dw - 178, 24}, taLeft)
+		drawText(cv, "Utilization", uiSemibold(9), T.Muted, rect{x0, y, dw - 178, 24}, taLeft)
 		if len(g.Engines) > 0 {
 			ov := rect{x0 + dw - 170, y, 80, 24}
 			en := rect{x0 + dw - 86, y, 86, 24}
@@ -196,12 +196,17 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 				text, id string
 				on       bool
 			}{{ov, "Overall", "gpuview:overall", p.gpuOver}, {en, "Engines", "gpuview:engines", !p.gpuOver}} {
-				fill := T.CardHi
+				fill, ink := T.Sunken, T.Muted
 				if c.on {
-					fill = blend(T.Accent, T.Card, 0.45)
+					fill, ink = T.Accent, T.OnAccent
+				} else if highContrast {
+					ink = T.Text
 				}
-				fillRound(cv, c.r, 12, fill)
-				drawText(cv, c.text, uiFont(9), T.Text, c.r, taCenter)
+				fillRound(cv, c.r, rSm, fill)
+				if highContrast && !c.on {
+					strokeRound(cv, c.r, rSm, T.Stroke)
+				}
+				drawText(cv, c.text, uiSemibold(9), ink, c.r, taCenter)
 				v.addItem(c.r, c.id, c.text+" graph", ctlRadioButton, c.on)
 			}
 		}
@@ -212,8 +217,8 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 	case area.Y+area.H <= visibleTop:
 		// Scrolled out of view.
 	case !available:
-		fillRound(cv, area, 8, T.Card)
-		strokeRound(cv, area, 8, T.Stroke)
+		fillRound(cv, area, rLg, T.Card)
+		strokeRound(cv, area, rLg, T.Edge)
 		drawText(cv, "Utilization unavailable", uiFont(10), T.Muted, area.inset(10), taLeft)
 		v.addText(area, "Utilization unavailable")
 	case p.gpuOver || len(g.Engines) == 0:
@@ -228,7 +233,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 				continue
 			}
 			cr := rect{cx, cy, cw, cellH}
-			fillRound(cv, cr, 8, T.Card)
+			fillRound(cv, cr, rMd, T.Card)
 			name := e.Name
 			vals, ver := p.gpuCurve(serGPUEng, g.ID, name, func(h *metrics.GPUHist) float64 {
 				v, ok := h.Eng[name]
@@ -240,7 +245,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 			plotSeries(cv, rect{cr.X + 4, cr.Y + 4, cr.W - 8, cr.H - 8},
 				[]series{{vals: vals, ver: ver, color: heatColorGPU(e.Pct), fill: true}},
 				graphStyle{bg: T.Card, max: 100, capacity: p.capacity(), lineW: 2})
-			strokeRound(cv, cr, 8, T.Stroke)
+			strokeRound(cv, cr, rMd, T.Edge)
 			drawText(cv, name, uiFont(8), T.Muted, rect{cr.X + 8, cr.Y + 3, cr.W - 50, 16}, taLeft)
 			pt := "0%"
 			if e.Pct >= 0.05 {
@@ -269,7 +274,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 		if cr.Y+cr.H <= visibleTop || cr.Y >= h {
 			continue
 		}
-		fillRound(cv, cr, 8, T.Card)
+		fillRound(cv, cr, rSm, T.Card) // a graph tile: the plot reaches the corners
 		col := T.GPU
 		if m.colorIsMem {
 			col = T.Mem
@@ -293,7 +298,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 		plotSeries(cv, rect{cr.X + 4, plotY, cr.W - 8, cr.Y + cr.H - plotY - 4},
 			[]series{{vals: vals, ver: ver, color: col, fill: true}},
 			graphStyle{bg: T.Card, max: float64(m.tot), capacity: p.capacity(), grid: true, lineW: 2})
-		strokeRound(cv, cr, 8, T.Stroke)
+		strokeRound(cv, cr, rSm, T.Edge)
 		drawText(cv, m.title, uiFont(8), T.Muted, label, taLeft)
 		drawText(cv, caption, uiFont(9), T.Text, valueRect, align)
 		v.addText(cr, m.title+": "+caption)
@@ -315,7 +320,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 	p.gpuRows, p.gpuProcs = procRows, len(g.Procs)
 	p.clampGPUScroll()
 	hdr := rect{x0, y, dw, 26}
-	fillRound(cv, hdr, 6, T.Card)
+	fillRound(cv, hdr, rSm, T.Card)
 	title := "Processes"
 	if len(g.Procs) > procRows {
 		end := p.gpuScroll + procRows
@@ -324,7 +329,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 		}
 		title += fmt.Sprintf("  %d–%d/%d", p.gpuScroll+1, end, len(g.Procs))
 	}
-	drawText(cv, title, uiBold(9), T.Text, rect{hdr.X + 8, hdr.Y + 4, dw*36/100 - 12, 18}, taLeft)
+	drawText(cv, title, uiSemibold(9), T.Text, rect{hdr.X + 8, hdr.Y + 4, dw*36/100 - 12, 18}, taLeft)
 	v.addText(hdr, "Memory and engine use by process. "+title)
 	colName, colPID, colDed, colShr, colPct := x0+8, x0+dw*36/100, x0+dw*49/100, x0+dw*69/100, x0+dw*87/100
 	for _, c := range []struct {
@@ -335,7 +340,7 @@ func (p *perfPage) paintGPUBody(cv *walk.Canvas, cur resItem, x0, dw, top, h int
 	}
 	ry := y + 30
 	if len(g.Procs) == 0 {
-		drawText(cv, "No per-process GPU activity reported.", uiFont(9), T.Faint, rect{colName, ry + 2, dw - 16, 18}, taLeft)
+		drawText(cv, "No per-process GPU activity reported.", uiFont(9), T.Muted, rect{colName, ry + 2, dw - 16, 18}, taLeft)
 		v.addText(rect{colName, ry + 2, dw - 16, 18}, "No per-process GPU activity reported.")
 		return
 	}

@@ -121,7 +121,7 @@ try {
     Invoke-Sign 'dist\gotm.exe'
     Write-Host "built dist\gotm.exe ($Version)"
 
-    Invoke-Native 'go' @('run','./tools/notices','-o','dist\THIRD-PARTY-NOTICES.txt','.')
+    Invoke-Native 'go' @('run','./tools/notices','-o','dist\THIRD-PARTY-NOTICES.txt','-extra','Geist typeface 1.9.2, tabular figures made the default (SIL Open Font License 1.1)|https://github.com/vercel/geist-font|internal/ui/fonts/OFL.txt','.')
     Copy-Item -LiteralPath 'docs\README-user.txt' -Destination 'dist\README.txt' -Force
 
     # The installer embeds gotm.exe, the README and the notices, zipped.

@@ -103,11 +103,17 @@ func fillRectPixels(hdc win.HDC, w walk.Rectangle, c walk.Color) {
 	win.FillRect(hdc, &rc, win.HBRUSH(dcBrush(hdc, c)))
 }
 
+// capRadius keeps a corner radius within half the shape's shorter side, so a
+// Meridian radius never exceeds what the shape can hold and rFull gives a pill.
+func capRadius(r rect, radius int) int {
+	return max(0, min(radius, min(r.W, r.H)/2))
+}
+
 func fillRound(cv *walk.Canvas, r rect, radius int, c walk.Color) {
 	if r.W <= 0 || r.H <= 0 {
 		return
 	}
-	hdc, w, e := cv.HDC(), r.wr(), int32(sc(radius)*2)
+	hdc, w, e := cv.HDC(), r.wr(), int32(sc(capRadius(r, radius))*2)
 	oldBrush := win.SelectObject(hdc, dcBrush(hdc, c))
 	oldPen := win.SelectObject(hdc, win.GetStockObject(win.NULL_PEN))
 	// A null pen leaves the right and bottom edge unpainted: extend by one
@@ -121,7 +127,7 @@ func strokeRound(cv *walk.Canvas, r rect, radius int, c walk.Color) {
 	if r.W <= 1 || r.H <= 1 {
 		return
 	}
-	hdc, w, e := cv.HDC(), r.wr(), int32(sc(radius)*2)
+	hdc, w, e := cv.HDC(), r.wr(), int32(sc(capRadius(r, radius))*2)
 	oldBrush := win.SelectObject(hdc, win.GetStockObject(win.NULL_BRUSH))
 	oldPen := win.SelectObject(hdc, dcPen(hdc, c))
 	win.RoundRect(hdc, int32(w.X), int32(w.Y), int32(w.X+w.Width-1), int32(w.Y+w.Height-1), e, e)

@@ -141,19 +141,19 @@ func (p *diskPage) paintStrip(cv *walk.Canvas, w, h int) {
 		cur := strings.EqualFold(filepath.VolumeName(p.root)+`\`, d.Letter+`\`)
 		fill := T.Card
 		if cur {
-			fill = T.CardSel
+			fill = T.Tint
 		} else if p.strip.hover == fmt.Sprintf("drv:%d", i) {
 			fill = T.CardHi
 		}
-		fillRound(cv, r, 10, fill)
-		strokeRound(cv, r, 10, T.Stroke)
-		drawText(cv, d.Letter, uiBold(14), T.Text, rect{r.X + 14, r.Y + 8, 60, 26}, taLeft)
+		fillRound(cv, r, rMd, fill)
+		strokeRound(cv, r, rMd, T.Edge)
+		drawText(cv, d.Letter, uiSemibold(14), T.Text, rect{r.X + 14, r.Y + 8, 60, 26}, taLeft)
 		used := d.Total - d.Free
 		frac := 0.0
 		if d.Total > 0 {
 			frac = float64(used) / float64(d.Total)
 		}
-		drawText(cv, fmt.Sprintf("%s · %.0f%% used", d.Kind, frac*100), uiFont(8), T.Faint, rect{r.X + 14, r.Y + 32, 140, 16}, taLeft)
+		drawText(cv, fmt.Sprintf("%s · %.0f%% used", d.Kind, frac*100), uiFont(8), T.Muted, rect{r.X + 14, r.Y + 32, 140, 16}, taLeft)
 		barC := T.Disk
 		switch {
 		case frac > 0.9:
@@ -162,8 +162,8 @@ func (p *diskPage) paintStrip(cv *walk.Canvas, w, h int) {
 			barC = T.Warn
 		}
 		bar := rect{r.X + 14, r.Y + r.H - 24, r.W - 28, 8}
-		fillRound(cv, bar, 4, T.Grid)
-		fillRound(cv, rect{bar.X, bar.Y, int(float64(bar.W) * frac), bar.H}, 4, barC)
+		fillRound(cv, bar, rFull, T.Tint)
+		fillRound(cv, rect{bar.X, bar.Y, int(float64(bar.W) * frac), bar.H}, rFull, barC)
 		drawText(cv, fmt.Sprintf("%s free of %s", fmtBytes(d.Free), fmtBytes(d.Total)), uiFont(9), T.Muted,
 			rect{r.X + 80, r.Y + 8, r.W - 92, 40}, walk.TextRight|walk.TextVCenter|walk.TextSingleLine)
 		p.strip.addItem(r, fmt.Sprintf("drv:%d", i),

@@ -157,13 +157,13 @@ func TestTextWidthCreatesNoGDIObjects(t *testing.T) {
 		gs = 1
 		defer func() { gs = saved }()
 		warm, done := newCanvas()
-		_ = textWidth(warm, "warm-up", uiLight(23)) // the font's handles for this DPI
+		_ = textWidth(warm, "warm-up", uiSemibold(23)) // the font's handles for this DPI
 		done()
 		for i := 0; i < 20; i++ {
 			cv, done := newCanvas()
 			before := count()
 			for k := 0; k < 5; k++ {
-				_ = textWidth(cv, fmt.Sprintf("%d%% %d", i, k), uiLight(23)) // never cached
+				_ = textWidth(cv, fmt.Sprintf("%d%% %d", i, k), uiSemibold(23)) // never cached
 			}
 			after := count()
 			done()

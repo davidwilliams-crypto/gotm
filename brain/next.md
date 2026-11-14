@@ -1,5 +1,15 @@
 # Next
 
+## Meridian design (2026-11-13)
+- [?] Meridian dark palette, radii, buttons, selection and status tints across every drawn page (internal/ui)
+- [?] Contrast and radius tests (internal/ui/meridian_test.go); UI test suite passes
+- [?] Geist Regular/SemiBold bundled with tabular digits, licence in the notices (internal/ui/fonts, fonts.go, tools/fonts)
+- [ ] Decide: Meridian light theme following the Windows app mode
+- [ ] Native table headers, search boxes and column rules in Meridian style (owner-draw work)
+- [ ] Decide: sentence-case page names ("Flight recorder", "Installed apps", "Disk space") per Meridian
+- [ ] Rail-card channel bars, the surface-ink emphasis panel, and native menus
+- [ ] Card padding and grid gaps to the Meridian spacing scale (touches the layout tests)
+
 ## v0.9.0 — the last open limits
 - [?] High-contrast palette from system colours, live re-theme (theme.go, app.go retheme)
 - [?] UI Automation provider for the drawn surfaces + keyboard on sidebar/status bar/drive strip (uia.go, widgets.go, keys.go)

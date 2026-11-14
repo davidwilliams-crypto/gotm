@@ -412,9 +412,9 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 		sub = gpuSubtitle(&s.GPUs[cur.gpu])
 	}
 	span := "History window · " + humanDur(time.Duration(p.app.cfg.HistorySeconds)*time.Second)
-	valueFont := uiLight(23)
+	valueFont := uiSemibold(23)
 	valueW := textWidth(cv, value, valueFont) + 4
-	drawText(cv, title, uiBold(17), T.Text, rect{x0, 3, dw - valueW - 12, 36}, taLeft)
+	drawText(cv, title, uiSemibold(17), T.Text, rect{x0, 3, dw - valueW - 12, 36}, taLeft)
 	drawText(cv, value, valueFont, resColor(kind), rect{x0 + dw - valueW, 1, valueW, 38}, taRight)
 	drawText(cv, device, uiFont(10), T.Text, rect{x0, 39, dw, 19}, taLeft)
 	spanW := textWidth(cv, span, uiFont(9)) + 4
@@ -423,10 +423,10 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 	v.addText(rect{x0, 3, dw, 74}, fmt.Sprintf("%s: %s. %s. %s. %s", title, value, device, sub, span))
 	if kind != resNet && value != "n/a" {
 		bar := rect{x0, 82, dw, 3}
-		fillRect(cv, bar, T.Grid)
+		fillRect(cv, bar, T.Tint)
 		fillRect(cv, rect{bar.X, bar.Y, clampI(int(float64(dw)*pct/100), 0, dw), bar.H}, resColor(kind))
 	} else {
-		hline(cv, x0, x0+dw, 83, T.Stroke)
+		hline(cv, x0, x0+dw, 83, T.Line)
 	}
 
 	const top = 96
@@ -466,8 +466,8 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 				continue
 			}
 			cr := rect{cx, cy, cw, cellH}
-			fillRound(cv, cr, 8, T.Card)
-			strokeRound(cv, cr, 8, T.Stroke)
+			fillRound(cv, cr, rSm, T.Card)
+			strokeRound(cv, cr, rSm, T.Edge)
 			vals, ver := p.coreSeries(i)
 			ser := []series{{vals: vals, ver: ver, color: heatColor(c), fill: true}}
 			plotSeries(cv, rect{cr.X + 4, cr.Y + 4, cr.W - 8, cr.H - 8}, ser,
@@ -480,10 +480,10 @@ func (p *perfPage) paint(cv *walk.Canvas, w, h int) {
 				label = fmt.Sprintf("%d  %.1f GHz", i, s.CPUFreq[i]/1000) // short: tiles are narrow
 			}
 			if cw < 70 { // too narrow for two labels: the load only
-				drawText(cv, fmt.Sprintf("%.0f%%", c), uiBold(8), heatColor(c), rect{cr.X, cr.Y + 3, cr.W, 16}, taCenter)
+				drawText(cv, fmt.Sprintf("%.0f%%", c), uiSemibold(8), heatColor(c), rect{cr.X, cr.Y + 3, cr.W, 16}, taCenter)
 			} else {
 				drawText(cv, label, uiFont(8), T.Muted, rect{cr.X + 8, cr.Y + 3, cr.W - 42, 16}, taLeft)
-				drawText(cv, fmt.Sprintf("%.0f%%", c), uiBold(8), heatColor(c), rect{cr.X + cr.W - 46, cr.Y + 3, 38, 16}, taRight)
+				drawText(cv, fmt.Sprintf("%.0f%%", c), uiSemibold(8), heatColor(c), rect{cr.X + cr.W - 46, cr.Y + 3, 38, 16}, taRight)
 			}
 			coreName := fmt.Sprintf("CPU %d: %.0f%%", i, c)
 			if i < len(s.CPUFreq) {
@@ -555,10 +555,10 @@ func (p *perfPage) paintRail(cv *walk.Canvas, r rect, items []resItem, s *metric
 		{r.X + r.W - 26, "rail:down", "↓", "More resources", p.railFirst+count < len(items)},
 	} {
 		button := rect{b.x, y, 26, 26}
-		ink := T.Faint
+		ink := T.Disabled
 		if b.enabled {
 			ink = T.Text
-			fillRound(cv, button, 6, T.CardHi)
+			fillRound(cv, button, rSm, T.CardHi)
 			p.v.addItem(button, b.id, b.name, ctlButton, false)
 		}
 		drawText(cv, b.glyph, uiFont(10), ink, button, taCenter)
@@ -569,14 +569,14 @@ func (p *perfPage) paintRail(cv *walk.Canvas, r rect, items []resItem, s *metric
 // paintCard gives the reading its measured space before offering any room to a sparkline.
 func (p *perfPage) paintCard(cv *walk.Canvas, r rect, it resItem, index int, s *metrics.Snapshot) {
 	id := fmt.Sprintf("res:%d", index)
-	fill, border := T.Card, T.Stroke
+	fill, border := T.Card, T.Edge
 	if index == p.sel {
-		fill, border = T.CardSel, blend(T.Accent, T.Card, 0.7)
+		fill, border = T.Tint, T.Tint
 	} else if p.v.hover == id {
 		fill = T.CardHi
 	}
-	fillRound(cv, r, 8, fill)
-	strokeRound(cv, r, 8, border)
+	fillRound(cv, r, rMd, fill)
+	strokeRound(cv, r, rMd, border)
 	color := resColor(it.kind)
 	value, sub, _ := p.headline(it, s)
 	if it.kind == resCPU {
@@ -595,7 +595,7 @@ func (p *perfPage) paintCard(cv *walk.Canvas, r rect, it resItem, index int, s *
 	} else if r.H < 49 {
 		headerH, valueH, valuePt = r.H/2, r.H-r.H/2, 11
 	}
-	font := uiLight(valuePt)
+	font := uiSemibold(valuePt)
 	valueW := textWidth(cv, value, font)
 	if valueW > lineW {
 		font = uiFont(10)
@@ -604,13 +604,13 @@ func (p *perfPage) paintCard(cv *walk.Canvas, r rect, it resItem, index int, s *
 	labelY := r.Y + max(0, min(7, (r.H-headerH-valueH)/2))
 	valueY := labelY + headerH
 	fillRect(cv, rect{r.X + 1, labelY + 3, 3, headerH - 6}, color)
-	drawText(cv, title, uiBold(10), T.Text, rect{x, labelY, lineW, headerH}, taLeft)
+	drawText(cv, title, uiSemibold(10), T.Text, rect{x, labelY, lineW, headerH}, taLeft)
 	drawText(cv, value, font, color, rect{x, valueY, lineW, valueH}, taLeft)
 	if r.Y+r.H-valueY-valueH >= 17 {
 		drawText(cv, sub, uiFont(8), T.Muted, rect{x, valueY + valueH, lineW, 17}, taLeft)
 	}
 	if r.W >= 190 && r.H >= 42 {
-		readingW := max(textWidth(cv, title, uiBold(10)), valueW) + 10
+		readingW := max(textWidth(cv, title, uiSemibold(10)), valueW) + 10
 		if sparkW := min(90, lineW-readingW); sparkW >= 56 {
 			spark := rect{x + lineW - sparkW, labelY + 3, sparkW, headerH + valueH - 7}
 			plotSeries(cv, spark, p.seriesFor(it), graphStyle{bg: fill, max: p.fixedMax(it.kind), capacity: p.capacity(), lineW: 2})
@@ -673,20 +673,20 @@ func (p *perfPage) beginDetail(cv *walk.Canvas, area rect, contentH int) (int, f
 
 func (p *perfPage) paintHistory(cv *walk.Canvas, gr rect, cur resItem) {
 	kind := cur.kind
-	fillRound(cv, rect{gr.X - 1, gr.Y - 1, gr.W + 2, gr.H + 2}, 10, T.Card)
+	fillRound(cv, rect{gr.X - 1, gr.Y - 1, gr.W + 2, gr.H + 2}, rLg, T.Card)
 	inner := gr.inset(8)
 	maxV := plotSeries(cv, inner, p.seriesFor(cur),
 		graphStyle{bg: T.Card, max: p.fixedMax(kind), capacity: p.capacity(), grid: true, lineW: 2})
-	strokeRound(cv, gr, 10, T.Stroke)
+	strokeRound(cv, gr, rLg, T.Edge)
 	p.hoverGraph, p.hoverGraphOn = inner, true
 	axis := "100%"
 	if kind == resDisk || kind == resNet {
 		axis = fmtRate(maxV)
 	}
-	drawText(cv, axis, uiFont(8), T.Faint, rect{inner.X + 6, inner.Y + 2, 120, 14}, taLeft)
-	drawText(cv, p.oldestSampleLabel(), uiFont(8), T.Faint,
+	drawText(cv, axis, uiFont(8), T.Muted, rect{inner.X + 6, inner.Y + 2, 120, 14}, taLeft)
+	drawText(cv, p.oldestSampleLabel(), uiFont(8), T.Muted,
 		rect{inner.X + 6, inner.Y + inner.H - 16, 120, 14}, taLeft)
-	drawText(cv, "now", uiFont(8), T.Faint, rect{inner.X + inner.W - 60, inner.Y + inner.H - 16, 54, 14}, taRight)
+	drawText(cv, "now", uiFont(8), T.Muted, rect{inner.X + inner.W - 60, inner.Y + inner.H - 16, 54, 14}, taRight)
 
 	// hover readout: a hairline at the sample under the mouse and a small
 	// caption with its value and age, the way the classic Task Manager does.
@@ -704,20 +704,26 @@ func (p *perfPage) paintHistory(cv *walk.Canvas, gr rect, cur resItem) {
 			ly = inner.Y + 36 // below the per-core chip, which owns the top-right corner
 		}
 		br := rect{clampI(x-lw/2, inner.X+4, inner.X+inner.W-lw-4), ly, lw, 20}
-		fillRound(cv, br, 6, blend(T.Text, T.Card, 0.15))
-		strokeRound(cv, br, 6, T.Stroke)
+		fillRound(cv, br, rSm, blend(T.Text, T.Card, 0.15))
+		strokeRound(cv, br, rSm, T.Edge)
 		drawText(cv, label, uiFont(9), T.Text, br, taCenter)
 	}
 
 	// per-core toggle chip (CPU only)
 	if kind == resCPU {
 		cr := rect{gr.X + gr.W - 150, gr.Y + 8, 140, 26}
-		chip := T.CardHi
+		chip, chipInk := T.Sunken, T.Muted
 		if p.perCore {
-			chip = blend(T.Accent, T.Card, 0.35)
+			chip, chipInk = T.Tint, T.AccentInk
 		}
-		fillRound(cv, cr, 13, chip)
-		drawText(cv, "Per-core view", uiFont(9), T.Text, cr, taCenter)
+		if highContrast {
+			chipInk = T.Text
+		}
+		fillRound(cv, cr, rFull, chip)
+		if highContrast && !p.perCore {
+			strokeRound(cv, cr, rFull, T.Stroke)
+		}
+		drawText(cv, "Per-core view", uiSemibold(9), chipInk, cr, taCenter)
 		p.v.addItem(cr, "cores", "Per-core view", ctlCheckBox, p.perCore)
 	}
 }

@@ -78,7 +78,7 @@ func newStartupTab(a *App) *startupTab {
 	}
 	g.model.tint = func(row, col int, text string) (walk.Color, bool) {
 		if it, ok := t.items[cell(g.model.rows[row], 3)]; ok && !it.Enabled {
-			return T.Faint, true
+			return T.Muted, true
 		}
 		return T.Text, false
 	}

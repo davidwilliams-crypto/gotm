@@ -494,7 +494,7 @@ func commandRow(children []decl.Widget) decl.Composite {
 // Keep the native edit for keyboard editing and assistive technology. Clear
 // is independently focusable while there is text, including a whitespace query.
 func tableFilter(edit **walk.LineEdit, cue, name string, changed func()) []decl.Widget {
-	clear := newButton("Clear", "\uE894", 68, func() {
+	clear := newButton("Clear", "\uE894", 80, func() {
 		_ = (*edit).SetFocus()
 		_ = (*edit).SetText("")
 	})

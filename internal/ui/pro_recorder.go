@@ -430,10 +430,10 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		state, ink = "Recording paused", T.Warn
 	}
 	badge := rect{12, 6, 148, 30}
-	fillRound(cv, badge, 6, T.Card)
-	strokeRound(cv, badge, 6, T.Stroke)
+	fillRound(cv, badge, rFull, T.Card)
+	strokeRound(cv, badge, rFull, T.Edge)
 	fillRound(cv, rect{24, 17, 8, 8}, 4, ink)
-	drawText(cv, state, uiBold(10), ink, rect{40, 6, 112, 30}, taLeft)
+	drawText(cv, state, uiSemibold(10), ink, rect{40, 6, 112, 30}, taLeft)
 	p.view.addText(badge, state)
 
 	legendX, legendY := w-182, 6
@@ -462,7 +462,7 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	}
 	if err := rec.DiskErr(); rec.Persist() && err != nil {
 		r := rect{12, plotY - 14, w - 24, 26}
-		fillRound(cv, r, 5, blend(T.Warn, T.Bg, 0.14))
+		fillRound(cv, r, rSm, T.WarnTint)
 		warning := "Disk warning · Some samples are only in memory. " + err.Error()
 		drawText(cv, warning, uiFont(9), T.Warn, rect{r.X + 10, r.Y, r.W - 20, r.H}, taLeft)
 		p.view.addText(r, warning)
@@ -477,8 +477,8 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	p.plot = rect{}
 	if !hasSamples {
 		card.H = max(54, min(200, h-card.Y-12))
-		fillRound(cv, card, 10, T.Card)
-		strokeRound(cv, card, 10, T.Stroke)
+		fillRound(cv, card, rLg, T.Card)
+		strokeRound(cv, card, rLg, T.Edge)
 		message := "Start recording to collect samples."
 		if on {
 			message = "Waiting for the first sample…"
@@ -488,14 +488,14 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 		return
 	}
 	p.plot = pr
-	fillRound(cv, card, 10, T.Card)
-	strokeRound(cv, card, 10, T.Stroke)
+	fillRound(cv, card, rLg, T.Card)
+	strokeRound(cv, card, rLg, T.Edge)
 
 	// While scrubbing or after a paused tick the curves come from the graph
 	// cache; only the markers, cursor and details below are drawn anew.
 	plotSeries(cv, pr, p.curves(from, to), graphStyle{bg: T.Card, max: 100, timeFrom: from, timeTo: to, grid: true, lineW: 2})
-	drawText(cv, "100%", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + 2, 50, 14}, taLeft)
-	drawText(cv, "0", uiFont(8), T.Faint, rect{pr.X + 6, pr.Y + pr.H - 16, 30, 14}, taLeft)
+	drawText(cv, "100%", uiFont(8), T.Muted, rect{pr.X + 6, pr.Y + 2, 50, 14}, taLeft)
+	drawText(cv, "0", uiFont(8), T.Muted, rect{pr.X + 6, pr.Y + pr.H - 16, 30, 14}, taLeft)
 
 	tf := "15:04"
 	if to-from < 10*60_000 { // a short span needs seconds, or every label reads the same
@@ -563,8 +563,8 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	left := rect{12, dy, min(330, (w-36)*45/100), dh}
 	rightX := left.X + left.W + 12
 	right := rect{rightX, dy, w - rightX - 12, dh}
-	fillRound(cv, left, 10, T.Card)
-	strokeRound(cv, left, 10, T.Stroke)
+	fillRound(cv, left, rLg, T.Card)
+	strokeRound(cv, left, rLg, T.Edge)
 	p.paintMoment(cv, s, rect{left.X + 16, left.Y + 8, left.W - 32, 28})
 	y := left.Y + 44
 	step := 28
@@ -574,9 +574,9 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	stat := func(label string, v float64, c walk.Color, unit string) {
 		drawText(cv, label, uiFont(10), T.Muted, rect{left.X + 16, y, 120, 22}, taLeft)
 		bar := rect{left.X + 110, y + 7, left.W - 110 - 80, 8}
-		fillRound(cv, bar, 4, T.Grid)
-		fillRound(cv, rect{bar.X, bar.Y, int(float64(bar.W) * v / 100), bar.H}, 4, c)
-		drawText(cv, fmt.Sprintf("%.0f%s", v, unit), uiBold(10), T.Text, rect{left.X + left.W - 70, y, 54, 22}, taRight)
+		fillRound(cv, bar, rFull, T.Tint)
+		fillRound(cv, rect{bar.X, bar.Y, int(float64(bar.W) * v / 100), bar.H}, rFull, c)
+		drawText(cv, fmt.Sprintf("%.0f%s", v, unit), uiSemibold(10), T.Text, rect{left.X + left.W - 70, y, 54, 22}, taRight)
 		p.view.addText(rect{left.X + 16, y, left.W - 32, 22}, fmt.Sprintf("%s %.0f%s", label, v, unit))
 		y += step
 	}
@@ -584,7 +584,7 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 	stat("Memory", s.Mem, T.Mem, "%")
 	if s.GPUUnavailable {
 		drawText(cv, "GPU", uiFont(10), T.Muted, rect{left.X + 16, y, 120, 22}, taLeft)
-		drawText(cv, "n/a", uiBold(10), T.Text, rect{left.X + left.W - 70, y, 54, 22}, taRight)
+		drawText(cv, "n/a", uiSemibold(10), T.Text, rect{left.X + left.W - 70, y, 54, 22}, taRight)
 		p.view.addText(rect{left.X + 16, y, left.W - 32, 22}, "GPU unavailable")
 		y += step
 	} else {
@@ -599,10 +599,10 @@ func (p *recorderPage) paint(cv *walk.Canvas, w, h int) {
 }
 
 func (p *recorderPage) paintProcesses(cv *walk.Canvas, procs []metrics.RecProc, right rect) {
-	fillRound(cv, right, 10, T.Card)
-	strokeRound(cv, right, 10, T.Stroke)
+	fillRound(cv, right, rLg, T.Card)
+	strokeRound(cv, right, rLg, T.Edge)
 	title := rect{right.X + 16, right.Y + 8, right.W - 32, 24}
-	drawText(cv, "Busiest processes", uiBold(11), T.Text, title, taLeft)
+	drawText(cv, "Busiest processes", uiSemibold(11), T.Text, title, taLeft)
 	p.view.addText(title, "Busiest processes at this sample")
 	ty := right.Y + 44
 	if len(procs) == 0 {
@@ -619,12 +619,12 @@ func (p *recorderPage) paintProcesses(cv *walk.Canvas, procs []metrics.RecProc, 
 		nameEnd = cpuX - 6
 	}
 	nameW := nameEnd - (right.X + 16)
-	drawText(cv, "Process", uiFont(9), T.Faint, rect{right.X + 16, ty, nameW, 20}, taLeft)
+	drawText(cv, "Process", uiFont(9), T.Muted, rect{right.X + 16, ty, nameW, 20}, taLeft)
 	if showPID {
-		drawText(cv, "PID", uiFont(9), T.Faint, rect{pidX, ty, 60, 20}, taRight)
+		drawText(cv, "PID", uiFont(9), T.Muted, rect{pidX, ty, 60, 20}, taRight)
 	}
-	drawText(cv, "CPU", uiFont(9), T.Faint, rect{cpuX, ty, 48, 20}, taRight)
-	drawText(cv, "Memory", uiFont(9), T.Faint, rect{memX, ty, 80, 20}, taRight)
+	drawText(cv, "CPU", uiFont(9), T.Muted, rect{cpuX, ty, 48, 20}, taRight)
+	drawText(cv, "Memory", uiFont(9), T.Muted, rect{memX, ty, 80, 20}, taRight)
 	ty += 22
 	maxRows := (right.H - 70) / 24
 	for i, pr := range procs {
@@ -664,13 +664,13 @@ func (p *recorderPage) paintMoment(cv *walk.Canvas, s metrics.RecSample, row rec
 		if p.view.hover == "live" || p.view.down == "live" {
 			bg = T.CardHi
 		}
-		fillRound(cv, r, 5, bg)
-		strokeRound(cv, r, 5, T.Accent)
+		fillRound(cv, r, rSm, bg)
+		strokeRound(cv, r, rSm, T.Stroke)
 		drawText(cv, label, uiFont(9), T.Text, r, taCenter)
 		p.view.addItem(r, "live", label, ctlButton, false)
 		row.W -= r.W + 8
 	}
-	drawText(cv, title, uiBold(11), T.Text, row, taLeft)
+	drawText(cv, title, uiSemibold(11), T.Text, row, taLeft)
 	p.view.addText(row, title)
 }
 

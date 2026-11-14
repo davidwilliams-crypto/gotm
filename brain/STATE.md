@@ -1,6 +1,13 @@
 ## Objective
 gotm is your own Windows task manager in Go: a native Win32 application (no browser, no local server) over a metrics core that reads the system directly. Built clean-room, using TMOG only as a feature-category and design inspiration.
 
+## Status (2026-11-13) — Meridian design applied (uncommitted, awaiting your OK)
+- The UI now paints with the dark theme of the Meridian Design System (claude.ai artifact, see links.md): palette, radii, button variants, selection and status tints. All in internal/ui; theme.go holds the token mapping.
+- Verified: go vet clean, internal/ui tests pass (new meridian_test.go checks token contrast and radius capping). Captures viewed: Performance (CPU and GPU), Processes, Settings, Flight Recorder, Disk Space, Power & Freq, and high-contrast Performance/Processes/Settings.
+- Geist is bundled (2026-11-13): Geist Regular and SemiBold 1.9.2 from the official vercel/geist-font release are embedded (internal/ui/fonts, SIL OFL 1.1) and registered for the gotm process only; Segoe UI remains the fallback. The embedded copies are modified so digits are tabular by default (tools/fonts/tabular.py), because GDI cannot enable the font's tnum feature. build.ps1 adds the OFL text to THIRD-PARTY-NOTICES.txt. The exe grows by about 250 KB. Checked with Geist: Performance, Processes, Settings, Disk Space, Services captures; fonts_test.go (faces load, digits equal width).
+- Not done: Meridian light theme; native table headers, search boxes, column rules and menus (still the Windows dark style); card padding and grid spacing (layout untouched); page names are still title case ("Flight Recorder", "Installed Apps", "Disk Space") against Meridian's sentence-case rule; Performance rail cards keep their left channel bar; surface-ink (the one dark panel) is unused. No release built, nothing committed.
+- Unrelated: internal/metrics TestADLLive fails on this PC with and without this change (DXGI adapter on bus 17 has no ADL match). The first internal/ui test run of the session panicked inside walk (send on closed channel) before any edit; later runs pass.
+
 ## Status (2026-10-24) — v0.9.2 (SDK confirmed in-app; placeholder thermal zone)
 - Signing: build.ps1 -TrustedSigning implemented and tested up to the Azure call (signtool loads the verified Microsoft dlib and reaches the service; fails only for lack of an account). Waiting on the user's Azure-side setup (docs/SIGNING.md); then `.uild.ps1 -Version x.y.z -TrustedSigning` produces signed kits.
 - Elevated capture of 0.9.1: SDK rows present in the app (Tctl/Tdie 56.5 °C, Core #0–#15, cHTC 89 °C). Elevated tests all pass; gotm.exe --ryzen-probe Init OK (59 °C).

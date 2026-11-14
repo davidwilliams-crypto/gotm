@@ -26,6 +26,14 @@ type module struct {
 	Replace            *module
 }
 
+// extraList collects the -extra flags.
+type extraList []string
+
+func (e *extraList) String() string     { return strings.Join(*e, ", ") }
+func (e *extraList) Set(v string) error { *e = append(*e, v); return nil }
+
+var extras extraList
+
 type pkg struct {
 	Standard bool
 	Module   *module
@@ -34,6 +42,7 @@ type pkg struct {
 func main() {
 	out := flag.String("o", "THIRD-PARTY-NOTICES.txt", "output file")
 	app := flag.String("app", "gotm", "program name for the header")
+	flag.Var(&extras, "extra", "a bundled non-Go component as \"title|url|license file\" (repeatable)")
 	flag.Parse()
 	target := "."
 	if flag.NArg() > 0 {
@@ -105,6 +114,19 @@ func run(out, app, target string) error {
 			return fmt.Errorf("%s: %w", p, err)
 		}
 		section(&b, fmt.Sprintf("%s %s (%s)", m.Path, m.Version, name), "https://"+m.Path, text)
+	}
+	// Components that are not Go modules (bundled fonts) name their own
+	// license file.
+	for _, e := range extras {
+		parts := strings.SplitN(e, "|", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("-extra %q: want \"title|url|license file\"", e)
+		}
+		text, err := os.ReadFile(parts[2])
+		if err != nil {
+			return fmt.Errorf("%s: %w", parts[0], err)
+		}
+		section(&b, parts[0], parts[1], text)
 	}
 	return os.WriteFile(out, []byte(b.String()), 0o644)
 }

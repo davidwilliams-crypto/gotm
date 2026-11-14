@@ -47,7 +47,7 @@ func newServicesTab(a *App) *servicesTab {
 			case "Running":
 				return T.Good, true
 			case "Stopped":
-				return T.Faint, true
+				return T.Muted, true
 			}
 		}
 		return T.Text, false

@@ -38,15 +38,15 @@ func (a *App) paintSidebar(cv *walk.Canvas, w, h int) {
 	if a.mw != nil && a.mw.Icon() != nil {
 		_ = cv.DrawImageStretchedPixels(a.mw.Icon(), rect{18, (brandH - 32) / 2, 32, 32}.wr())
 	}
-	drawText(cv, "gotm", uiBold(17), T.Text, rect{60, (brandH - 44) / 2, w - 70, 29}, taLeft)
+	drawText(cv, "gotm", uiSemibold(17), T.Text, rect{60, (brandH - 44) / 2, w - 70, 29}, taLeft)
 	drawText(cv, "Task Manager", uiFont(9), T.Muted, rect{61, (brandH-44)/2 + 28, w - 70, 17}, taLeft)
 	v.addText(rect{18, 0, w - 32, brandH}, "gotm Task Manager")
-	fillRect(cv, rect{w - 1, 0, 1, h}, T.Stroke)
+	fillRect(cv, rect{w - 1, 0, 1, h}, T.Line)
 
 	y := brandH
 	section := func(name string) {
 		r := rect{20, y, w - 36, sectionH}
-		drawText(cv, name, uiBold(8), T.Faint, r, taLeft)
+		drawText(cv, name, uiSemibold(8), T.Muted, r, taLeft)
 		v.addText(r, name)
 		y += sectionH
 	}
@@ -57,24 +57,24 @@ func (a *App) paintSidebar(cv *walk.Canvas, w, h int) {
 		name := p.title
 		selected := i == a.cur && p.initialized
 		pending := a.opening != nil && a.opening.id == i
-		ink, glyphInk := T.Muted, T.Faint
+		ink, glyphInk := T.Muted, T.Muted
 		font := uiFont(10)
 		switch {
 		case pending:
-			strokeRound(cv, r, 5, T.Accent)
-			ink, glyphInk = T.Text, T.Accent
+			strokeRound(cv, r, rMd, T.Focus)
+			ink, glyphInk = T.Text, T.AccentInk
 			name += ", opening"
 		case selected:
-			fill, marker := T.CardSel, T.Accent
-			ink, glyphInk = T.Text, T.Accent
+			// Meridian marks selection with the tint fill alone: no marker bar.
+			fill := T.Tint
+			ink, glyphInk = T.Text, T.AccentInk
 			if highContrast {
-				fill, marker, ink, glyphInk = T.RowSel, T.RowSelText, T.RowSelText, T.RowSelText
+				fill, ink, glyphInk = T.RowSel, T.RowSelText, T.RowSelText
 			}
-			fillRound(cv, r, 5, fill)
-			fillRect(cv, rect{r.X, r.Y + r.H/4, 3, r.H / 2}, marker)
+			fillRound(cv, r, rMd, fill)
 			font = uiSemibold(10)
 		case v.hover == id:
-			fillRound(cv, r, 5, T.CardHi)
+			fillRound(cv, r, rMd, T.CardHi)
 			ink, glyphInk = T.Text, T.Text
 		}
 		drawText(cv, p.glyph, iconFont(12), glyphInk, rect{r.X + 12, r.Y, 22, r.H}, taCenter)
@@ -93,7 +93,7 @@ func (a *App) paintSidebar(cv *walk.Canvas, w, h int) {
 		y += itemH
 	}
 	sy := h - 6 - itemH
-	hline(cv, 16, w-16, sy-3, T.Stroke)
+	hline(cv, 16, w-16, sy-3, T.Line)
 	item(pgSettings, sy)
 }
 
@@ -126,19 +126,18 @@ func (a *App) paintHeader(cv *walk.Canvas, w, h int, page int) {
 		v.addText(sub, subtitle)
 	}
 	if alert.W > 0 {
-		fillRound(cv, alert, 5, blend(T.Warn, T.Bg, 0.12))
-		fillRect(cv, rect{alert.X, alert.Y + 4, 3, alert.H - 8}, T.Warn)
+		fillRound(cv, alert, rSm, T.WarnTint)
 		drawText(cv, a.alertText, uiFont(9), T.Warn, rect{alert.X + 12, alert.Y, alert.W - 20, alert.H}, taLeft)
 		v.addText(alert, "Alert: "+a.alertText)
 	}
-	hline(cv, 0, w, h-1, T.Stroke)
+	hline(cv, 0, w, h-1, T.Line)
 }
 
 // ---- footer --------------------------------------------------------------------
 
 func (a *App) paintFooter(cv *walk.Canvas, w, h int, page int) {
 	v, s := a.foots[page], a.snap
-	hline(cv, 0, w, 0, T.Stroke)
+	hline(cv, 0, w, 0, T.Line)
 	recOn := a.rec.Enabled()
 	rec, recName, recInk := "Recording off", "Flight recorder off; turn on", T.Muted
 	if recOn {
@@ -164,7 +163,7 @@ func (a *App) paintFooter(cv *walk.Canvas, w, h int, page int) {
 	rr := rect{ar.X - 8 - rw, 3, rw, h - 6}
 	live, dot := "Live", T.Good
 	if s == nil {
-		live, dot = "Starting…", T.Faint
+		live, dot = "Starting…", T.Muted
 	}
 	lw := textWidth(cv, live, uiSemibold(9)) + 4
 	fillRound(cv, rect{16, h/2 - 3, 6, 6}, 3, dot)
@@ -187,7 +186,7 @@ func (a *App) paintFooter(cv *walk.Canvas, w, h int, page int) {
 		v.addText(r, strings.ReplaceAll(details, "   ·   ", ", "))
 	}
 	if v.hover == "rec" || v.down == "rec" {
-		fillRound(cv, rr, 4, T.CardHi)
+		fillRound(cv, rr, rSm, T.CardHi)
 	}
 	ring := rect{rr.X + 9, h/2 - 4, 9, 9}
 	if recOn {
@@ -198,12 +197,12 @@ func (a *App) paintFooter(cv *walk.Canvas, w, h int, page int) {
 	drawText(cv, rec, font, recInk, rect{rr.X + 24, rr.Y, rr.W - 28, rr.H}, taLeft)
 	v.addItem(rr, "rec", recName, ctlCheckBox, recOn)
 
-	fillRect(cv, rect{ar.X - 4, h/2 - 6, 1, 12}, T.Stroke)
+	fillRect(cv, rect{ar.X - 4, h/2 - 6, 1, 12}, T.Line)
 	ink := T.Muted
 	if !a.host.Elevated {
-		ink = T.Accent
+		ink = T.AccentInk
 		if v.hover == "admin" {
-			fillRound(cv, ar, 4, T.CardHi)
+			fillRound(cv, ar, rSm, T.CardHi)
 		}
 	}
 	drawText(cv, admin, font, ink, ar.inset(2), taCenter)

@@ -451,7 +451,7 @@ func TestPaintingKeepsGDIObjectCountStable(t *testing.T) {
 		paint := func(i int) {
 			fillRect(cv, rect{0, 0, 300, 120}, T.Bg)
 			fillRound(cv, rect{4, 4, 100, 40}, 8, T.Card)
-			strokeRound(cv, rect{4, 4, 100, 40}, 8, T.Stroke)
+			strokeRound(cv, rect{4, 4, 100, 40}, 8, T.Line)
 			hline(cv, 0, 300, 60, T.Grid)
 			drawText(cv, "CPU", uiFont(9), T.Text, rect{8, 8, 80, 16}, taLeft)
 			_ = textWidth(cv, "CPU", uiFont(9))
